@@ -9,7 +9,13 @@ import type { ExportQuality } from '../types/clip';
 
 type Phase = 'idle' | 'working' | 'ready' | 'shared' | 'error';
 
-export default function ExportSheet({ onClose, quality }: { onClose: () => void; quality: ExportQuality }) {
+const QUALITIES: ExportQuality[] = ['1080p', '4K'];
+
+export default function ExportSheet({ onClose, quality, onQualityChange }: {
+  onClose: () => void;
+  quality: ExportQuality;
+  onQualityChange: (quality: ExportQuality) => void;
+}) {
   const clips = useStore((s) => s.clips);
   const aspectRatio = useStore((s) => s.aspectRatio);
   const [phase, setPhase] = useState<Phase>('idle');
@@ -19,7 +25,6 @@ export default function ExportSheet({ onClose, quality }: { onClose: () => void;
   const [handoffNotice, setHandoffNotice] = useState<string | null>(null);
   const [exportMode, setExportMode] = useState<'native' | 'remuxed' | 'transcoded' | null>(null);
   const resultRef = useRef<Blob | null>(null);
-  const startedRef = useRef(false);
 
   const filenameRef = useRef(`take-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.mp4`);
   const filename = filenameRef.current;
@@ -40,12 +45,15 @@ export default function ExportSheet({ onClose, quality }: { onClose: () => void;
 
   const output = exportDimensions(aspectRatio, quality);
 
+  // The quality decision lives here, where the export starts; Escape closes
+  // the sheet whenever an export is not actively running.
   useEffect(() => {
-    if (startedRef.current) return;
-    startedRef.current = true;
-    const timer = window.setTimeout(() => void start(), 0);
-    return () => window.clearTimeout(timer);
-  }, [start]);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && phase !== 'working') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose, phase]);
 
   const share = async () => {
     if (!resultRef.current) return;
@@ -73,7 +81,9 @@ export default function ExportSheet({ onClose, quality }: { onClose: () => void;
         <div className="flex items-center justify-between mb-4">
           <h2 id="export-title" className="font-semibold">Export video</h2>
           {phase !== 'working' && (
-            <button onClick={onClose} className="p-1.5 rounded-lg active:bg-white/10" aria-label="Close">
+            <button onClick={onClose}
+              className="-m-2 flex h-11 w-11 items-center justify-center rounded-lg active:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+              aria-label="Close">
               <X size={18} />
             </button>
           )}
@@ -83,12 +93,39 @@ export default function ExportSheet({ onClose, quality }: { onClose: () => void;
           <div className="flex justify-between"><span>Format</span><span className="text-white/90">MP4 · H.264 + AAC</span></div>
           <div className="flex justify-between"><span>Frame</span><span className="text-white/90">{ASPECT_RATIOS[aspectRatio].outputLabel}</span></div>
           <div className="flex justify-between"><span>Export</span><span className="text-white/90">{quality} · {output.width} × {output.height}</span></div>
-          <div className="text-[11px] leading-snug text-white/40">Export resolution is independent of camera capture. Source detail is limited by the device and browser.</div>
+          <div className="text-[11px] leading-snug text-white/55">Export resolution is independent of camera capture. Source detail is limited by the device and browser.</div>
           <div className="flex justify-between"><span>Duration</span><span className="text-white/90">{fmtTime(totalDuration(clips))}</span></div>
           <div className="flex justify-between"><span>Watermark / metadata</span><span className="text-white/90">None</span></div>
         </div>
 
-        {phase === 'idle' && <p className="text-sm text-white/60">Preparing your video…</p>}
+        {(phase === 'idle' || phase === 'error') && (
+          <div className="mb-4">
+            <div className="mb-1.5 text-sm text-white/60">Quality</div>
+            <div className="flex w-full items-center rounded-full bg-white/10 p-0.5" role="group" aria-label="Export quality">
+              {QUALITIES.map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  aria-pressed={quality === option}
+                  onClick={() => onQualityChange(option)}
+                  className={`min-h-11 flex-1 rounded-full px-2 text-xs font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white ${
+                    quality === option ? 'bg-white text-black' : 'text-white/70'
+                  }`}
+                >
+                  {option}
+                </button>
+              ))}
+            </div>
+            <p className="mt-1.5 text-[11px] leading-snug text-white/55">1080p exports faster. 4K is larger and can take much longer on this device.</p>
+          </div>
+        )}
+
+        {phase === 'idle' && (
+          <button onClick={() => void start()}
+            className="w-full bg-white text-black font-semibold py-3 rounded-xl active:scale-[0.98] flex items-center justify-center gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
+            <Download size={17} /> Start export
+          </button>
+        )}
 
         {phase === 'working' && (
           <div>
@@ -98,7 +135,7 @@ export default function ExportSheet({ onClose, quality }: { onClose: () => void;
             <div className="mt-2 text-xs text-white/60 flex justify-between">
               <span>{label}…</span><span>{Math.round(progress * 100)}%</span>
             </div>
-            <p className="mt-3 text-[11px] text-white/40">Keep this tab open until the export finishes.</p>
+            <p className="mt-3 text-[11px] text-white/60">Keep this tab open until the export finishes.</p>
           </div>
         )}
 
@@ -113,11 +150,11 @@ export default function ExportSheet({ onClose, quality }: { onClose: () => void;
               {exportMode === 'transcoded' && `Rendered at ${quality} output resolution.`}
             </p>
             <button onClick={share}
-              className="w-full bg-white text-black font-semibold py-3 rounded-xl active:scale-[0.98] flex items-center justify-center gap-2">
+              className="w-full bg-white text-black font-semibold py-3 rounded-xl active:scale-[0.98] flex items-center justify-center gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
               <Share2 size={17} /> Share
             </button>
             <button onClick={download}
-              className="w-full bg-white/10 font-medium py-3 rounded-xl active:scale-[0.98] flex items-center justify-center gap-2">
+              className="w-full bg-white/10 font-medium py-3 rounded-xl active:scale-[0.98] flex items-center justify-center gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
               <Download size={17} /> Download MP4
             </button>
             {handoffNotice && <p role="status" className="text-xs leading-relaxed text-white/55">{handoffNotice}</p>}
@@ -136,7 +173,8 @@ export default function ExportSheet({ onClose, quality }: { onClose: () => void;
         {phase === 'error' && (
           <div className="space-y-2">
             <p className="text-sm text-red-400">{error}</p>
-            <button onClick={start} className="w-full bg-white text-black font-semibold py-3 rounded-xl active:scale-[0.98]">
+            <button onClick={() => void start()}
+              className="w-full bg-white text-black font-semibold py-3 rounded-xl active:scale-[0.98] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
               Try again
             </button>
           </div>

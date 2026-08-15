@@ -56,18 +56,18 @@ await page.getByText('Edit', { exact: true }).click();
 
 const frame = page.locator('[data-editor-frame]');
 await frame.waitFor();
+await page.getByText('Export video', { exact: true }).click();
+const dialog = page.getByRole('dialog', { name: 'Export video' });
 if (exportQuality === '1080p') {
-  await page.getByRole('button', { name: /Export quality 4K/ }).click();
+  await dialog.getByRole('button', { name: '1080p', exact: true }).click();
 }
 const expectedWidth = exportQuality === '4K' ? '2160' : '1080';
 const expectedHeight = exportQuality === '4K' ? '3840' : '1920';
 if (await frame.getAttribute('data-export-width') !== expectedWidth || await frame.getAttribute('data-export-height') !== expectedHeight) {
   throw new Error(`${exportQuality} portrait metadata is not ${expectedWidth}x${expectedHeight}`);
 }
-
-await page.getByText('Export video', { exact: true }).click();
-const dialog = page.getByRole('dialog', { name: 'Export video' });
 await dialog.getByText(new RegExp(`${exportQuality} · ${expectedWidth} × ${expectedHeight}`)).waitFor();
+await dialog.getByRole('button', { name: 'Start export' }).click();
 await dialog.getByText('Video ready to share or download').waitFor({ timeout: 300000 });
 if (exportQuality === '1080p') {
   await dialog.getByText(clipCount === 1
