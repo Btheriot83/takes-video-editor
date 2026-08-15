@@ -15,7 +15,14 @@ let loading: Promise<FFmpegLike> | null = null;
  * 4K exports several times faster; otherwise we fall back to the
  * single-threaded core.
  */
+// The pthread build currently deadlocks during real browser exports on some
+// Chrome/WebAssembly combinations. Keep it available for explicit testing,
+// but ship the proven single-threaded core until the mt path passes the same
+// end-to-end export suite. Vite only exposes VITE_* values at build time.
+const mtCoreEnabled = import.meta.env.VITE_ENABLE_FFMPEG_MT === 'true';
+
 const canUseMtCore = () =>
+  mtCoreEnabled &&
   typeof SharedArrayBuffer !== 'undefined' &&
   (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated === true &&
   (navigator.hardwareConcurrency ?? 1) > 1;

@@ -42,9 +42,9 @@ export default defineConfig({
       },
     }),
   ],
-  // COOP/COEP make the page cross-origin isolated, enabling SharedArrayBuffer
-  // so ffmpeg's multithreaded core can be used (several-times-faster 4K
-  // exports). The production host must send these same headers.
+  // COOP/COEP allow explicit local testing of the experimental multithreaded
+  // ffmpeg core with VITE_ENABLE_FFMPEG_MT=true. Production uses the verified
+  // single-threaded core unless that flag is deliberately enabled at build.
   server: {
     port: 3000,
     headers: {
