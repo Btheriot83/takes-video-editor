@@ -376,18 +376,21 @@ export default function Camera() {
           <div className="absolute inset-x-0 top-0 h-16 bg-gradient-to-b from-black/50 to-transparent pointer-events-none" />
           <div className="absolute inset-x-0 bottom-0 h-20 bg-gradient-to-t from-black/55 to-transparent pointer-events-none" />
 
-          <div className="absolute left-1/2 bottom-3 -translate-x-1/2 rounded-full bg-black/65 px-3 py-1.5 text-xs font-semibold tabular-nums shadow-sm" aria-live="polite">
-            {zoom.toFixed(zoom % 1 === 0 ? 0 : 1)}×
-            {!zoomRange && <span className="ml-1.5 font-normal text-white/60">fixed</span>}
-          </div>
-
           <div className="absolute right-3 top-3 rounded-full bg-black/65 px-2.5 py-1.5 text-[10px] font-semibold text-white/80">
             {ASPECT_RATIOS[aspectRatio].outputLabel}
           </div>
 
-          <div className="absolute left-3 bottom-3 rounded-full bg-black/65 px-2.5 py-1.5 text-[10px] text-white/70">
-            Camera {captureSize?.width && captureSize?.height ? `${captureSize.width}×${captureSize.height}` : 'device managed'}
-            {captureSize?.frameRate ? ` · ${captureSize.frameRate.toFixed(0)} fps` : ''}
+          {/* One shared bottom row keeps the capture badge and zoom status from
+              overlapping when the portrait frame gets narrow (e.g. 320x568). */}
+          <div className="absolute inset-x-2 bottom-3 flex items-center justify-between gap-2 pointer-events-none">
+            <div className="min-w-0 truncate rounded-full bg-black/65 px-2.5 py-1.5 text-[10px] text-white/70">
+              Camera {captureSize?.width && captureSize?.height ? `${captureSize.width}×${captureSize.height}` : 'device managed'}
+              {captureSize?.frameRate ? ` · ${captureSize.frameRate.toFixed(0)} fps` : ''}
+            </div>
+            <div className="shrink-0 rounded-full bg-black/65 px-3 py-1.5 text-xs font-semibold tabular-nums shadow-sm" aria-live="polite">
+              {zoom.toFixed(zoom % 1 === 0 ? 0 : 1)}×
+              {!zoomRange && <span className="ml-1.5 font-normal text-white/60">fixed</span>}
+            </div>
           </div>
 
           {recording && (
@@ -521,8 +524,8 @@ export default function Camera() {
           >
             <Images size={18} /> Import
           </button>
-          <div className="flex items-center gap-1 text-[11px] text-white/45" aria-hidden="true">
-            <Film size={13} /> Local to this device
+          <div className="flex items-center gap-1 text-[11px] text-white/60">
+            <Film size={13} aria-hidden="true" /> Local to this device
           </div>
           {hasClips ? (
             <button

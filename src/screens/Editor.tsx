@@ -280,27 +280,23 @@ export default function Editor() {
       data-last-handoff-gap-ms={handoffGapMs?.toFixed(1) ?? ''}
       className="fixed inset-0 bg-neutral-950 text-white flex flex-col select-none">
       {/* header */}
-      <div className="pt-[env(safe-area-inset-top)] px-3 py-2.5 flex items-center justify-between border-b border-white/10">
+      <div className="pt-[env(safe-area-inset-top)] px-2 py-1.5 flex items-center justify-between gap-1 border-b border-white/10">
         <button onClick={() => { videoRefs.current.forEach((video) => video?.pause()); setPlaying(false); setScreen('camera'); }}
-          className="flex items-center gap-1 text-sm text-white/80 active:opacity-60 px-2 py-1.5">
-          <ArrowLeft size={18} /> Camera
+          aria-label="Back to camera"
+          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-white/80 active:opacity-60 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white">
+          <ArrowLeft size={20} />
         </button>
-        <div className="text-center text-sm tabular-nums text-white/70">
-          <div>{fmtTime(playhead)} <span className="text-white/40">/ {fmtTime(total)}</span></div>
-          <button type="button" onClick={() => setExportQuality((quality) => quality === '4K' ? '1080p' : '4K')}
-            aria-label={`Export quality ${exportQuality}. Tap to switch`}
-            className="min-h-6 rounded-full px-2 text-[10px] font-semibold text-white/55 active:bg-white/10">
-            {exportQuality} export
-          </button>
+        <div className="whitespace-nowrap text-center text-xs min-[360px]:text-sm tabular-nums text-white/70">
+          {fmtTime(playhead)} <span className="text-white/55">/ {fmtTime(total)}</span>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex shrink-0 items-center">
           <button onClick={undo} disabled={!canUndo} aria-label="Undo"
-            className="p-2 rounded-lg active:bg-white/10 disabled:opacity-30"><Undo2 size={18} /></button>
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg active:bg-white/10 disabled:opacity-30 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"><Undo2 size={18} /></button>
           <button onClick={redo} disabled={!canRedo} aria-label="Redo"
-            className="p-2 rounded-lg active:bg-white/10 disabled:opacity-30"><Redo2 size={18} /></button>
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg active:bg-white/10 disabled:opacity-30 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"><Redo2 size={18} /></button>
           <button onClick={() => setExportOpen(true)} disabled={!clips.length}
-            className="ml-1 bg-white text-black text-sm font-semibold px-3.5 py-1.5 rounded-full active:scale-95 disabled:opacity-30 flex items-center gap-1.5">
-            <Download size={15} /> Export video
+            className="ml-1 flex min-h-11 items-center gap-1.5 rounded-full bg-white px-3.5 text-sm font-semibold text-black active:scale-95 disabled:opacity-30 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
+            <Download size={15} className="hidden min-[360px]:block" /><span className="hidden min-[360px]:inline">Export video</span><span className="min-[360px]:hidden">Export</span>
           </button>
         </div>
       </div>
@@ -322,7 +318,7 @@ export default function Editor() {
           ))}
         </div>
         <button onClick={togglePlay}
-          className="absolute inset-0 flex items-center justify-center group"
+          className="absolute inset-0 flex items-center justify-center group focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-white"
           aria-label={playing ? 'Pause' : 'Play'}>
           {!playing && (
             <span className="w-16 h-16 rounded-full bg-black/60 backdrop-blur flex items-center justify-center border border-white/20">
@@ -333,24 +329,28 @@ export default function Editor() {
       </div>
 
       {/* action row */}
-      <div className="px-3 py-2 flex items-center justify-center gap-2 border-t border-white/10">
-        <Action icon={<Scissors size={17} />} label="Split" onClick={splitSelected} disabled={!selected || playing} />
-        <Action icon={<Copy size={17} />} label="Duplicate" onClick={duplicateSelected} disabled={!selected} />
-        <Action icon={<Trash2 size={17} />} label="Delete" onClick={deleteSelected} disabled={!selected} />
-        <Action icon={<Plus size={17} />} label="Import" onClick={() => fileRef.current?.click()} disabled={false} />
-        {selected && (
-          <div className="flex items-center gap-1 ml-1 border-l border-white/10 pl-2">
-            <button aria-label="Trim in -1 frame" className="p-1.5 active:bg-white/10 rounded"
-              onClick={() => trimSelected(selected.trimIn - FRAME, selected.trimOut)}>
-              <ChevronLeft size={16} /></button>
-            <span className="text-[11px] tabular-nums text-white/60 w-14 text-center">
-              {clipLen(selected).toFixed(2)}s
-            </span>
-            <button aria-label="Trim in +1 frame" className="p-1.5 active:bg-white/10 rounded"
-              onClick={() => trimSelected(selected.trimIn + FRAME, selected.trimOut)}>
-              <ChevronRight size={16} /></button>
-          </div>
-        )}
+      <div className="border-t border-white/10 overflow-x-auto">
+        <div className="mx-auto flex w-max items-center gap-1 px-3 py-1">
+          <Action icon={<Scissors size={17} />} label="Split" onClick={splitSelected} disabled={!selected || playing} />
+          <Action icon={<Copy size={17} />} label="Duplicate" onClick={duplicateSelected} disabled={!selected} />
+          <Action icon={<Trash2 size={17} />} label="Delete" onClick={deleteSelected} disabled={!selected} />
+          <Action icon={<Plus size={17} />} label="Import" onClick={() => fileRef.current?.click()} disabled={false} />
+          {selected && (
+            <div className="flex items-center ml-1 border-l border-white/10 pl-1.5">
+              <button aria-label="Trim in -1 frame"
+                className="flex h-11 w-11 items-center justify-center rounded active:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+                onClick={() => trimSelected(selected.trimIn - FRAME, selected.trimOut)}>
+                <ChevronLeft size={16} /></button>
+              <span className="text-[11px] tabular-nums text-white/60 w-12 text-center">
+                {clipLen(selected).toFixed(2)}s
+              </span>
+              <button aria-label="Trim in +1 frame"
+                className="flex h-11 w-11 items-center justify-center rounded active:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+                onClick={() => trimSelected(selected.trimIn + FRAME, selected.trimOut)}>
+                <ChevronRight size={16} /></button>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* timeline */}
@@ -374,7 +374,13 @@ export default function Editor() {
       <input ref={fileRef} type="file" accept="video/*" multiple hidden
         onChange={(e) => { if (e.target.files?.length) importFiles(e.target.files); e.target.value = ''; }} />
 
-      {exportOpen && <ExportSheet quality={exportQuality} onClose={() => setExportOpen(false)} />}
+      {exportOpen && (
+        <ExportSheet
+          quality={exportQuality}
+          onQualityChange={setExportQuality}
+          onClose={() => setExportOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -382,7 +388,7 @@ export default function Editor() {
 function Action({ icon, label, onClick, disabled }: { icon: React.ReactNode; label: string; onClick: () => void; disabled: boolean }) {
   return (
     <button onClick={onClick} disabled={disabled}
-      className="flex flex-col items-center gap-0.5 px-2.5 py-1 rounded-lg active:bg-white/10 disabled:opacity-30 min-w-[56px]">
+      className="flex min-h-11 min-w-11 flex-col items-center justify-center gap-0.5 px-1.5 py-1 rounded-lg active:bg-white/10 disabled:opacity-30 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white">
       {icon}
       <span className="text-[10px] text-white/70">{label}</span>
     </button>
@@ -486,7 +492,7 @@ function Timeline({
 
   return (
     <div className="border-t border-white/10 bg-neutral-900/60 pb-[max(env(safe-area-inset-bottom),0.5rem)]">
-      <div className="text-[10px] text-white/40 px-3 pt-1.5 flex justify-between">
+      <div className="text-[10px] text-white/60 px-3 pt-1.5 flex justify-between">
         <span>Tap to select · drag edges to trim · hold &amp; drag to reorder</span>
       </div>
       <div ref={stripRef} className="relative overflow-x-auto overflow-y-hidden px-3 py-2 flex items-center gap-1 min-h-[76px]">

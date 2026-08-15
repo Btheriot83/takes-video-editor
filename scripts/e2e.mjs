@@ -282,13 +282,20 @@ log(`after split: ${afterSplit} clips`);
 if (afterSplit !== 4) throw new Error(`split failed: expected 4 clips, got ${afterSplit}`);
 await page.screenshot({ path: `${OUT}/5-split.png` });
 
-// Keep the broad smoke quick; the dedicated 4K smoke verifies 2160x3840.
-await page.getByRole('button', { name: /Export quality 4K/ }).click();
-if (await editorFrame.getAttribute('data-export-width') !== '1080') throw new Error('1080p export toggle failed');
 await page.click('text=Export video');
 const exportDialog = page.getByRole('dialog', { name: 'Export video' });
 await exportDialog.getByText('9:16 portrait', { exact: true }).waitFor();
+await exportDialog.getByText(/4K · 2160 × 3840/).waitFor();
+// Quality is decided inside the export sheet with finger-sized controls.
+// Keep the broad smoke quick; the dedicated 4K smoke verifies 2160x3840.
+const quality1080 = exportDialog.getByRole('button', { name: '1080p', exact: true });
+const qualityBox = await quality1080.boundingBox();
+if (!qualityBox || qualityBox.height < 44) throw new Error(`1080p quality control is ${qualityBox?.height}px tall, expected at least 44`);
+await quality1080.click();
+if (await quality1080.getAttribute('aria-pressed') !== 'true') throw new Error('1080p quality selection was not pressed');
+if (await editorFrame.getAttribute('data-export-width') !== '1080') throw new Error('1080p selection did not update export metadata');
 await exportDialog.getByText(/1080p · 1080 × 1920/).waitFor();
+await exportDialog.getByRole('button', { name: 'Start export' }).click();
 log('export started (ffmpeg.wasm)…');
 await page.waitForSelector('text=Video ready to share or download', { timeout: 300000 });
 if (await page.getByText('Saved to this device').count()) throw new Error('UI falsely claimed the file was saved');
