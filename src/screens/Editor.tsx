@@ -11,6 +11,9 @@ import { locate, clipStart } from '../lib/editor';
 import ExportSheet from '../components/ExportSheet';
 
 const PX_PER_SEC = 44;
+// How far before a clip boundary the preloaded slot starts playing muted, so
+// the swap at the boundary is a mute/visibility flip instead of a cold play().
+const PREROLL_SEC = 0.1;
 type VideoSlot = 0 | 1;
 
 function waitForMedia(v: HTMLVideoElement, timeoutMs = 1800): Promise<void> {
@@ -55,6 +58,9 @@ export default function Editor() {
   const activeIndexRef = useRef(0);
   const slotIndexRef = useRef<[number | null, number | null]>([null, null]);
   const handoffRef = useRef(false);
+  // Index of the clip currently pre-rolling (playing muted in the spare slot
+  // just before its boundary), or null when no pre-roll is in flight.
+  const prerollForRef = useRef<number | null>(null);
   const lastUiUpdateRef = useRef(0);
   const [playing, setPlaying] = useState(false);
   const [activeSlot, setActiveSlot] = useState<VideoSlot>(0);
@@ -117,8 +123,25 @@ export default function Editor() {
     const nextIndex = index + 1;
     if (nextIndex >= clips.length) return;
     const slot = (activeSlotRef.current === 0 ? 1 : 0) as VideoSlot;
-    void loadSlot(slot, nextIndex, 0);
-  }, [clips.length, loadSlot]);
+    void (async () => {
+      if (!await loadSlot(slot, nextIndex, 0)) return;
+      const v = videoRefs.current[slot];
+      if (!v || activeSlotRef.current === slot || slotIndexRef.current[slot] !== nextIndex) return;
+      // Prime the decoder: a muted play()+pause() spins up the decode pipeline
+      // now, so the boundary swap doesn't pay that cost. Skip the pause if a
+      // pre-roll grabbed this slot while the play() promise was in flight, and
+      // bail entirely if a scrub made this slot active in the meantime.
+      try {
+        v.muted = true;
+        await v.play();
+        if (activeSlotRef.current === slot) return;
+        if (prerollForRef.current !== nextIndex) {
+          v.pause();
+          await seekMedia(v, clips[nextIndex].trimIn);
+        }
+      } catch { /* autoplay refused or load interrupted; handoff still works, just colder */ }
+    })();
+  }, [clips, loadSlot]);
 
   // Position one video while the second slot preloads the adjacent clip.
   const syncVideo = useCallback(async (t: number, autoplay = false) => {
@@ -126,6 +149,7 @@ export default function Editor() {
     if (!loc) return;
     const loadedSlot = slotIndexRef.current.findIndex((index) => index === loc.index);
     const slot = (loadedSlot >= 0 ? loadedSlot : activeSlotRef.current) as VideoSlot;
+    prerollForRef.current = null;
     videoRefs.current.forEach((video) => video?.pause());
     if (!await loadSlot(slot, loc.index, loc.offset)) return;
     activeSlotRef.current = slot;
@@ -148,33 +172,60 @@ export default function Editor() {
   const playheadRef = useRef(playhead);
   playheadRef.current = playhead;
 
+  // Start the preloaded slot playing muted shortly before the boundary so the
+  // handoff itself is just a mute/visibility flip.
+  const preroll = useCallback((nextIndex: number) => {
+    if (prerollForRef.current === nextIndex || handoffRef.current) return;
+    const slot = (activeSlotRef.current === 0 ? 1 : 0) as VideoSlot;
+    const incoming = videoRefs.current[slot];
+    if (!incoming || slotIndexRef.current[slot] !== nextIndex) return;
+    if (incoming.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return;
+    prerollForRef.current = nextIndex;
+    incoming.muted = true;
+    if (incoming.paused) {
+      incoming.play().catch(() => {
+        if (prerollForRef.current === nextIndex) prerollForRef.current = null;
+      });
+    }
+  }, []);
+
   const handoff = useCallback(async (fromIndex: number) => {
     if (handoffRef.current) return;
     const nextIndex = fromIndex + 1;
     if (nextIndex >= clips.length) return;
     handoffRef.current = true;
+    // The timer starts at boundary detection so the reported gap includes any
+    // cold load/seek work — it must stay honest about what the viewer saw.
+    const boundaryStarted = performance.now();
     const fromSlot = activeSlotRef.current;
     const toSlot = (fromSlot === 0 ? 1 : 0) as VideoSlot;
-    await loadSlot(toSlot, nextIndex, 0);
-    const outgoing = videoRefs.current[fromSlot];
-    const incoming = videoRefs.current[toSlot];
+    let incoming = videoRefs.current[toSlot];
+    const warm = !!incoming && slotIndexRef.current[toSlot] === nextIndex
+      && incoming.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
+    if (!warm) {
+      // Cold path (preload failed or was interrupted): load and seek now.
+      await loadSlot(toSlot, nextIndex, 0);
+      incoming = videoRefs.current[toSlot];
+    }
     if (!incoming) { handoffRef.current = false; return; }
-
-    const boundaryStarted = performance.now();
-    outgoing?.pause();
-    if (outgoing) outgoing.muted = true;
+    const outgoing = videoRefs.current[fromSlot];
+    // Swap synchronously: unmute the (already playing, pre-rolled) incoming
+    // slot first, then silence the outgoing one — a few ms of overlap beats a
+    // few ms of gap.
     incoming.muted = false;
+    if (outgoing) { outgoing.muted = true; outgoing.pause(); }
     activeSlotRef.current = toSlot;
     activeIndexRef.current = nextIndex;
     setActiveSlot(toSlot);
     select(clips[nextIndex].id);
     setPlayhead(clipStart(clips, nextIndex));
     try {
-      await incoming.play();
+      if (incoming.paused) await incoming.play();
       setHandoffGapMs(performance.now() - boundaryStarted);
     } catch {
       setPlaying(false);
     }
+    prerollForRef.current = null;
     handoffRef.current = false;
     preloadAfter(nextIndex);
   }, [clips, loadSlot, preloadAfter, select, setPlayhead]);
@@ -194,6 +245,9 @@ export default function Editor() {
         lastUiUpdateRef.current = now;
         setPlayhead(global);
       }
+      if (index + 1 < clips.length && v.currentTime >= clip.trimOut - PREROLL_SEC) {
+        preroll(index + 1);
+      }
       if (v.currentTime >= clip.trimOut - FRAME / 2) {
         if (index + 1 < clips.length) void handoff(index);
         else {
@@ -207,10 +261,11 @@ export default function Editor() {
     };
     frame = window.requestAnimationFrame(tick);
     return () => window.cancelAnimationFrame(frame);
-  }, [clips, handoff, playing, setPlayhead]);
+  }, [clips, handoff, playing, preroll, setPlayhead]);
 
   const togglePlay = async () => {
     if (playing) {
+      prerollForRef.current = null;
       videoRefs.current.forEach((video) => video?.pause());
       setPlaying(false);
     } else {

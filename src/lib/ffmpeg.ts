@@ -233,14 +233,25 @@ export async function exportMp4(
   // duplicated and dropped frames (measured ~28-40% duplicates), which is
   // exactly the stutter seen on saved clips. Preserving the captured
   // timestamps (VFR output) keeps playback as smooth as the recording.
+  // Seamless joins: MediaRecorder audio routinely starts late or ends a few
+  // hundred ms short of the video, and the concat filter delays each next
+  // segment to the end of the previous segment's longest stream — so a short
+  // audio track becomes an audible gap/click at every join. Cut both streams
+  // to the exact clip length: video via trim (the input-level -t cut is only
+  // packet-accurate on VFR sources) and audio via atrim + apad=whole_dur,
+  // which pads real silence up to the same length. Every segment then measures
+  // exactly clipLen on both streams and concat lines them up sample-tight.
   const parts: string[] = [];
   for (let i = 0; i < clips.length; i++) {
+    const len = clipLen(clips[i]);
     parts.push(
       `[${i}:v]scale=${output.width}:${output.height}:force_original_aspect_ratio=increase,` +
-        `crop=${output.width}:${output.height}:(in_w-out_w)/2:(in_h-out_h)/2,setsar=1,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS[v${i}]`,
+        `crop=${output.width}:${output.height}:(in_w-out_w)/2:(in_h-out_h)/2,setsar=1,format=yuv420p,settb=AVTB,` +
+        `setpts=PTS-STARTPTS,trim=end=${len}[v${i}]`,
     );
     parts.push(
-      `[${i}:a]aresample=48000:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`,
+      `[${i}:a]aresample=48000:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,` +
+        `asetpts=PTS-STARTPTS,atrim=end=${len},apad=whole_dur=${len}[a${i}]`,
     );
   }
   const concatIn = clips.map((_, i) => `[v${i}][a${i}]`).join('');
