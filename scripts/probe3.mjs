@@ -1,0 +1,15 @@
+import { chromium } from 'playwright-core';
+const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'] });
+const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, permissions: ['camera', 'microphone'], hasTouch: true, isMobile: true });
+const page = await ctx.newPage();
+page.on('console', m => console.log('CON:', m.type(), m.text().slice(0, 200)));
+page.on('pageerror', e => console.log('PAGEERR:', String(e).slice(0, 500)));
+await page.goto('http://localhost:4173/', { waitUntil: 'load' });
+await page.waitForSelector('button[aria-label="Start recording"]', { timeout: 15000 });
+await page.click('button[aria-label="Start recording"]');
+await page.waitForTimeout(2500);
+const stopVisible = await page.locator('button[aria-label="Stop recording"]').isVisible().catch(() => false);
+console.log('stopVisible:', stopVisible);
+console.log('body snippet:', (await page.textContent('body')).slice(0, 300));
+await page.screenshot({ path: 'scripts/probe3.png' });
+await browser.close();

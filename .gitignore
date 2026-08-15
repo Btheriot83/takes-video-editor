@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.vercel/
+*.log
+.DS_Store
+coverage/
+scripts/e2e-out/
+

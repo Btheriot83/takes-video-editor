@@ -1,0 +1,22 @@
+<!doctype html>
+<html><body><pre id="log">starting…</pre>
+<script type="module">
+const log = (m) => { document.getElementById('log').textContent += '\n' + m; console.log('[probe]', m); };
+try {
+  const { FFmpeg } = await import('./ffesm/index.js');
+  const ff = new FFmpeg();
+  ff.on('log', ({ message }) => log('ff: ' + message));
+  ff.on('progress', ({ time }) => log('progress ' + time));
+  log('loading core…');
+  const t0 = performance.now();
+  const u = (p) => new URL(p, document.baseURI).href;
+  await ff.load({ coreURL: u('ffmpeg/ffmpeg-core.js'), wasmURL: u('ffmpeg/ffmpeg-core.wasm') });
+  log('loaded in ' + Math.round(performance.now() - t0) + 'ms');
+  // make a 2s test clip: lavfi sources
+  await ff.exec(['-f', 'lavfi', '-i', 'testsrc=size=320x568:rate=30', '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '2', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', 'probe.mp4']);
+  const data = await ff.readFile('probe.mp4');
+  log('DONE bytes=' + data.byteLength + ' totalMs=' + Math.round(performance.now() - t0));
+} catch (e) {
+  log('FAILED: ' + (e?.message || e));
+}
+</script></body></html>
