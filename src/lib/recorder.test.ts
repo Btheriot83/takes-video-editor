@@ -1,0 +1,50 @@
+import { describe, it, expect } from 'vitest';
+import { captureConstraints, captureVideoBitrate } from './recorder';
+import { CAPTURE_DIMENSIONS, isUltraHDCapture } from '../types/clip';
+
+describe('captureConstraints', () => {
+  it('requests portrait 1080x1920 at 30fps for HD', () => {
+    const c = captureConstraints('environment', 'HD');
+    expect(c.width).toEqual({ ideal: 1080 });
+    expect(c.height).toEqual({ ideal: 1920 });
+    expect(c.frameRate).toEqual({ ideal: 30, max: 30 });
+    expect(c.facingMode).toEqual({ ideal: 'environment' });
+  });
+  it('requests portrait 2160x3840 for 4K and keeps the 30fps ceiling', () => {
+    const c = captureConstraints('user', '4K');
+    expect(c.width).toEqual({ ideal: 2160 });
+    expect(c.height).toEqual({ ideal: 3840 });
+    expect(c.frameRate).toEqual({ ideal: 30, max: 30 });
+    expect(c.facingMode).toEqual({ ideal: 'user' });
+  });
+  it('capture dimensions stay portrait (width < height)', () => {
+    for (const { width, height } of Object.values(CAPTURE_DIMENSIONS)) {
+      expect(width).toBeLessThan(height);
+    }
+  });
+});
+
+describe('isUltraHDCapture', () => {
+  it('accepts portrait and landscape 4K-class sizes', () => {
+    expect(isUltraHDCapture(2160, 3840)).toBe(true);
+    expect(isUltraHDCapture(3840, 2160)).toBe(true);
+  });
+  it('rejects HD, missing, and partial sizes', () => {
+    expect(isUltraHDCapture(1080, 1920)).toBe(false);
+    expect(isUltraHDCapture(1920, 3840)).toBe(false);
+    expect(isUltraHDCapture(undefined, undefined)).toBe(false);
+    expect(isUltraHDCapture(2160, undefined)).toBe(false);
+  });
+});
+
+describe('captureVideoBitrate', () => {
+  it('uses ~30 Mbps for delivered 4K frames', () => {
+    expect(captureVideoBitrate(2160, 3840)).toBe(30_000_000);
+    expect(captureVideoBitrate(3840, 2160)).toBe(30_000_000);
+  });
+  it('keeps the proven 6 Mbps rate when the camera fell back below 4K', () => {
+    expect(captureVideoBitrate(1080, 1920)).toBe(6_000_000);
+    expect(captureVideoBitrate(1280, 720)).toBe(6_000_000);
+    expect(captureVideoBitrate(undefined, undefined)).toBe(6_000_000);
+  });
+});

@@ -63,15 +63,40 @@ log('default portrait 9:16 frame verified');
 await page.setViewportSize({ width: 320, height: 568 });
 await page.screenshot({ path: `${OUT}/1-camera-compact.png` });
 const viewport = page.viewportSize();
-for (const ratio of ['16:9', '4:3', '1:1']) {
+for (const ratio of ['16:9', '4:3', '1:1', 'HD', '4K']) {
   const box = await page.getByRole('button', { name: ratio, exact: true }).boundingBox();
   if (!box || box.x < 0 || box.y < 0 || box.x + box.width > viewport.width || box.y + box.height > viewport.height) {
     throw new Error(`${ratio} selector is clipped on the mobile viewport`);
   }
   if (box.width < 44 || box.height < 44) throw new Error(`${ratio} selector hitbox is ${box.width}x${box.height}, expected at least 44x44`);
 }
-log('mobile ratio selector visibility and hitboxes verified at 320x568');
+log('mobile ratio + quality selector visibility and hitboxes verified at 320x568');
 await page.setViewportSize({ width: 390, height: 844 });
+
+// Capture quality: HD must be the default, and choosing 4K must reopen the
+// stream. The fake camera cannot promise 4K, so either the badge reports a
+// true >=2160 capture or the graceful "not available" notice must appear.
+if (await page.getByRole('button', { name: 'HD', exact: true }).getAttribute('aria-pressed') !== 'true') {
+  throw new Error('HD capture quality is not the default');
+}
+await page.getByRole('button', { name: '4K', exact: true }).click();
+await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
+const qualityFrame = page.locator('[data-camera-frame]');
+if (await qualityFrame.getAttribute('data-capture-quality') !== '4K') throw new Error('frame did not reflect the 4K capture setting');
+const capW = Number(await qualityFrame.getAttribute('data-capture-width')) || 0;
+const capH = Number(await qualityFrame.getAttribute('data-capture-height')) || 0;
+if (Math.min(capW, capH) >= 2160) {
+  log(`4K capture delivered (${capW}x${capH})`);
+} else {
+  await page.getByText('4K not available on this camera').waitFor({ timeout: 3000 });
+  const badge = await page.getByText(/^Camera /).textContent();
+  if (capW && capH && !badge.includes(`${capW}×${capH}`)) throw new Error(`capture badge "${badge}" does not reflect actual ${capW}x${capH}`);
+  log(`4K unavailable fallback verified (actual ${capW || '?'}x${capH || '?'} shown honestly)`);
+}
+await page.getByRole('button', { name: 'HD', exact: true }).click();
+await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
+if (await qualityFrame.getAttribute('data-capture-quality') !== 'HD') throw new Error('switching back to HD capture failed');
+log('capture quality toggle verified (back on HD)');
 
 // verify every project frame option changes the actual capture viewport
 for (const ratio of ['16:9', '4:3', '1:1']) {
@@ -144,6 +169,13 @@ for (let i = 0; i < 3; i++) {
       throw new Error('recording did not continue while the touch was held');
     }
     if (mediaRecorderStarts !== 1) throw new Error(`duplicate hold started ${mediaRecorderStarts} recorders`);
+    // Ratio and quality selectors must lock while a recording is running.
+    for (const control of ['16:9', 'HD', '4K']) {
+      if (!(await page.getByRole('button', { name: control, exact: true }).isDisabled())) {
+        throw new Error(`${control} selector stayed enabled while recording`);
+      }
+    }
+    log('ratio + quality selectors locked during recording');
   }
   await page.waitForTimeout(2000);
   const releaseStarted = Date.now();

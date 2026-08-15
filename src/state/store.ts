@@ -1,6 +1,6 @@
 import { create } from 'zustand';
-import { totalDuration, clipLen, DEFAULT_ASPECT_RATIO } from '../types/clip';
-import type { AspectRatio, Clip } from '../types/clip';
+import { totalDuration, clipLen, DEFAULT_ASPECT_RATIO, DEFAULT_CAPTURE_QUALITY } from '../types/clip';
+import type { AspectRatio, CaptureQuality, Clip } from '../types/clip';
 import { History, trimClip, splitClip, moveClip, duplicateClip, uid } from '../lib/editor';
 import {
   saveProject, loadProject, saveBlob, getBlob, deleteBlob, recRecover, recFinalize, gcBlobs, clearProject,
@@ -21,6 +21,7 @@ interface State {
   recoveredNotice: string | null;
   total: number;
   aspectRatio: AspectRatio;
+  captureQuality: CaptureQuality;
 
   init: () => Promise<void>;
   addClipFromBlob: (blob: Blob, mimeType: string, generateThumbs?: boolean) => Promise<Clip>;
@@ -29,6 +30,7 @@ interface State {
   setScreen: (s: Screen) => void;
   setPlayhead: (t: number) => void;
   setAspectRatio: (aspectRatio: AspectRatio) => void;
+  setCaptureQuality: (captureQuality: CaptureQuality) => void;
 
   commit: (next: Clip[], selectId?: string | null) => void;
   undo: () => void;
@@ -45,20 +47,20 @@ interface State {
 const history = new History();
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-function persist(clips: Clip[], aspectRatio: AspectRatio) {
+function persist(clips: Clip[], aspectRatio: AspectRatio, captureQuality: CaptureQuality) {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    saveProject(clips, aspectRatio).catch(() => {});
+    saveProject(clips, aspectRatio, captureQuality).catch(() => {});
     // NOTE: no blob GC here — undo/redo can restore clips referencing older
     // blobs. Orphaned blobs are reclaimed on newProject / clearAllData.
   }, 400);
 }
 
-async function persistNow(clips: Clip[], aspectRatio: AspectRatio) {
+async function persistNow(clips: Clip[], aspectRatio: AspectRatio, captureQuality: CaptureQuality) {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = null;
-  await saveProject(clips, aspectRatio);
+  await saveProject(clips, aspectRatio, captureQuality);
 }
 
 export const useStore = create<State>((set, get) => ({
@@ -72,6 +74,7 @@ export const useStore = create<State>((set, get) => ({
   recoveredNotice: null,
   total: 0,
   aspectRatio: DEFAULT_ASPECT_RATIO,
+  captureQuality: DEFAULT_CAPTURE_QUALITY,
 
   init: async () => {
     let notice: string | null = null;
@@ -97,6 +100,9 @@ export const useStore = create<State>((set, get) => ({
         // Empty projects always open in the requested vertical default.
         // Existing projects retain their chosen frame for editing/export.
         aspectRatio: existing.length ? (p?.aspectRatio ?? DEFAULT_ASPECT_RATIO) : DEFAULT_ASPECT_RATIO,
+        // Capture quality is a camera preference, not a project frame, so it
+        // is restored even when the project itself is empty.
+        captureQuality: p?.captureQuality ?? DEFAULT_CAPTURE_QUALITY,
       });
 
       const rec = await recRecover();
@@ -132,7 +138,7 @@ export const useStore = create<State>((set, get) => ({
       thumbs: [],
     };
     const clips = [...get().clips, clip];
-    await persistNow(clips, get().aspectRatio);
+    await persistNow(clips, get().aspectRatio, get().captureQuality);
     history.push(get().clips);
     set({ clips, selectedId: clip.id, total: totalDuration(clips), canUndo: history.canUndo, canRedo: false });
 
@@ -143,7 +149,7 @@ export const useStore = create<State>((set, get) => ({
       if (!latest.some((item) => item.id === clip.id)) return;
       const withThumbs = latest.map((item) => (item.id === clip.id ? { ...item, thumbs } : item));
       set({ clips: withThumbs });
-      persist(withThumbs, get().aspectRatio);
+      persist(withThumbs, get().aspectRatio, get().captureQuality);
     }).catch(() => { /* thumbnails are non-essential */ });
     return clip;
   },
@@ -161,7 +167,11 @@ export const useStore = create<State>((set, get) => ({
   setPlayhead: (t) => set({ playhead: t }),
   setAspectRatio: (aspectRatio) => {
     set({ aspectRatio });
-    persist(get().clips, aspectRatio);
+    persist(get().clips, aspectRatio, get().captureQuality);
+  },
+  setCaptureQuality: (captureQuality) => {
+    set({ captureQuality });
+    persist(get().clips, get().aspectRatio, captureQuality);
   },
 
   commit: (next, selectId) => {
@@ -173,20 +183,20 @@ export const useStore = create<State>((set, get) => ({
       canUndo: history.canUndo,
       canRedo: history.canRedo,
     });
-    persist(next, get().aspectRatio);
+    persist(next, get().aspectRatio, get().captureQuality);
   },
 
   undo: () => {
     const prev = history.undo(get().clips);
     if (!prev) return;
     set({ clips: prev, total: totalDuration(prev), canUndo: history.canUndo, canRedo: history.canRedo });
-    persist(prev, get().aspectRatio);
+    persist(prev, get().aspectRatio, get().captureQuality);
   },
   redo: () => {
     const next = history.redo(get().clips);
     if (!next) return;
     set({ clips: next, total: totalDuration(next), canUndo: history.canUndo, canRedo: history.canRedo });
-    persist(next, get().aspectRatio);
+    persist(next, get().aspectRatio, get().captureQuality);
   },
 
   trimSelected: (trimIn, trimOut) => {
@@ -242,7 +252,8 @@ export const useStore = create<State>((set, get) => ({
       clips: [], selectedId: null, screen: 'camera', playhead: 0, total: 0,
       canUndo: false, canRedo: false, aspectRatio: DEFAULT_ASPECT_RATIO,
     });
-    await saveProject([], DEFAULT_ASPECT_RATIO);
+    // Capture quality is a device preference, so it survives New project.
+    await saveProject([], DEFAULT_ASPECT_RATIO, get().captureQuality);
   },
 
   dismissNotice: () => set({ recoveredNotice: null }),

@@ -1,7 +1,23 @@
 export type AspectRatio = '16:9' | '4:3' | '1:1';
 export type ExportQuality = '1080p' | '4K';
+export type CaptureQuality = 'HD' | '4K';
 
 export const DEFAULT_ASPECT_RATIO: AspectRatio = '16:9';
+export const DEFAULT_CAPTURE_QUALITY: CaptureQuality = 'HD';
+
+/** Requested capture size per quality, portrait convention (width < height). */
+export const CAPTURE_DIMENSIONS: Record<CaptureQuality, { width: number; height: number }> = {
+  HD: { width: 1080, height: 1920 },
+  '4K': { width: 2160, height: 3840 },
+};
+
+/**
+ * True when a capture size is 4K-class regardless of sensor orientation
+ * (2160x3840 portrait or 3840x2160 landscape both qualify).
+ */
+export function isUltraHDCapture(width?: number, height?: number): boolean {
+  return Math.min(width ?? 0, height ?? 0) >= 2160;
+}
 
 export const ASPECT_RATIOS: Record<AspectRatio, { css: string; outputLabel: string }> = {
   '16:9': { css: '9 / 16', outputLabel: '9:16 portrait' },
@@ -40,6 +56,7 @@ export interface Project {
   updatedAt: number;
   name: string;
   aspectRatio?: AspectRatio;
+  captureQuality?: CaptureQuality;
 }
 
 export const FRAME = 1 / 30;
