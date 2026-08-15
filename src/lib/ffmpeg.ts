@@ -1,5 +1,5 @@
-import { ASPECT_RATIOS, clipLen } from '../types/clip';
-import type { AspectRatio, Clip } from '../types/clip';
+import { clipLen, exportDimensions } from '../types/clip';
+import type { AspectRatio, Clip, ExportQuality } from '../types/clip';
 import type { FFmpeg } from '@ffmpeg/ffmpeg';
 
 // We load @ffmpeg/ffmpeg's ESM build from same-origin static files
@@ -33,42 +33,95 @@ export interface ExportResult {
   blob: Blob;
   bytes: number;
   seconds: number;
+  mode: 'native' | 'remuxed' | 'transcoded';
 }
 
+const isUntrimmed = (clip: Clip) =>
+  clip.trimIn <= 1 / 60 && Math.abs(clip.trimOut - clip.duration) <= 1 / 60;
+
 /**
- * Export clips to a clean 1080x1920 H.264/AAC MP4.
- * Everything is re-encoded through one filter graph → A/V stays in sync,
- * orientation is normalized, metadata is stripped.
+ * Export clips to MP4 at the selected output profile. A compatible source is
+ * returned unchanged, compatible untrimmed sources are first offered to the
+ * concat demuxer, and only the remaining cases enter the render pipeline.
  */
 export async function exportMp4(
   clips: Clip[],
   getBlob: (key: string) => Promise<Blob | undefined>,
   aspectRatio: AspectRatio,
+  quality: ExportQuality,
   onProgress?: (phase: string, p: number) => void,
 ): Promise<ExportResult> {
   if (!clips.length) throw new Error('Nothing to export');
-  const ffmpeg = await getFFmpeg();
-  onProgress?.('Preparing encoder', 0);
-
-  const ext = (m: string) => (m.includes('mp4') ? 'mp4' : 'webm');
-  const inputs: string[] = [];
-
+  const started = performance.now();
+  onProgress?.('Reading clips', 0);
+  const blobs: Blob[] = [];
   for (let i = 0; i < clips.length; i++) {
     const b = await getBlob(clips[i].blobKey);
     if (!b) throw new Error(`Missing media for clip ${i + 1}`);
-    const name = `in${i}.${ext(clips[i].mimeType)}`;
-    await ffmpeg.writeFile(name, new Uint8Array(await b.arrayBuffer()));
-    inputs.push(name);
+    blobs.push(b);
   }
 
   const total = clips.reduce((s, c) => s + clipLen(c), 0);
+  const output = exportDimensions(aspectRatio, quality);
+  const sourcesMatchOutput = clips.every((clip) =>
+    clip.width === output.width && clip.height === output.height,
+  );
+  const allMp4 = clips.every((clip, i) =>
+    clip.mimeType.includes('mp4') || blobs[i].type.includes('mp4'),
+  );
+  const allUntrimmed = clips.every(isUntrimmed);
+  const sameCameraCodec = clips.every((clip) =>
+    clip.mimeType === clips[0].mimeType && clip.mimeType.includes('avc1'),
+  );
+
+  if (clips.length === 1 && allMp4 && allUntrimmed && sourcesMatchOutput) {
+    onProgress?.('Using camera original', 1);
+    return {
+      blob: blobs[0],
+      bytes: blobs[0].size,
+      seconds: (performance.now() - started) / 1000,
+      mode: 'native',
+    };
+  }
+
+  const ffmpeg = await getFFmpeg();
+  onProgress?.('Preparing media', 0.02);
+  const ext = (m: string) => (m.includes('mp4') ? 'mp4' : 'webm');
+  const inputs: string[] = [];
+  for (let i = 0; i < clips.length; i++) {
+    const name = `in${i}.${ext(clips[i].mimeType || blobs[i].type)}`;
+    await ffmpeg.writeFile(name, new Uint8Array(await blobs[i].arrayBuffer()));
+    inputs.push(name);
+  }
+
+  if (clips.length > 1 && allMp4 && allUntrimmed && sourcesMatchOutput && sameCameraCodec) {
+    const concatFile = 'concat.txt';
+    const concatBody = inputs.map((name) => `file '${name}'`).join('\n');
+    await ffmpeg.writeFile(concatFile, new TextEncoder().encode(concatBody));
+    onProgress?.('Joining without re-encoding', 0.25);
+    const remuxCode = await ffmpeg.exec([
+      '-f', 'concat', '-safe', '0', '-i', concatFile,
+      '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy',
+      '-movflags', '+faststart', '-map_metadata', '-1', 'out.mp4',
+    ]);
+    if (remuxCode === 0) {
+      const data = await ffmpeg.readFile('out.mp4');
+      const bytes = (data as Uint8Array).byteLength;
+      const blob = new Blob([new Uint8Array(data as Uint8Array).buffer as ArrayBuffer], { type: 'video/mp4' });
+      for (const name of [...inputs, concatFile, 'out.mp4']) ffmpeg.deleteFile(name).catch(() => {});
+      onProgress?.('Done', 1);
+      return { blob, bytes, seconds: (performance.now() - started) / 1000, mode: 'remuxed' };
+    }
+    console.warn('[export] lossless join was incompatible; rendering instead');
+    await ffmpeg.deleteFile(concatFile).catch(() => {});
+    await ffmpeg.deleteFile('out.mp4').catch(() => {});
+  }
 
   const args: string[] = [];
+  args.push('-fflags', '+genpts');
   for (let i = 0; i < clips.length; i++) {
     args.push('-ss', String(clips[i].trimIn), '-t', String(clipLen(clips[i])), '-i', inputs[i]);
   }
-
-  const output = ASPECT_RATIOS[aspectRatio];
 
   // Per-clip normalize to the selected portrait frame, 30fps, reset timestamps.
   const parts: string[] = [];
@@ -78,7 +131,7 @@ export async function exportMp4(
         `crop=${output.width}:${output.height}:(in_w-out_w)/2:(in_h-out_h)/2,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v${i}]`,
     );
     parts.push(
-      `[${i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`,
+      `[${i}:a]aresample=48000:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`,
     );
   }
   const concatIn = clips.map((_, i) => `[v${i}][a${i}]`).join('');
@@ -87,9 +140,11 @@ export async function exportMp4(
   args.push(
     '-filter_complex', parts.join(';'),
     '-map', '[vout]', '-map', '[aout]',
-    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-profile:v', 'high', '-level', '4.0',
+    '-c:v', 'libx264', '-preset', quality === '4K' ? 'ultrafast' : 'veryfast', '-crf', quality === '4K' ? '22' : '20',
+    '-profile:v', 'high', '-level', quality === '4K' ? '5.1' : '4.0',
     '-c:a', 'aac', '-b:a', '128k',
     '-movflags', '+faststart',
+    '-fps_mode', 'cfr', '-video_track_timescale', '90000', '-avoid_negative_ts', 'make_zero',
     '-map_metadata', '-1',
     '-metadata', 'encoder=',
     'out.mp4',
@@ -102,7 +157,6 @@ export async function exportMp4(
   ffmpeg.on('progress', progressCb);
 
   console.log('[export] args:', args.join(' '));
-  const t0 = performance.now();
   const ok = await ffmpeg.exec(args);
   ffmpeg.off('progress', progressCb);
   if (ok !== 0) throw new Error('Export failed (encoder error)');
@@ -116,30 +170,39 @@ export async function exportMp4(
   ffmpeg.deleteFile('out.mp4').catch(() => {});
 
   onProgress?.('Done', 1);
-  return { blob, bytes, seconds: (performance.now() - t0) / 1000 };
+  return { blob, bytes, seconds: (performance.now() - started) / 1000, mode: 'transcoded' };
 }
 
-/** Try native share sheet with the file; returns false if unavailable/cancelled. */
-export async function shareFile(blob: Blob, filename: string): Promise<'shared' | 'downloaded' | 'unavailable'> {
+/** Native share reports completion/cancellation, but not the destination chosen by the OS. */
+export async function shareFile(blob: Blob, filename: string): Promise<'shared' | 'cancelled' | 'unavailable' | 'failed'> {
   const file = new File([blob], filename, { type: 'video/mp4' });
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
     try {
       await navigator.share({ files: [file] });
       return 'shared';
     } catch (error: unknown) {
-      if (error instanceof DOMException && error.name === 'AbortError') return 'shared'; // user dismissed sheet; not an error
+      if (error instanceof DOMException && error.name === 'AbortError') return 'cancelled';
+      return 'failed';
     }
   }
   return 'unavailable';
 }
 
-export function downloadBlob(blob: Blob, filename: string) {
+/** Requests a browser download. Browsers expose no API to confirm its final OS location. */
+export function downloadBlob(blob: Blob, filename: string): boolean {
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  try {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Large iOS downloads may still be handed to the OS after the click.
+    window.setTimeout(() => URL.revokeObjectURL(url), 5 * 60_000);
+    return true;
+  } catch {
+    URL.revokeObjectURL(url);
+    return false;
+  }
 }

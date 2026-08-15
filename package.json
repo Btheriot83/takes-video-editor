@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "smoke": "node scripts/e2e.mjs",
+    "smoke:4k": "node scripts/e2e-4k.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

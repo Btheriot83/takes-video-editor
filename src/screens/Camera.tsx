@@ -43,6 +43,7 @@ export default function Camera() {
   const [zoom, setZoom] = useState(1);
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
+  const [captureSize, setCaptureSize] = useState<{ width?: number; height?: number; frameRate?: number } | null>(null);
   const [capabilityNotice, setCapabilityNotice] = useState<string | null>(null);
 
   const {
@@ -77,6 +78,7 @@ export default function Camera() {
       setZoomRange(nextZoomRange);
       setZoom(settings?.zoom ?? nextZoomRange?.min ?? 1);
       setTorchSupported(nextFacing === 'environment' && capabilities?.torch === true);
+      setCaptureSize({ width: settings?.width, height: settings?.height, frameRate: settings?.frameRate });
       setStreamReady(true);
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
@@ -86,6 +88,7 @@ export default function Camera() {
     } catch (cameraError: unknown) {
       setZoomRange(null);
       setTorchSupported(false);
+      setCaptureSize(null);
       setError(
         cameraError instanceof DOMException && cameraError.name === 'NotAllowedError'
           ? 'Camera access was denied. Allow camera and microphone permission, then try again.'
@@ -124,7 +127,9 @@ export default function Camera() {
     try {
       const blob = await active.stop();
       if (blob.size > 0) {
-        await addClipFromBlob(blob, blob.type);
+        // Camera thumbnails are deferred so mobile decoders are fully
+        // available for the next recording instead of competing in parallel.
+        await addClipFromBlob(blob, blob.type, false);
         // Clear crash-recovery chunks only after the media and project entry
         // are both safely stored.
         await active.finalize();
@@ -324,9 +329,10 @@ export default function Camera() {
       >
         <div
           data-camera-frame
-          data-output-width={ASPECT_RATIOS[aspectRatio].width}
-          data-output-height={ASPECT_RATIOS[aspectRatio].height}
-          data-output-ratio={ASPECT_RATIOS[aspectRatio].outputLabel}
+          data-frame-ratio={ASPECT_RATIOS[aspectRatio].outputLabel}
+          data-capture-width={captureSize?.width}
+          data-capture-height={captureSize?.height}
+          data-capture-frame-rate={captureSize?.frameRate}
           className="relative max-h-full max-w-full overflow-hidden bg-neutral-900"
           style={{
             aspectRatio: ASPECT_RATIOS[aspectRatio].css,
@@ -352,6 +358,11 @@ export default function Camera() {
 
           <div className="absolute right-3 top-3 rounded-full bg-black/65 px-2.5 py-1.5 text-[10px] font-semibold text-white/80">
             {ASPECT_RATIOS[aspectRatio].outputLabel}
+          </div>
+
+          <div className="absolute left-3 bottom-3 rounded-full bg-black/65 px-2.5 py-1.5 text-[10px] text-white/70">
+            Camera {captureSize?.width && captureSize?.height ? `${captureSize.width}×${captureSize.height}` : 'device managed'}
+            {captureSize?.frameRate ? ` · ${captureSize.frameRate.toFixed(0)} fps` : ''}
           </div>
 
           {recording && (

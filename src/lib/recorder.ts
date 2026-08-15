@@ -34,6 +34,7 @@ export async function getCameraStream(facing: 'user' | 'environment'): Promise<M
       facingMode: { ideal: facing },
       width: { ideal: 1080 },
       height: { ideal: 1920 },
+      frameRate: { ideal: 30, max: 30 },
     },
     audio: { echoCancellation: true, noiseSuppression: true },
   };
@@ -47,7 +48,7 @@ export async function getCameraStream(facing: 'user' | 'environment'): Promise<M
 
 /**
  * Start an interruption-safe recording. Chunks are flushed to IndexedDB
- * every second so a crash/kill loses at most ~1s, never completed clips.
+ * every two seconds so a crash/kill loses at most ~2s, never completed clips.
  */
 export async function startRecording(
   stream: MediaStream,
@@ -55,21 +56,28 @@ export async function startRecording(
   facing: 'user' | 'environment' = 'environment',
 ): Promise<ActiveRecording> {
   const mimeType = pickMimeType();
-  console.log('[rec] mimeType=', mimeType);
+  const videoSettings = stream.getVideoTracks()[0]?.getSettings?.();
+  const audioSettings = stream.getAudioTracks()[0]?.getSettings?.();
+  console.log('[rec] capture=', { mimeType, videoSettings, audioSettings });
   const rec = new MediaRecorder(stream, {
     mimeType: mimeType || undefined,
-    videoBitsPerSecond: 8_000_000,
+    videoBitsPerSecond: 6_000_000,
     audioBitsPerSecond: 128_000,
   });
 
   let seq = 0;
   const chunks: Blob[] = [];
   const pendingChunkWrites: Promise<void>[] = [];
+  const chunkIntervals: number[] = [];
+  let lastChunkAt = performance.now();
   console.log('[rec] recBegin…');
   await recBegin({ mimeType: rec.mimeType || mimeType, startedAt: Date.now(), facing });
 
   rec.ondataavailable = (e) => {
     if (e.data && e.data.size > 0) {
+      const now = performance.now();
+      chunkIntervals.push(now - lastChunkAt);
+      lastChunkAt = now;
       chunks.push(e.data);
       const write = recChunk(seq++, e.data).catch(() => {});
       pendingChunkWrites.push(write);
@@ -86,7 +94,9 @@ export async function startRecording(
   }, 100);
 
   console.log('[rec] starting mediarecorder');
-  rec.start(1000);
+  // Fewer, larger chunks reduce IndexedDB/main-thread churn during capture
+  // while retaining interruption recovery at a two-second cadence.
+  rec.start(2000);
   console.log('[rec] started, state=', rec.state);
 
   return {
@@ -112,6 +122,15 @@ export async function startRecording(
           window.clearTimeout(timeout);
           clearInterval(timer);
           const blob = new Blob(chunks, { type: rec.mimeType || mimeType });
+          console.log('[rec] completed=', {
+            elapsed,
+            bytes: blob.size,
+            chunks: chunks.length,
+            chunkIntervalsMs: chunkIntervals.map((interval) => Math.round(interval)),
+            mimeType: blob.type,
+            videoBitsPerSecond: rec.videoBitsPerSecond,
+            audioBitsPerSecond: rec.audioBitsPerSecond,
+          });
           resolve(blob);
         };
         rec.onerror = () => {

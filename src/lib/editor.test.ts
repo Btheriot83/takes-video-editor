@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { trimClip, splitClip, moveClip, History, locate, clipStart } from './editor';
-import { ASPECT_RATIOS, clipLen, totalDuration, FRAME } from '../types/clip';
+import { ASPECT_RATIOS, clipLen, totalDuration, FRAME, exportDimensions } from '../types/clip';
 import type { Clip } from '../types/clip';
 
 const mk = (id: string, dur: number, trimIn = 0, trimOut?: number): Clip => ({
@@ -105,9 +105,11 @@ describe('locate / clipStart', () => {
 });
 
 describe('aspect-ratio export targets', () => {
-  it('keeps every supported frame mapped to its intended output size', () => {
-    expect(ASPECT_RATIOS['16:9']).toMatchObject({ css: '9 / 16', outputLabel: '9:16 portrait', width: 1080, height: 1920 });
-    expect(ASPECT_RATIOS['4:3']).toMatchObject({ css: '3 / 4', outputLabel: '3:4 portrait', width: 1080, height: 1440 });
-    expect(ASPECT_RATIOS['1:1']).toMatchObject({ css: '1 / 1', outputLabel: '1:1 square', width: 1080, height: 1080 });
+  it('keeps framing separate from 1080p and 4K export dimensions', () => {
+    expect(ASPECT_RATIOS['16:9']).toMatchObject({ css: '9 / 16', outputLabel: '9:16 portrait' });
+    expect(exportDimensions('16:9', '1080p')).toEqual({ width: 1080, height: 1920 });
+    expect(exportDimensions('16:9', '4K')).toEqual({ width: 2160, height: 3840 });
+    expect(exportDimensions('4:3', '4K')).toEqual({ width: 2160, height: 2880 });
+    expect(exportDimensions('1:1', '4K')).toEqual({ width: 2160, height: 2160 });
   });
 });

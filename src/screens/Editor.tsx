@@ -4,13 +4,43 @@ import {
   ChevronLeft, ChevronRight,
 } from 'lucide-react';
 import { useStore } from '../state/store';
-import { ASPECT_RATIOS, clipLen, totalDuration, fmtTime, FRAME } from '../types/clip';
-import type { Clip } from '../types/clip';
+import { ASPECT_RATIOS, clipLen, totalDuration, fmtTime, FRAME, exportDimensions } from '../types/clip';
+import type { Clip, ExportQuality } from '../types/clip';
 import { getBlob } from '../lib/db';
 import { locate, clipStart } from '../lib/editor';
 import ExportSheet from '../components/ExportSheet';
 
 const PX_PER_SEC = 44;
+type VideoSlot = 0 | 1;
+
+function waitForMedia(v: HTMLVideoElement, timeoutMs = 1800): Promise<void> {
+  if (v.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      window.clearTimeout(timeout);
+      v.removeEventListener('canplay', done);
+      v.removeEventListener('error', done);
+      resolve();
+    };
+    const timeout = window.setTimeout(done, timeoutMs);
+    v.addEventListener('canplay', done, { once: true });
+    v.addEventListener('error', done, { once: true });
+  });
+}
+
+function seekMedia(v: HTMLVideoElement, time: number): Promise<void> {
+  if (Math.abs(v.currentTime - time) < 0.02) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      window.clearTimeout(timeout);
+      v.removeEventListener('seeked', done);
+      resolve();
+    };
+    const timeout = window.setTimeout(done, 900);
+    v.addEventListener('seeked', done, { once: true });
+    v.currentTime = time;
+  });
+}
 
 export default function Editor() {
   const {
@@ -20,11 +50,17 @@ export default function Editor() {
     aspectRatio,
   } = useStore();
 
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const urlRef = useRef<string | null>(null);
-  const switchingSourceRef = useRef(false);
+  const videoRefs = useRef<[HTMLVideoElement | null, HTMLVideoElement | null]>([null, null]);
+  const activeSlotRef = useRef<VideoSlot>(0);
+  const activeIndexRef = useRef(0);
+  const slotIndexRef = useRef<[number | null, number | null]>([null, null]);
+  const handoffRef = useRef(false);
+  const lastUiUpdateRef = useRef(0);
   const [playing, setPlaying] = useState(false);
+  const [activeSlot, setActiveSlot] = useState<VideoSlot>(0);
+  const [handoffGapMs, setHandoffGapMs] = useState<number | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
+  const [exportQuality, setExportQuality] = useState<ExportQuality>('4K');
   const [clipUrls, setClipUrls] = useState<Record<string, string>>({});
   const clipUrlsRef = useRef<Record<string, string>>({});
   const fileRef = useRef<HTMLInputElement>(null);
@@ -39,6 +75,7 @@ export default function Editor() {
   const total = useMemo(() => totalDuration(clips), [clips]);
   const selected = clips.find((c) => c.id === selectedId) ?? null;
   const selIdx = clips.findIndex((c) => c.id === selectedId);
+  const output = exportDimensions(aspectRatio, exportQuality);
 
   // object URLs for all clips
   useEffect(() => {
@@ -59,29 +96,47 @@ export default function Editor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clips.map((c) => c.blobKey).join(',')]);
 
-  // position video element at playhead
-  const syncVideo = useCallback(async (t: number, autoplay = false) => {
-    const v = videoRef.current;
-    const loc = locate(clips, t);
-    if (!v || !loc) return;
-    const clip = clips[loc.index];
-    const url = clipUrls[clip.blobKey];
-    if (!url) return;
-    if (urlRef.current !== url) {
-      switchingSourceRef.current = true;
-      urlRef.current = url;
+  const loadSlot = useCallback(async (slot: VideoSlot, index: number, offset = 0) => {
+    const v = videoRefs.current[slot];
+    const clip = clips[index];
+    const url = clip && clipUrls[clip.blobKey];
+    if (!v || !clip || !url) return false;
+    if (slotIndexRef.current[slot] !== index || v.src !== url) {
+      v.pause();
+      v.muted = slot !== activeSlotRef.current;
       v.src = url;
-      await new Promise<void>((res) => {
-        if (v.readyState >= 1) return res();
-        v.onloadedmetadata = () => res();
-      });
+      v.load();
+      slotIndexRef.current[slot] = index;
+      await waitForMedia(v);
     }
-    v.currentTime = clip.trimIn + loc.offset;
-    if (autoplay) {
-      try { await v.play(); } catch { /* browser can reject interrupted play */ }
-    }
-    switchingSourceRef.current = false;
+    await seekMedia(v, clip.trimIn + offset);
+    return v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
   }, [clips, clipUrls]);
+
+  const preloadAfter = useCallback((index: number) => {
+    const nextIndex = index + 1;
+    if (nextIndex >= clips.length) return;
+    const slot = (activeSlotRef.current === 0 ? 1 : 0) as VideoSlot;
+    void loadSlot(slot, nextIndex, 0);
+  }, [clips.length, loadSlot]);
+
+  // Position one video while the second slot preloads the adjacent clip.
+  const syncVideo = useCallback(async (t: number, autoplay = false) => {
+    const loc = locate(clips, t);
+    if (!loc) return;
+    const loadedSlot = slotIndexRef.current.findIndex((index) => index === loc.index);
+    const slot = (loadedSlot >= 0 ? loadedSlot : activeSlotRef.current) as VideoSlot;
+    videoRefs.current.forEach((video) => video?.pause());
+    if (!await loadSlot(slot, loc.index, loc.offset)) return;
+    activeSlotRef.current = slot;
+    activeIndexRef.current = loc.index;
+    setActiveSlot(slot);
+    videoRefs.current.forEach((video, index) => { if (video) video.muted = index !== slot; });
+    if (autoplay) {
+      try { await videoRefs.current[slot]?.play(); } catch { return; }
+    }
+    preloadAfter(loc.index);
+  }, [clips, loadSlot, preloadAfter]);
 
   // External scrubs/selections seek the media element. Native playback owns
   // currentTime while playing; seeking it again after every timeupdate turns
@@ -90,41 +145,73 @@ export default function Editor() {
     if (!playing) void syncVideo(playhead);
   }, [playhead, selectedId, playing, syncVideo]);
 
-  // playback loop across clips
-  useEffect(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    const onTime = () => {
-      const loc = locate(clips, playheadRef.current);
-      if (!loc) return;
-      const clip = clips[loc.index];
-      if (urlRef.current !== clipUrls[clip.blobKey]) return; // src switched; onTime from old
-      const offset = v.currentTime - clip.trimIn;
-      const global = clipStart(clips, loc.index) + Math.max(0, offset);
-      setPlayhead(global);
-      if (v.currentTime >= clip.trimOut - 0.02) {
-        const nextIdx = loc.index + 1;
-        if (nextIdx < clips.length) {
-          select(clips[nextIdx].id);
-          syncVideo(clipStart(clips, nextIdx), true);
-        } else {
-          setPlaying(false);
-          v.pause();
-        }
-      }
-    };
-    v.addEventListener('timeupdate', onTime);
-    return () => v.removeEventListener('timeupdate', onTime);
-  }, [clips, clipUrls, select, setPlayhead, syncVideo]);
-
   const playheadRef = useRef(playhead);
   playheadRef.current = playhead;
 
+  const handoff = useCallback(async (fromIndex: number) => {
+    if (handoffRef.current) return;
+    const nextIndex = fromIndex + 1;
+    if (nextIndex >= clips.length) return;
+    handoffRef.current = true;
+    const fromSlot = activeSlotRef.current;
+    const toSlot = (fromSlot === 0 ? 1 : 0) as VideoSlot;
+    await loadSlot(toSlot, nextIndex, 0);
+    const outgoing = videoRefs.current[fromSlot];
+    const incoming = videoRefs.current[toSlot];
+    if (!incoming) { handoffRef.current = false; return; }
+
+    const boundaryStarted = performance.now();
+    outgoing?.pause();
+    if (outgoing) outgoing.muted = true;
+    incoming.muted = false;
+    activeSlotRef.current = toSlot;
+    activeIndexRef.current = nextIndex;
+    setActiveSlot(toSlot);
+    select(clips[nextIndex].id);
+    setPlayhead(clipStart(clips, nextIndex));
+    try {
+      await incoming.play();
+      setHandoffGapMs(performance.now() - boundaryStarted);
+    } catch {
+      setPlaying(false);
+    }
+    handoffRef.current = false;
+    preloadAfter(nextIndex);
+  }, [clips, loadSlot, preloadAfter, select, setPlayhead]);
+
+  // Frame-timed playback avoids the coarse 200–250ms cadence of timeupdate.
+  useEffect(() => {
+    if (!playing) return;
+    let frame = 0;
+    const tick = (now: number) => {
+      const index = activeIndexRef.current;
+      const clip = clips[index];
+      const v = videoRefs.current[activeSlotRef.current];
+      if (!clip || !v) return;
+      const global = clipStart(clips, index) + Math.max(0, v.currentTime - clip.trimIn);
+      playheadRef.current = global;
+      if (now - lastUiUpdateRef.current >= 80) {
+        lastUiUpdateRef.current = now;
+        setPlayhead(global);
+      }
+      if (v.currentTime >= clip.trimOut - FRAME / 2) {
+        if (index + 1 < clips.length) void handoff(index);
+        else {
+          v.pause();
+          setPlayhead(totalDuration(clips));
+          setPlaying(false);
+          return;
+        }
+      }
+      frame = window.requestAnimationFrame(tick);
+    };
+    frame = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(frame);
+  }, [clips, handoff, playing, setPlayhead]);
+
   const togglePlay = async () => {
-    const v = videoRef.current;
-    if (!v) return;
     if (playing) {
-      v.pause();
+      videoRefs.current.forEach((video) => video?.pause());
       setPlaying(false);
     } else {
       if (playhead >= total - 0.05) setPlayhead(0);
@@ -133,27 +220,23 @@ export default function Editor() {
     }
   };
 
-  useEffect(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    const onPause = () => {
-      if (!switchingSourceRef.current) setPlaying(false);
-    };
-    v.addEventListener('pause', onPause);
-    return () => v.removeEventListener('pause', onPause);
-  }, []);
-
   return (
-    <div data-editor-playhead={playhead.toFixed(3)} className="fixed inset-0 bg-neutral-950 text-white flex flex-col select-none">
+    <div data-editor-playhead={playhead.toFixed(3)} data-editor-active-slot={activeSlot}
+      data-last-handoff-gap-ms={handoffGapMs?.toFixed(1) ?? ''}
+      className="fixed inset-0 bg-neutral-950 text-white flex flex-col select-none">
       {/* header */}
       <div className="pt-[env(safe-area-inset-top)] px-3 py-2.5 flex items-center justify-between border-b border-white/10">
-        <button onClick={() => { videoRef.current?.pause(); setPlaying(false); setScreen('camera'); }}
+        <button onClick={() => { videoRefs.current.forEach((video) => video?.pause()); setPlaying(false); setScreen('camera'); }}
           className="flex items-center gap-1 text-sm text-white/80 active:opacity-60 px-2 py-1.5">
           <ArrowLeft size={18} /> Camera
         </button>
         <div className="text-center text-sm tabular-nums text-white/70">
           <div>{fmtTime(playhead)} <span className="text-white/40">/ {fmtTime(total)}</span></div>
-          <div className="text-[10px] font-semibold text-white/45">{ASPECT_RATIOS[aspectRatio].outputLabel}</div>
+          <button type="button" onClick={() => setExportQuality((quality) => quality === '4K' ? '1080p' : '4K')}
+            aria-label={`Export quality ${exportQuality}. Tap to switch`}
+            className="min-h-6 rounded-full px-2 text-[10px] font-semibold text-white/55 active:bg-white/10">
+            {exportQuality} export
+          </button>
         </div>
         <div className="flex items-center gap-1">
           <button onClick={undo} disabled={!canUndo} aria-label="Undo"
@@ -162,21 +245,26 @@ export default function Editor() {
             className="p-2 rounded-lg active:bg-white/10 disabled:opacity-30"><Redo2 size={18} /></button>
           <button onClick={() => setExportOpen(true)} disabled={!clips.length}
             className="ml-1 bg-white text-black text-sm font-semibold px-3.5 py-1.5 rounded-full active:scale-95 disabled:opacity-30 flex items-center gap-1.5">
-            <Download size={15} /> Save video
+            <Download size={15} /> Export video
           </button>
         </div>
       </div>
 
       {/* preview */}
       <div className="relative flex-1 min-h-0 bg-black flex items-center justify-center overflow-hidden">
-        <div data-editor-frame data-output-width={ASPECT_RATIOS[aspectRatio].width}
-          data-output-height={ASPECT_RATIOS[aspectRatio].height}
+        <div data-editor-frame data-export-width={output.width}
+          data-export-height={output.height}
+          data-export-quality={exportQuality}
           className="relative max-h-full max-w-full overflow-hidden bg-neutral-900" style={{
           aspectRatio: ASPECT_RATIOS[aspectRatio].css,
           height: aspectRatio === '16:9' ? '100%' : 'auto',
           width: aspectRatio === '16:9' ? 'auto' : '100%',
         }}>
-          <video ref={videoRef} playsInline preload="auto" className="absolute inset-0 h-full w-full object-cover" />
+          {[0, 1].map((slot) => (
+            <video key={slot} ref={(video) => { videoRefs.current[slot as VideoSlot] = video; }}
+              data-editor-video-slot={slot} playsInline preload="auto" muted={slot !== activeSlot}
+              className={`absolute inset-0 h-full w-full object-cover transition-none ${slot === activeSlot ? 'opacity-100' : 'opacity-0'}`} />
+          ))}
         </div>
         <button onClick={togglePlay}
           className="absolute inset-0 flex items-center justify-center group"
@@ -216,7 +304,7 @@ export default function Editor() {
         selectedId={selectedId}
         playhead={playhead}
         onSelect={(id, offset) => {
-          videoRef.current?.pause();
+          videoRefs.current.forEach((video) => video?.pause());
           setPlaying(false);
           select(id);
           const nextPlayhead = clipStart(clips, clips.findIndex((c) => c.id === id)) + offset;
@@ -231,7 +319,7 @@ export default function Editor() {
       <input ref={fileRef} type="file" accept="video/*" multiple hidden
         onChange={(e) => { if (e.target.files?.length) importFiles(e.target.files); e.target.value = ''; }} />
 
-      {exportOpen && <ExportSheet onClose={() => setExportOpen(false)} />}
+      {exportOpen && <ExportSheet quality={exportQuality} onClose={() => setExportOpen(false)} />}
     </div>
   );
 }

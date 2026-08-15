@@ -23,7 +23,7 @@ interface State {
   aspectRatio: AspectRatio;
 
   init: () => Promise<void>;
-  addClipFromBlob: (blob: Blob, mimeType: string) => Promise<Clip>;
+  addClipFromBlob: (blob: Blob, mimeType: string, generateThumbs?: boolean) => Promise<Clip>;
   importFiles: (files: FileList | File[]) => Promise<void>;
   select: (id: string | null) => void;
   setScreen: (s: Screen) => void;
@@ -113,7 +113,7 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
-  addClipFromBlob: async (blob, mimeType) => {
+  addClipFromBlob: async (blob, mimeType, generateThumbs = true) => {
     const blobKey = uid();
     // Persist the irreplaceable media before doing any decoder work. Camera
     // recovery data is kept until this clip and its project entry are durable.
@@ -138,7 +138,7 @@ export const useStore = create<State>((set, get) => ({
 
     // Thumbnail decoding is expensive and can monopolize iPhone media
     // decoders. It must never keep the record button in a stopping state.
-    void makeThumbs(blob, 4).then(async (thumbs) => {
+    if (generateThumbs) void makeThumbs(blob, 4).then(async (thumbs) => {
       const latest = get().clips;
       if (!latest.some((item) => item.id === clip.id)) return;
       const withThumbs = latest.map((item) => (item.id === clip.id ? { ...item, thumbs } : item));

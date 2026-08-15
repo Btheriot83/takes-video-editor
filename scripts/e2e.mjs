@@ -51,9 +51,8 @@ const defaultBox = await defaultFrame.boundingBox();
 if (Math.abs(defaultBox.width / defaultBox.height - 9 / 16) > 0.03) {
   throw new Error(`default frame is not portrait 9:16: ${(defaultBox.width / defaultBox.height).toFixed(2)}`);
 }
-if (await defaultFrame.getAttribute('data-output-width') !== '1080' || await defaultFrame.getAttribute('data-output-height') !== '1920') {
-  throw new Error('default frame metadata is not 1080x1920');
-}
+const captureFps = Number(await defaultFrame.getAttribute('data-capture-frame-rate'));
+if (captureFps && captureFps > 30.1) throw new Error(`camera exceeded the requested 30fps ceiling: ${captureFps}`);
 if (!(await page.getByRole('button', { name: '16:9', exact: true }).getAttribute('aria-pressed') === 'true')) {
   throw new Error('16:9 selector is not the default');
 }
@@ -174,10 +173,10 @@ log('editor open');
 const editorFrame = page.locator('[data-editor-frame]');
 const editorBox = await editorFrame.boundingBox();
 if (Math.abs(editorBox.width / editorBox.height - 9 / 16) > 0.03) throw new Error('editor frame is not portrait 9:16');
-if (await editorFrame.getAttribute('data-output-width') !== '1080' || await editorFrame.getAttribute('data-output-height') !== '1920') {
-  throw new Error('editor frame metadata is not 1080x1920');
+if (await editorFrame.getAttribute('data-export-width') !== '2160' || await editorFrame.getAttribute('data-export-height') !== '3840') {
+  throw new Error('editor default export metadata is not 4K portrait 2160x3840');
 }
-log('editor portrait 9:16 frame verified');
+log('editor portrait frame and default 4K export verified');
 
 const clipCount = await page.locator('[data-clip]').count();
 log(`timeline clips: ${clipCount}`);
@@ -220,12 +219,14 @@ if (afterUndo !== 3) throw new Error('undo failed');
 await page.locator('[data-clip]').nth(0).click();
 await page.waitForTimeout(200);
 await page.click('button[aria-label="Play"]');
-const playbackStart = await page.locator('[data-editor-frame] video').evaluate((video) => ({
+const playbackSlot = await page.locator('[data-editor-playhead]').getAttribute('data-editor-active-slot');
+const playbackVideo = page.locator(`[data-editor-video-slot="${playbackSlot}"]`);
+const playbackStart = await playbackVideo.evaluate((video) => ({
   mediaTime: video.currentTime,
   wallTime: performance.now(),
 }));
 await page.waitForTimeout(1200);
-const playbackEnd = await page.locator('[data-editor-frame] video').evaluate((video) => ({
+const playbackEnd = await playbackVideo.evaluate((video) => ({
   mediaTime: video.currentTime,
   wallTime: performance.now(),
 }));
@@ -238,7 +239,9 @@ const globalEnd = Number(await page.locator('[data-editor-playhead]').getAttribu
 const crossClipRate = (globalEnd - globalStart) / 1.4;
 if (crossClipRate < 0.8 || crossClipRate > 1.2) throw new Error(`cross-clip playback ran at ${crossClipRate.toFixed(2)}x`);
 if (!(await page.getByRole('button', { name: 'Pause' }).isVisible())) throw new Error('playback stopped while switching clips');
-log(`cross-clip playback verified at ${crossClipRate.toFixed(2)}x`);
+const handoffGap = Number(await page.locator('[data-editor-playhead]').getAttribute('data-last-handoff-gap-ms'));
+if (!Number.isFinite(handoffGap) || handoffGap > 120) throw new Error(`clip handoff gap was ${handoffGap}ms`);
+log(`cross-clip playback verified at ${crossClipRate.toFixed(2)}x; handoff ${handoffGap.toFixed(1)}ms`);
 await page.click('button[aria-label="Pause"]');
 await page.click('text=Split');
 await page.waitForTimeout(300);
@@ -247,18 +250,34 @@ log(`after split: ${afterSplit} clips`);
 if (afterSplit !== 4) throw new Error(`split failed: expected 4 clips, got ${afterSplit}`);
 await page.screenshot({ path: `${OUT}/5-split.png` });
 
-// One tap starts the stitch/export and downloads the final MP4.
-const automaticDownload = page.waitForEvent('download', { timeout: 300000 });
-await page.click('text=Save video');
-const exportDialog = page.getByRole('dialog', { name: 'Save video' });
+// Keep the broad smoke quick; the dedicated 4K smoke verifies 2160x3840.
+await page.getByRole('button', { name: /Export quality 4K/ }).click();
+if (await editorFrame.getAttribute('data-export-width') !== '1080') throw new Error('1080p export toggle failed');
+await page.click('text=Export video');
+const exportDialog = page.getByRole('dialog', { name: 'Export video' });
 await exportDialog.getByText('9:16 portrait', { exact: true }).waitFor();
-await exportDialog.getByText('1080 × 1920', { exact: true }).waitFor();
+await exportDialog.getByText(/1080p · 1080 × 1920/).waitFor();
 log('export started (ffmpeg.wasm)…');
-const download = await automaticDownload;
-await page.waitForSelector('text=Saved to this device', { timeout: 300000 });
-log('export complete');
+await page.waitForSelector('text=Video ready to share or download', { timeout: 300000 });
+if (await page.getByText('Saved to this device').count()) throw new Error('UI falsely claimed the file was saved');
+log('export ready without false save claim');
 await page.screenshot({ path: `${OUT}/6-exported.png` });
 
+// A blocked anchor click must produce failure copy, never success copy.
+await page.evaluate(() => {
+  const proto = HTMLAnchorElement.prototype;
+  window.__takesOriginalAnchorClick = proto.click;
+  proto.click = () => { throw new Error('synthetic blocked download'); };
+});
+await page.getByRole('button', { name: 'Download MP4' }).click();
+await page.getByText('The browser could not start the download. Try Share instead.').waitFor();
+await page.evaluate(() => {
+  HTMLAnchorElement.prototype.click = window.__takesOriginalAnchorClick;
+});
+const downloadPromise = page.waitForEvent('download', { timeout: 60000 });
+await page.getByRole('button', { name: 'Download MP4' }).click();
+const download = await downloadPromise;
+await page.getByText(/Download requested/).waitFor();
 const path = `${OUT}/exported.mp4`;
 await download.saveAs(path);
 const size = fs.statSync(path).size;
