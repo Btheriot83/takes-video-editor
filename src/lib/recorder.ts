@@ -1,12 +1,18 @@
 import { recBegin, recChunk, recFinalize } from './db';
 
+// Prefer H.264 in MP4: it is hardware-encoded on virtually all phones, so the
+// capture keeps its full frame rate. VP9/VP8 fallbacks are software encoders
+// that can starve 1080x1920 capture down to ~20fps on mobile — the source of
+// stuttery saved clips.
 const MIME_CANDIDATES = [
+  'video/mp4;codecs=avc1.640028,mp4a.40.2', // High profile
+  'video/mp4;codecs=avc1.4D4028,mp4a.40.2', // Main profile
   'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
   'video/mp4;codecs=avc1,mp4a',
+  'video/webm;codecs=h264,opus',
   'video/mp4',
   'video/webm;codecs=vp9,opus',
   'video/webm;codecs=vp8,opus',
-  'video/webm;codecs=h264,opus',
   'video/webm',
 ];
 

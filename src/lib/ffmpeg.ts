@@ -9,6 +9,27 @@ type FFmpegLike = FFmpeg;
 let ff: FFmpegLike | null = null;
 let loading: Promise<FFmpegLike> | null = null;
 
+/**
+ * Multithreaded encoding needs SharedArrayBuffer, which browsers only enable
+ * on cross-origin-isolated pages (COOP/COEP headers). When available it makes
+ * 4K exports several times faster; otherwise we fall back to the
+ * single-threaded core.
+ */
+const canUseMtCore = () =>
+  typeof SharedArrayBuffer !== 'undefined' &&
+  (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated === true &&
+  (navigator.hardwareConcurrency ?? 1) > 1;
+
+let usingMtCore = false;
+
+/**
+ * With the mt core, x264 must not be allowed to pick its own thread count:
+ * Emscripten's pthread pool is finite and letting x264 spawn cores-worth of
+ * threads (plus lookahead threads) deadlocks the encoder mid-stream. Two
+ * encoder threads is a safe, still-faster-than-single configuration.
+ */
+const encoderThreadArgs = () => (usingMtCore ? ['-threads', '2'] : []);
+
 async function getFFmpeg(): Promise<FFmpegLike> {
   if (ff) return ff;
   if (!loading) {
@@ -17,10 +38,24 @@ async function getFFmpeg(): Promise<FFmpegLike> {
       const mod = await import(/* @vite-ignore */ u('ffesm/index.js'));
       const inst = new mod.FFmpeg();
       inst.on('log', ({ message }: { message: string }) => console.log('[ffmpeg]', message));
+      if (canUseMtCore()) {
+        try {
+          await inst.load({
+            coreURL: u('ffmpeg-mt/ffmpeg-core.js'),
+            wasmURL: u('ffmpeg-mt/ffmpeg-core.wasm'),
+            workerURL: u('ffmpeg-mt/ffmpeg-core.worker.js'),
+          });
+          console.log('[ffmpeg] loaded multithreaded core');
+          usingMtCore = true;
+          ff = inst;
+          return inst;
+        } catch (error) {
+          console.warn('[ffmpeg] mt core failed to load; using single-threaded core', error);
+        }
+      }
       await inst.load({
         coreURL: u('ffmpeg/ffmpeg-core.js'),
         wasmURL: u('ffmpeg/ffmpeg-core.wasm'),
-        workerURL: u('ffesm/worker.js'),
       });
       ff = inst;
       return inst;
@@ -123,12 +158,17 @@ export async function exportMp4(
     args.push('-ss', String(clips[i].trimIn), '-t', String(clipLen(clips[i])), '-i', inputs[i]);
   }
 
-  // Per-clip normalize to the selected portrait frame, 30fps, reset timestamps.
+  // Per-clip normalize to the selected portrait frame and reset timestamps.
+  // Deliberately NO fps=30 CFR conversion here: camera captures are variable
+  // frame rate, and snapping jittery/short timestamps onto a rigid 30fps grid
+  // duplicated and dropped frames (measured ~28-40% duplicates), which is
+  // exactly the stutter seen on saved clips. Preserving the captured
+  // timestamps (VFR output) keeps playback as smooth as the recording.
   const parts: string[] = [];
   for (let i = 0; i < clips.length; i++) {
     parts.push(
       `[${i}:v]scale=${output.width}:${output.height}:force_original_aspect_ratio=increase,` +
-        `crop=${output.width}:${output.height}:(in_w-out_w)/2:(in_h-out_h)/2,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v${i}]`,
+        `crop=${output.width}:${output.height}:(in_w-out_w)/2:(in_h-out_h)/2,setsar=1,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS[v${i}]`,
     );
     parts.push(
       `[${i}:a]aresample=48000:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`,
@@ -140,11 +180,17 @@ export async function exportMp4(
   args.push(
     '-filter_complex', parts.join(';'),
     '-map', '[vout]', '-map', '[aout]',
+    ...encoderThreadArgs(),
     '-c:v', 'libx264', '-preset', quality === '4K' ? 'ultrafast' : 'veryfast', '-crf', quality === '4K' ? '22' : '20',
     '-profile:v', 'high', '-level', quality === '4K' ? '5.1' : '4.0',
+    // Keep the 4K encoder memory-lean so wasm (2GB address space, less on
+    // some mobile browsers) survives 2160x3840: single reference frame, no
+    // B-frames, short lookahead.
+    ...(quality === '4K' ? ['-x264-params', 'ref=1:bframes=0:rc-lookahead=10:keyint=60'] : []),
     '-c:a', 'aac', '-b:a', '128k',
     '-movflags', '+faststart',
-    '-fps_mode', 'cfr', '-video_track_timescale', '90000', '-avoid_negative_ts', 'make_zero',
+    // vfr preserves the capture's real frame timing (see filter note above).
+    '-fps_mode', 'vfr', '-video_track_timescale', '90000', '-avoid_negative_ts', 'make_zero',
     '-map_metadata', '-1',
     '-metadata', 'encoder=',
     'out.mp4',
