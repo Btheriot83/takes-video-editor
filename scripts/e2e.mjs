@@ -60,6 +60,20 @@ if (!(await page.getByRole('button', { name: '16:9', exact: true }).getAttribute
 await page.getByText('9:16 portrait', { exact: true }).waitFor();
 log('default portrait 9:16 frame verified');
 
+// The selector must be fully visible and finger-sized on the mobile viewport.
+await page.setViewportSize({ width: 320, height: 568 });
+await page.screenshot({ path: `${OUT}/1-camera-compact.png` });
+const viewport = page.viewportSize();
+for (const ratio of ['16:9', '4:3', '1:1']) {
+  const box = await page.getByRole('button', { name: ratio, exact: true }).boundingBox();
+  if (!box || box.x < 0 || box.y < 0 || box.x + box.width > viewport.width || box.y + box.height > viewport.height) {
+    throw new Error(`${ratio} selector is clipped on the mobile viewport`);
+  }
+  if (box.width < 44 || box.height < 44) throw new Error(`${ratio} selector hitbox is ${box.width}x${box.height}, expected at least 44x44`);
+}
+log('mobile ratio selector visibility and hitboxes verified at 320x568');
+await page.setViewportSize({ width: 390, height: 844 });
+
 // verify every project frame option changes the actual capture viewport
 for (const ratio of ['16:9', '4:3', '1:1']) {
   await page.getByRole('button', { name: ratio, exact: true }).click();
@@ -134,13 +148,14 @@ for (let i = 0; i < 3; i++) {
   }
   await page.waitForTimeout(2000);
   const releaseStarted = Date.now();
-  await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  const releaseType = i === 1 ? 'touchCancel' : 'touchEnd';
+  await cdp.send('Input.dispatchTouchEvent', { type: releaseType, touchPoints: [] });
   await page.waitForFunction(() => document.querySelector('[data-record-state]')?.getAttribute('data-record-state') !== 'recording', null, { timeout: 750 });
   const releaseLatency = Date.now() - releaseStarted;
   await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 10000 });
   await page.waitForTimeout(600);
   if (mediaRecorderStarts !== i + 1) throw new Error(`expected ${i + 1} recorder starts, got ${mediaRecorderStarts}`);
-  log(`clip ${i + 1} recorded; release stopped in ${releaseLatency}ms`);
+  log(`clip ${i + 1} recorded; ${releaseType} stopped in ${releaseLatency}ms`);
 }
 await page.screenshot({ path: `${OUT}/2-recorded.png` });
 
@@ -200,7 +215,25 @@ if (afterUndo !== 3) throw new Error('undo failed');
 await page.locator('[data-clip]').nth(0).click();
 await page.waitForTimeout(200);
 await page.click('button[aria-label="Play"]');
-await page.waitForTimeout(900);
+const playbackStart = await page.locator('[data-editor-frame] video').evaluate((video) => ({
+  mediaTime: video.currentTime,
+  wallTime: performance.now(),
+}));
+await page.waitForTimeout(1200);
+const playbackEnd = await page.locator('[data-editor-frame] video').evaluate((video) => ({
+  mediaTime: video.currentTime,
+  wallTime: performance.now(),
+}));
+const playbackRate = (playbackEnd.mediaTime - playbackStart.mediaTime) / ((playbackEnd.wallTime - playbackStart.wallTime) / 1000);
+if (playbackRate < 0.85 || playbackRate > 1.15) throw new Error(`editor playback ran at ${playbackRate.toFixed(2)}x`);
+log(`editor playback verified at ${playbackRate.toFixed(2)}x`);
+const globalStart = Number(await page.locator('[data-editor-playhead]').getAttribute('data-editor-playhead'));
+await page.waitForTimeout(1400);
+const globalEnd = Number(await page.locator('[data-editor-playhead]').getAttribute('data-editor-playhead'));
+const crossClipRate = (globalEnd - globalStart) / 1.4;
+if (crossClipRate < 0.8 || crossClipRate > 1.2) throw new Error(`cross-clip playback ran at ${crossClipRate.toFixed(2)}x`);
+if (!(await page.getByRole('button', { name: 'Pause' }).isVisible())) throw new Error('playback stopped while switching clips');
+log(`cross-clip playback verified at ${crossClipRate.toFixed(2)}x`);
 await page.click('button[aria-label="Pause"]');
 await page.click('text=Split');
 await page.waitForTimeout(300);

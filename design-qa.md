@@ -55,3 +55,7 @@ and timeline legible.
    sufficiently explicit. The refreshed comparison now shows a visible
    `9:16 portrait` output badge while retaining the requested `16:9` selector;
    touch testing verifies recording remains active only for the held gesture.
+5. A compact 320 × 568 regression capture verifies the ratio selector remains
+   fully visible with 44 px touch targets. Touch-end and touch-cancel both stop
+   recording, and editor media time advances at normal speed without repeated
+   seeks from playhead state updates.

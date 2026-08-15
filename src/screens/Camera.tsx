@@ -10,6 +10,7 @@ type ZoomRange = { min: number; max: number; step: number };
 type ExtendedCapabilities = MediaTrackCapabilities & { zoom?: ZoomRange; torch?: boolean };
 type ExtendedSettings = MediaTrackSettings & { zoom?: number };
 type ExtendedConstraintSet = MediaTrackConstraintSet & { zoom?: number; torch?: boolean };
+type ActiveHold = { kind: 'pointer' | 'touch'; id: number } | { kind: 'keyboard'; id: 'keyboard' };
 
 const RATIOS: AspectRatio[] = ['16:9', '4:3', '1:1'];
 
@@ -22,7 +23,7 @@ export default function Camera() {
   const streamRef = useRef<MediaStream | null>(null);
   const recRef = useRef<ActiveRecording | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  const activeHoldRef = useRef<number | 'keyboard' | null>(null);
+  const activeHoldRef = useRef<ActiveHold | null>(null);
   const startingRef = useRef(false);
   const stoppingRef = useRef(false);
   const pointersRef = useRef(new Map<number, { x: number; y: number }>());
@@ -133,7 +134,7 @@ export default function Camera() {
     }
   }, [addClipFromBlob]);
 
-  const startHold = useCallback((source: number | 'keyboard') => {
+  const startHold = useCallback((source: ActiveHold) => {
     if (
       !streamRef.current || !streamReady || error || stoppingRef.current ||
       startingRef.current || recRef.current || activeHoldRef.current !== null
@@ -165,27 +166,45 @@ export default function Camera() {
     })();
   }, [error, facing, finishRecording, streamReady]);
 
-  const endHold = useCallback((source: number | 'keyboard') => {
-    if (activeHoldRef.current !== source) return;
+  const stopActiveHold = useCallback(() => {
+    if (!activeHoldRef.current) return;
     activeHoldRef.current = null;
     if (recRef.current) void finishRecording(recRef.current);
   }, [finishRecording]);
 
+  const endMatchingHold = useCallback((kind: ActiveHold['kind'], id: number | 'keyboard') => {
+    const active = activeHoldRef.current;
+    if (!active || active.kind !== kind || active.id !== id) return;
+    stopActiveHold();
+  }, [stopActiveHold]);
+
   useEffect(() => {
-    const endPointerHold = (event: PointerEvent) => endHold(event.pointerId);
-    const cancelActiveHold = () => {
+    const endPointerHold = (event: PointerEvent) => endMatchingHold('pointer', event.pointerId);
+    const endTouchHold = (event: TouchEvent) => {
       const active = activeHoldRef.current;
-      if (active !== null) endHold(active);
+      if (!active) return;
+      if (active.kind === 'touch' && Array.from(event.changedTouches).some((touch) => touch.identifier === active.id)) {
+        stopActiveHold();
+      } else if (active.kind === 'pointer' && event.touches.length === 0) {
+        // Some mobile WebKit versions omit the final pointerup after capture;
+        // touchend remains the reliable release signal.
+        stopActiveHold();
+      }
     };
+    const cancelTouchHold = () => stopActiveHold();
     window.addEventListener('pointerup', endPointerHold, true);
     window.addEventListener('pointercancel', endPointerHold, true);
-    window.addEventListener('blur', cancelActiveHold);
+    window.addEventListener('touchend', endTouchHold, true);
+    window.addEventListener('touchcancel', cancelTouchHold, true);
+    window.addEventListener('blur', stopActiveHold);
     return () => {
       window.removeEventListener('pointerup', endPointerHold, true);
       window.removeEventListener('pointercancel', endPointerHold, true);
-      window.removeEventListener('blur', cancelActiveHold);
+      window.removeEventListener('touchend', endTouchHold, true);
+      window.removeEventListener('touchcancel', cancelTouchHold, true);
+      window.removeEventListener('blur', stopActiveHold);
     };
-  }, [endHold]);
+  }, [endMatchingHold, stopActiveHold]);
 
   const toggleTorch = async () => {
     const track = streamRef.current?.getVideoTracks()[0];
@@ -265,9 +284,9 @@ export default function Camera() {
 
   return (
     <div className="fixed inset-0 bg-black text-white select-none overflow-hidden flex flex-col">
-      <header className="relative z-20 shrink-0 pt-[env(safe-area-inset-top)] bg-black px-3 py-2.5 flex items-center justify-between gap-2">
-        <div className="text-sm font-semibold tracking-tight w-14">Takes</div>
-        <div className="flex items-center rounded-full bg-white/10 p-0.5" aria-label="Aspect ratio">
+      <header className="relative z-20 grid shrink-0 grid-cols-2 items-center gap-x-2 bg-black px-3 pb-2 pt-[max(env(safe-area-inset-top),0.625rem)] sm:grid-cols-[1fr_auto_1fr]">
+        <div className="order-1 text-sm font-semibold tracking-tight">Takes</div>
+        <div className="order-3 col-span-2 mt-2 flex w-full items-center rounded-full bg-white/10 p-0.5 sm:order-2 sm:col-span-1 sm:mt-0 sm:w-auto" role="group" aria-label="Aspect ratio">
           {RATIOS.map((ratio) => (
             <button
               key={ratio}
@@ -275,7 +294,7 @@ export default function Camera() {
               disabled={controlsDisabled}
               aria-pressed={aspectRatio === ratio}
               onClick={() => setAspectRatio(ratio)}
-              className={`min-h-8 min-w-11 rounded-full px-2 text-[11px] font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:opacity-40 ${
+              className={`min-h-11 min-w-11 flex-1 rounded-full px-2 text-[11px] font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:opacity-40 sm:min-h-8 sm:flex-none ${
                 aspectRatio === ratio ? 'bg-white text-black' : 'text-white/70'
               }`}
             >
@@ -283,7 +302,7 @@ export default function Camera() {
             </button>
           ))}
         </div>
-        <div className="w-14 text-right text-sm tabular-nums text-white/80">
+        <div className="order-2 text-right text-sm tabular-nums text-white/80 sm:order-3">
           {recording ? fmtTime(elapsed) : fmtTime(total)}
         </div>
       </header>
@@ -395,24 +414,39 @@ export default function Camera() {
                 if (event.button !== 0 || !event.isPrimary) return;
                 event.preventDefault();
                 event.currentTarget.setPointerCapture?.(event.pointerId);
-                startHold(event.pointerId);
+                startHold({ kind: 'pointer', id: event.pointerId });
               }}
-              onPointerUp={(event) => { event.preventDefault(); endHold(event.pointerId); }}
-              onPointerCancel={(event) => endHold(event.pointerId)}
-              onLostPointerCapture={(event) => endHold(event.pointerId)}
+              onPointerUp={(event) => { event.preventDefault(); endMatchingHold('pointer', event.pointerId); }}
+              onPointerCancel={(event) => endMatchingHold('pointer', event.pointerId)}
+              onLostPointerCapture={(event) => endMatchingHold('pointer', event.pointerId)}
+              onTouchStart={(event) => {
+                const touch = event.changedTouches[0];
+                if (touch) startHold({ kind: 'touch', id: touch.identifier });
+              }}
+              onTouchEnd={(event) => {
+                const active = activeHoldRef.current;
+                if (active?.kind === 'touch' && Array.from(event.changedTouches).some((touch) => touch.identifier === active.id)) {
+                  stopActiveHold();
+                } else if (active?.kind === 'pointer' && event.touches.length === 0) {
+                  stopActiveHold();
+                }
+              }}
+              onTouchCancel={() => {
+                if (activeHoldRef.current?.kind !== 'keyboard') stopActiveHold();
+              }}
               onKeyDown={(event) => {
                 if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) {
                   event.preventDefault();
-                  startHold('keyboard');
+                  startHold({ kind: 'keyboard', id: 'keyboard' });
                 }
               }}
               onKeyUp={(event) => {
                 if (event.key === ' ' || event.key === 'Enter') {
                   event.preventDefault();
-                  endHold('keyboard');
+                  endMatchingHold('keyboard', 'keyboard');
                 }
               }}
-              onBlur={() => endHold('keyboard')}
+              onBlur={() => endMatchingHold('keyboard', 'keyboard')}
               className={`relative flex h-[78px] w-[78px] touch-none items-center justify-center rounded-full border-[5px] border-white transition-transform duration-150 active:scale-95 disabled:opacity-35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white ${recording ? 'scale-110' : ''}`}
             >
               <span className={`block bg-red-500 transition-all duration-150 ${recording ? 'h-[62px] w-[62px]' : 'h-[58px] w-[58px] rounded-full'}`} />

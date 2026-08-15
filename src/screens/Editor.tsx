@@ -22,6 +22,7 @@ export default function Editor() {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const urlRef = useRef<string | null>(null);
+  const switchingSourceRef = useRef(false);
   const [playing, setPlaying] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [clipUrls, setClipUrls] = useState<Record<string, string>>({});
@@ -59,6 +60,7 @@ export default function Editor() {
     const url = clipUrls[clip.blobKey];
     if (!url) return;
     if (urlRef.current !== url) {
+      switchingSourceRef.current = true;
       urlRef.current = url;
       v.src = url;
       await new Promise<void>((res) => {
@@ -67,10 +69,18 @@ export default function Editor() {
       });
     }
     v.currentTime = clip.trimIn + loc.offset;
-    if (autoplay) v.play().catch(() => {});
+    if (autoplay) {
+      try { await v.play(); } catch { /* browser can reject interrupted play */ }
+    }
+    switchingSourceRef.current = false;
   }, [clips, clipUrls]);
 
-  useEffect(() => { syncVideo(playhead); }, [playhead, selectedId, syncVideo]);
+  // External scrubs/selections seek the media element. Native playback owns
+  // currentTime while playing; seeking it again after every timeupdate turns
+  // playback into a slow seek loop on mobile browsers.
+  useEffect(() => {
+    if (!playing) void syncVideo(playhead);
+  }, [playhead, selectedId, playing, syncVideo]);
 
   // playback loop across clips
   useEffect(() => {
@@ -118,16 +128,18 @@ export default function Editor() {
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
-    const onPause = () => setPlaying(false);
+    const onPause = () => {
+      if (!switchingSourceRef.current) setPlaying(false);
+    };
     v.addEventListener('pause', onPause);
     return () => v.removeEventListener('pause', onPause);
   }, []);
 
   return (
-    <div className="fixed inset-0 bg-neutral-950 text-white flex flex-col select-none">
+    <div data-editor-playhead={playhead.toFixed(3)} className="fixed inset-0 bg-neutral-950 text-white flex flex-col select-none">
       {/* header */}
       <div className="pt-[env(safe-area-inset-top)] px-3 py-2.5 flex items-center justify-between border-b border-white/10">
-        <button onClick={() => { setPlaying(false); setScreen('camera'); }}
+        <button onClick={() => { videoRef.current?.pause(); setPlaying(false); setScreen('camera'); }}
           className="flex items-center gap-1 text-sm text-white/80 active:opacity-60 px-2 py-1.5">
           <ArrowLeft size={18} /> Camera
         </button>
@@ -156,7 +168,7 @@ export default function Editor() {
           height: aspectRatio === '16:9' ? '100%' : 'auto',
           width: aspectRatio === '16:9' ? 'auto' : '100%',
         }}>
-          <video ref={videoRef} playsInline className="absolute inset-0 h-full w-full object-cover" />
+          <video ref={videoRef} playsInline preload="auto" className="absolute inset-0 h-full w-full object-cover" />
         </div>
         <button onClick={togglePlay}
           className="absolute inset-0 flex items-center justify-center group"
@@ -195,7 +207,14 @@ export default function Editor() {
         clips={clips}
         selectedId={selectedId}
         playhead={playhead}
-        onSelect={(id, offset) => { select(id); setPlayhead(clipStart(clips, clips.findIndex((c) => c.id === id)) + offset); syncVideo(clipStart(clips, clips.findIndex((c) => c.id === id)) + offset); }}
+        onSelect={(id, offset) => {
+          videoRef.current?.pause();
+          setPlaying(false);
+          select(id);
+          const nextPlayhead = clipStart(clips, clips.findIndex((c) => c.id === id)) + offset;
+          setPlayhead(nextPlayhead);
+          void syncVideo(nextPlayhead);
+        }}
         trimSelected={trimSelected}
         onReorder={reorder}
         selIdx={selIdx}
