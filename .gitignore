@@ -1,8 +1,9 @@
 node_modules/
 dist/
+
+# Local Vercel project metadata
 .vercel/
 *.log
 .DS_Store
 coverage/
 scripts/e2e-out/
-
