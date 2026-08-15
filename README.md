@@ -1,8 +1,9 @@
 # Takes
 
 A mobile-first, local-only video recorder and editor. Hold the record button to
-capture a clip and release it to stop, or import existing clips. Choose 16:9,
-4:3, or square framing, switch between front and rear cameras, use supported
+capture a clip and release it to stop, or import existing clips. The default
+16:9 selector produces a vertical 9:16 portrait frame; 4:3 produces 3:4
+portrait, and square produces 1:1. Switch between front and rear cameras, use supported
 torch and pinch-zoom controls, then trim, split, reorder, and export an MP4
 without creating an account or uploading source media to a server.
 

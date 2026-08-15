@@ -8,6 +8,7 @@ const OUT = 'scripts/e2e-out';
 fs.mkdirSync(OUT, { recursive: true });
 
 const errors = [];
+let mediaRecorderStarts = 0;
 const browser = await chromium.launch({
   executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   args: [
@@ -27,6 +28,7 @@ const page = await ctx.newPage();
 const cdp = await ctx.newCDPSession(page);
 page.on('console', (m) => {
   const t = m.text();
+  if (t.includes('[rec] started, state=')) mediaRecorderStarts += 1;
   if (t.includes('[ffmpeg]') || t.includes('[export]')) fs.appendFileSync(OUT + '/ffmpeg.log', t + '\n');
   if (m.type() === 'error') errors.push(`${t} (${m.location().url || 'unknown URL'})`);
 });
@@ -43,6 +45,21 @@ await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])'
 await page.screenshot({ path: `${OUT}/1-camera.png` });
 log('camera open');
 
+// A fresh/empty project must visibly default to vertical 9:16 output.
+const defaultFrame = page.locator('[data-camera-frame]');
+const defaultBox = await defaultFrame.boundingBox();
+if (Math.abs(defaultBox.width / defaultBox.height - 9 / 16) > 0.03) {
+  throw new Error(`default frame is not portrait 9:16: ${(defaultBox.width / defaultBox.height).toFixed(2)}`);
+}
+if (await defaultFrame.getAttribute('data-output-width') !== '1080' || await defaultFrame.getAttribute('data-output-height') !== '1920') {
+  throw new Error('default frame metadata is not 1080x1920');
+}
+if (!(await page.getByRole('button', { name: '16:9', exact: true }).getAttribute('aria-pressed') === 'true')) {
+  throw new Error('16:9 selector is not the default');
+}
+await page.getByText('9:16 portrait', { exact: true }).waitFor();
+log('default portrait 9:16 frame verified');
+
 // verify every project frame option changes the actual capture viewport
 for (const ratio of ['16:9', '4:3', '1:1']) {
   await page.getByRole('button', { name: ratio, exact: true }).click();
@@ -52,6 +69,10 @@ for (const ratio of ['16:9', '4:3', '1:1']) {
   if (Math.abs(actual - expected) > 0.03) throw new Error(`${ratio} frame rendered at ${actual.toFixed(2)}`);
   log(`${ratio} frame verified`);
 }
+
+// Record and edit in the portrait default, rather than whichever option the
+// selector loop happened to visit last.
+await page.getByRole('button', { name: '16:9', exact: true }).click();
 
 // conventional front/rear switch must reopen the alternate facing request
 await page.getByRole('button', { name: 'Switch to front camera' }).click();
@@ -97,11 +118,29 @@ for (let i = 0; i < 3; i++) {
   const recordPoint = { x: recordBox.x + recordBox.width / 2, y: recordBox.y + recordBox.height / 2, id: i + 1 };
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [recordPoint] });
   await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
+
+  if (i === 0) {
+    // A second finger/down event while the primary hold is active must not
+    // create another MediaRecorder. The first hold must remain recording.
+    await cdp.send('Input.dispatchTouchEvent', {
+      type: 'touchStart',
+      touchPoints: [recordPoint, { ...recordPoint, x: recordPoint.x + 6, id: 99 }],
+    });
+    await page.waitForTimeout(700);
+    if (!(await page.getByRole('button', { name: 'Release to stop recording' }).isVisible())) {
+      throw new Error('recording did not continue while the touch was held');
+    }
+    if (mediaRecorderStarts !== 1) throw new Error(`duplicate hold started ${mediaRecorderStarts} recorders`);
+  }
   await page.waitForTimeout(2000);
+  const releaseStarted = Date.now();
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  await page.waitForFunction(() => document.querySelector('[data-record-state]')?.getAttribute('data-record-state') !== 'recording', null, { timeout: 750 });
+  const releaseLatency = Date.now() - releaseStarted;
   await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 10000 });
   await page.waitForTimeout(600);
-  log(`clip ${i + 1} recorded`);
+  if (mediaRecorderStarts !== i + 1) throw new Error(`expected ${i + 1} recorder starts, got ${mediaRecorderStarts}`);
+  log(`clip ${i + 1} recorded; release stopped in ${releaseLatency}ms`);
 }
 await page.screenshot({ path: `${OUT}/2-recorded.png` });
 
@@ -111,6 +150,14 @@ await page.waitForSelector('text=Split', { timeout: 15000 });
 await page.waitForTimeout(1500); // thumbnails
 await page.screenshot({ path: `${OUT}/3-editor.png` });
 log('editor open');
+
+const editorFrame = page.locator('[data-editor-frame]');
+const editorBox = await editorFrame.boundingBox();
+if (Math.abs(editorBox.width / editorBox.height - 9 / 16) > 0.03) throw new Error('editor frame is not portrait 9:16');
+if (await editorFrame.getAttribute('data-output-width') !== '1080' || await editorFrame.getAttribute('data-output-height') !== '1920') {
+  throw new Error('editor frame metadata is not 1080x1920');
+}
+log('editor portrait 9:16 frame verified');
 
 const clipCount = await page.locator('[data-clip]').count();
 log(`timeline clips: ${clipCount}`);
@@ -165,6 +212,9 @@ await page.screenshot({ path: `${OUT}/5-split.png` });
 // export
 await page.click('text=Export');
 await page.waitForSelector('text=Start export', { timeout: 10000 });
+const exportDialog = page.getByRole('dialog', { name: 'Export video' });
+await exportDialog.getByText('9:16 portrait', { exact: true }).waitFor();
+await exportDialog.getByText('1080 × 1920', { exact: true }).waitFor();
 await page.click('text=Start export');
 log('export started (ffmpeg.wasm)…');
 await page.waitForSelector('text=Export complete', { timeout: 300000 });

@@ -75,7 +75,7 @@ export async function exportMp4(
   for (let i = 0; i < clips.length; i++) {
     parts.push(
       `[${i}:v]scale=${output.width}:${output.height}:force_original_aspect_ratio=increase,` +
-        `crop=${output.width}:${output.height},setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v${i}]`,
+        `crop=${output.width}:${output.height}:(in_w-out_w)/2:(in_h-out_h)/2,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v${i}]`,
     );
     parts.push(
       `[${i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`,

@@ -22,7 +22,8 @@ export default function Camera() {
   const streamRef = useRef<MediaStream | null>(null);
   const recRef = useRef<ActiveRecording | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  const pressActiveRef = useRef(false);
+  const activeHoldRef = useRef<number | 'keyboard' | null>(null);
+  const startingRef = useRef(false);
   const stoppingRef = useRef(false);
   const pointersRef = useRef(new Map<number, { x: number; y: number }>());
   const pinchRef = useRef<{ distance: number; zoom: number } | null>(null);
@@ -132,32 +133,59 @@ export default function Camera() {
     }
   }, [addClipFromBlob]);
 
-  const beginRecording = useCallback(async () => {
-    if (!streamRef.current || starting || recRef.current || stoppingRef.current) return;
+  const startHold = useCallback((source: number | 'keyboard') => {
+    if (
+      !streamRef.current || !streamReady || error || stoppingRef.current ||
+      startingRef.current || recRef.current || activeHoldRef.current !== null
+    ) return;
+
+    // Claim the gesture synchronously so duplicate touch/pointer events cannot
+    // start a second recorder before React renders the starting state.
+    activeHoldRef.current = source;
+    startingRef.current = true;
     setStarting(true);
-    try {
-      const active = await startRecording(streamRef.current, setElapsed, facing);
-      recRef.current = active;
-      setRecording(true);
-      if (!pressActiveRef.current) await finishRecording(active);
-    } catch (recordingError) {
-      console.error('[cam] start recording failed', recordingError);
-      setError('Recording is not supported in this browser.');
-    } finally {
-      setStarting(false);
-    }
-  }, [facing, finishRecording, starting]);
+    const stream = streamRef.current;
+    void (async () => {
+      try {
+        const active = await startRecording(stream, setElapsed, facing);
+        recRef.current = active;
+        if (activeHoldRef.current !== source) {
+          await finishRecording(active);
+          return;
+        }
+        setRecording(true);
+      } catch (recordingError) {
+        console.error('[cam] start recording failed', recordingError);
+        if (activeHoldRef.current === source) activeHoldRef.current = null;
+        setError('Recording is not supported in this browser.');
+      } finally {
+        startingRef.current = false;
+        setStarting(false);
+      }
+    })();
+  }, [error, facing, finishRecording, streamReady]);
 
-  const startHold = useCallback(() => {
-    if (!streamReady || error || starting || stopping) return;
-    pressActiveRef.current = true;
-    void beginRecording();
-  }, [beginRecording, error, starting, stopping, streamReady]);
-
-  const endHold = useCallback(() => {
-    pressActiveRef.current = false;
+  const endHold = useCallback((source: number | 'keyboard') => {
+    if (activeHoldRef.current !== source) return;
+    activeHoldRef.current = null;
     if (recRef.current) void finishRecording(recRef.current);
   }, [finishRecording]);
+
+  useEffect(() => {
+    const endPointerHold = (event: PointerEvent) => endHold(event.pointerId);
+    const cancelActiveHold = () => {
+      const active = activeHoldRef.current;
+      if (active !== null) endHold(active);
+    };
+    window.addEventListener('pointerup', endPointerHold, true);
+    window.addEventListener('pointercancel', endPointerHold, true);
+    window.addEventListener('blur', cancelActiveHold);
+    return () => {
+      window.removeEventListener('pointerup', endPointerHold, true);
+      window.removeEventListener('pointercancel', endPointerHold, true);
+      window.removeEventListener('blur', cancelActiveHold);
+    };
+  }, [endHold]);
 
   const toggleTorch = async () => {
     const track = streamRef.current?.getVideoTracks()[0];
@@ -269,6 +297,9 @@ export default function Camera() {
       >
         <div
           data-camera-frame
+          data-output-width={ASPECT_RATIOS[aspectRatio].width}
+          data-output-height={ASPECT_RATIOS[aspectRatio].height}
+          data-output-ratio={ASPECT_RATIOS[aspectRatio].outputLabel}
           className="relative max-h-full max-w-full overflow-hidden bg-neutral-900"
           style={{
             aspectRatio: ASPECT_RATIOS[aspectRatio].css,
@@ -290,6 +321,10 @@ export default function Camera() {
           <div className="absolute left-1/2 bottom-3 -translate-x-1/2 rounded-full bg-black/65 px-3 py-1.5 text-xs font-semibold tabular-nums shadow-sm" aria-live="polite">
             {zoom.toFixed(zoom % 1 === 0 ? 0 : 1)}×
             {!zoomRange && <span className="ml-1.5 font-normal text-white/60">fixed</span>}
+          </div>
+
+          <div className="absolute right-3 top-3 rounded-full bg-black/65 px-2.5 py-1.5 text-[10px] font-semibold text-white/80">
+            {ASPECT_RATIOS[aspectRatio].outputLabel}
           </div>
 
           {recording && (
@@ -350,33 +385,35 @@ export default function Camera() {
           <div className="flex flex-col items-center">
             <button
               type="button"
-              disabled={!streamReady || !!error || starting || stopping}
+              disabled={!streamReady || !!error || stopping}
               aria-label={recording ? 'Release to stop recording' : 'Hold to record'}
               aria-describedby="record-hint"
+              data-record-state={recording ? 'recording' : starting ? 'starting' : stopping ? 'stopping' : 'idle'}
               onContextMenu={(event) => event.preventDefault()}
+              onClick={(event) => event.preventDefault()}
               onPointerDown={(event) => {
-                if (event.button !== 0) return;
+                if (event.button !== 0 || !event.isPrimary) return;
                 event.preventDefault();
                 event.currentTarget.setPointerCapture?.(event.pointerId);
-                startHold();
+                startHold(event.pointerId);
               }}
-              onPointerUp={(event) => { event.preventDefault(); endHold(); }}
-              onPointerCancel={endHold}
-              onLostPointerCapture={() => { if (pressActiveRef.current) endHold(); }}
+              onPointerUp={(event) => { event.preventDefault(); endHold(event.pointerId); }}
+              onPointerCancel={(event) => endHold(event.pointerId)}
+              onLostPointerCapture={(event) => endHold(event.pointerId)}
               onKeyDown={(event) => {
                 if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) {
                   event.preventDefault();
-                  startHold();
+                  startHold('keyboard');
                 }
               }}
               onKeyUp={(event) => {
                 if (event.key === ' ' || event.key === 'Enter') {
                   event.preventDefault();
-                  endHold();
+                  endHold('keyboard');
                 }
               }}
-              onBlur={() => { if (pressActiveRef.current) endHold(); }}
-              className={`relative flex h-[78px] w-[78px] items-center justify-center rounded-full border-[5px] border-white transition-transform duration-150 active:scale-95 disabled:opacity-35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white ${recording ? 'scale-110' : ''}`}
+              onBlur={() => endHold('keyboard')}
+              className={`relative flex h-[78px] w-[78px] touch-none items-center justify-center rounded-full border-[5px] border-white transition-transform duration-150 active:scale-95 disabled:opacity-35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white ${recording ? 'scale-110' : ''}`}
             >
               <span className={`block bg-red-500 transition-all duration-150 ${recording ? 'h-[62px] w-[62px]' : 'h-[58px] w-[58px] rounded-full'}`} />
             </button>

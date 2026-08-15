@@ -133,7 +133,7 @@ export default function Editor() {
         </button>
         <div className="text-center text-sm tabular-nums text-white/70">
           <div>{fmtTime(playhead)} <span className="text-white/40">/ {fmtTime(total)}</span></div>
-          <div className="text-[10px] font-semibold text-white/45">{aspectRatio}</div>
+          <div className="text-[10px] font-semibold text-white/45">{ASPECT_RATIOS[aspectRatio].outputLabel}</div>
         </div>
         <div className="flex items-center gap-1">
           <button onClick={undo} disabled={!canUndo} aria-label="Undo"
@@ -149,7 +149,9 @@ export default function Editor() {
 
       {/* preview */}
       <div className="relative flex-1 min-h-0 bg-black flex items-center justify-center overflow-hidden">
-        <div className="relative max-h-full max-w-full overflow-hidden bg-neutral-900" style={{
+        <div data-editor-frame data-output-width={ASPECT_RATIOS[aspectRatio].width}
+          data-output-height={ASPECT_RATIOS[aspectRatio].height}
+          className="relative max-h-full max-w-full overflow-hidden bg-neutral-900" style={{
           aspectRatio: ASPECT_RATIOS[aspectRatio].css,
           height: aspectRatio === '16:9' ? '100%' : 'auto',
           width: aspectRatio === '16:9' ? 'auto' : '100%',

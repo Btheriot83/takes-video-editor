@@ -93,7 +93,9 @@ export const useStore = create<State>((set, get) => ({
         selectedId: existing[0]?.id ?? null,
         screen: existing.length ? 'editor' : 'camera',
         recoveredNotice: notice,
-        aspectRatio: p.aspectRatio ?? DEFAULT_ASPECT_RATIO,
+        // Empty projects always open in the requested vertical default.
+        // Existing projects retain their chosen frame for editing/export.
+        aspectRatio: existing.length ? (p.aspectRatio ?? DEFAULT_ASPECT_RATIO) : DEFAULT_ASPECT_RATIO,
         ready: true,
       });
     } else {
@@ -216,8 +218,11 @@ export const useStore = create<State>((set, get) => ({
     for (const c of get().clips) deleteBlob(c.blobKey).catch(() => {});
     await clearProject().catch(() => {});
     history.clear();
-    set({ clips: [], selectedId: null, screen: 'camera', playhead: 0, total: 0, canUndo: false, canRedo: false });
-    await saveProject([], get().aspectRatio);
+    set({
+      clips: [], selectedId: null, screen: 'camera', playhead: 0, total: 0,
+      canUndo: false, canRedo: false, aspectRatio: DEFAULT_ASPECT_RATIO,
+    });
+    await saveProject([], DEFAULT_ASPECT_RATIO);
   },
 
   dismissNotice: () => set({ recoveredNotice: null }),

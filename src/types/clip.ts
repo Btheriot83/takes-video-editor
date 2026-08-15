@@ -2,10 +2,10 @@ export type AspectRatio = '16:9' | '4:3' | '1:1';
 
 export const DEFAULT_ASPECT_RATIO: AspectRatio = '16:9';
 
-export const ASPECT_RATIOS: Record<AspectRatio, { css: string; width: number; height: number }> = {
-  '16:9': { css: '9 / 16', width: 1080, height: 1920 },
-  '4:3': { css: '3 / 4', width: 1080, height: 1440 },
-  '1:1': { css: '1 / 1', width: 1080, height: 1080 },
+export const ASPECT_RATIOS: Record<AspectRatio, { css: string; outputLabel: string; width: number; height: number }> = {
+  '16:9': { css: '9 / 16', outputLabel: '9:16 portrait', width: 1080, height: 1920 },
+  '4:3': { css: '3 / 4', outputLabel: '3:4 portrait', width: 1080, height: 1440 },
+  '1:1': { css: '1 / 1', outputLabel: '1:1 square', width: 1080, height: 1080 },
 };
 
 export interface Clip {

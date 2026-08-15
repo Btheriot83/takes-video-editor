@@ -41,9 +41,10 @@ export default function ExportSheet({ onClose }: { onClose: () => void }) {
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center">
       <div className="absolute inset-0 bg-black/70" onClick={phase !== 'working' ? onClose : undefined} />
-      <div className="relative w-full sm:max-w-sm bg-neutral-900 rounded-t-2xl sm:rounded-2xl border border-white/10 p-5 pb-[max(env(safe-area-inset-bottom),1.25rem)]">
+      <div role="dialog" aria-modal="true" aria-labelledby="export-title"
+        className="relative w-full sm:max-w-sm bg-neutral-900 rounded-t-2xl sm:rounded-2xl border border-white/10 p-5 pb-[max(env(safe-area-inset-bottom),1.25rem)]">
         <div className="flex items-center justify-between mb-4">
-          <h2 className="font-semibold">Export video</h2>
+          <h2 id="export-title" className="font-semibold">Export video</h2>
           {phase !== 'working' && (
             <button onClick={onClose} className="p-1.5 rounded-lg active:bg-white/10" aria-label="Close">
               <X size={18} />
@@ -53,7 +54,7 @@ export default function ExportSheet({ onClose }: { onClose: () => void }) {
 
         <div className="text-sm text-white/60 mb-4 space-y-1">
           <div className="flex justify-between"><span>Format</span><span className="text-white/90">MP4 · H.264 + AAC</span></div>
-          <div className="flex justify-between"><span>Frame</span><span className="text-white/90">{aspectRatio}</span></div>
+          <div className="flex justify-between"><span>Frame</span><span className="text-white/90">{ASPECT_RATIOS[aspectRatio].outputLabel}</span></div>
           <div className="flex justify-between"><span>Resolution</span><span className="text-white/90">{ASPECT_RATIOS[aspectRatio].width} × {ASPECT_RATIOS[aspectRatio].height}</span></div>
           <div className="flex justify-between"><span>Duration</span><span className="text-white/90">{fmtTime(totalDuration(clips))}</span></div>
           <div className="flex justify-between"><span>Watermark / metadata</span><span className="text-white/90">None</span></div>

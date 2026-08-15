@@ -12,7 +12,7 @@ Final result: passed
   - Source state: two-clip editor, edit controls, clip timeline
 - Camera implementation: `/Users/brandontheriot/Downloads/app/scripts/e2e-out/design-qa/camera-implementation.png`
   - Capture viewport: 430 × 887 CSS px at 3× device scale, cropped by 1 output pixel to 1290 × 2660 px
-  - Capture state: live synthetic rear camera, 16:9 selected, no recorded clips
+  - Capture state: live synthetic rear camera, 16:9 selector selected, explicit 9:16 portrait output, no recorded clips
 - Editor implementation: `/Users/brandontheriot/Downloads/app/scripts/e2e-out/design-qa/editor-implementation.png`
   - Capture viewport: 430 × 799 CSS px at 3× device scale, cropped by 1 output pixel to 1290 × 2396 px
   - Capture state: two recorded synthetic-camera clips, first clip selected
@@ -51,3 +51,7 @@ and timeline legible.
 3. Final combined review at matching pixel widths found no remaining P0, P1, or
    P2 visual issue. Camera controls are unclipped and centered; editor actions
    and timeline remain readable at the shorter reference height.
+4. Owner live testing found the portrait contract and hold gesture were not
+   sufficiently explicit. The refreshed comparison now shows a visible
+   `9:16 portrait` output badge while retaining the requested `16:9` selector;
+   touch testing verifies recording remains active only for the held gesture.
