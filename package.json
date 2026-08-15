@@ -10,6 +10,8 @@
     "test": "vitest run",
     "smoke": "node scripts/e2e.mjs",
     "smoke:4k": "node scripts/e2e-4k.mjs",
+    "release:verify": "node scripts/verify-release.mjs",
+    "release:production": "node scripts/release-production.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
