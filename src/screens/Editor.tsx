@@ -4,7 +4,7 @@ import {
   ChevronLeft, ChevronRight,
 } from 'lucide-react';
 import { useStore } from '../state/store';
-import { clipLen, totalDuration, fmtTime, FRAME } from '../types/clip';
+import { ASPECT_RATIOS, clipLen, totalDuration, fmtTime, FRAME } from '../types/clip';
 import type { Clip } from '../types/clip';
 import { getBlob } from '../lib/db';
 import { locate, clipStart } from '../lib/editor';
@@ -17,6 +17,7 @@ export default function Editor() {
     clips, selectedId, select, setScreen, playhead, setPlayhead,
     undo, redo, canUndo, canRedo, splitSelected, deleteSelected, duplicateSelected,
     trimSelected, reorder, importFiles,
+    aspectRatio,
   } = useStore();
 
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -130,8 +131,9 @@ export default function Editor() {
           className="flex items-center gap-1 text-sm text-white/80 active:opacity-60 px-2 py-1.5">
           <ArrowLeft size={18} /> Camera
         </button>
-        <div className="text-sm tabular-nums text-white/70">
-          {fmtTime(playhead)} <span className="text-white/40">/ {fmtTime(total)}</span>
+        <div className="text-center text-sm tabular-nums text-white/70">
+          <div>{fmtTime(playhead)} <span className="text-white/40">/ {fmtTime(total)}</span></div>
+          <div className="text-[10px] font-semibold text-white/45">{aspectRatio}</div>
         </div>
         <div className="flex items-center gap-1">
           <button onClick={undo} disabled={!canUndo} aria-label="Undo"
@@ -146,8 +148,14 @@ export default function Editor() {
       </div>
 
       {/* preview */}
-      <div className="relative flex-1 min-h-0 bg-black flex items-center justify-center">
-        <video ref={videoRef} playsInline className="max-h-full max-w-full h-full w-full object-contain" />
+      <div className="relative flex-1 min-h-0 bg-black flex items-center justify-center overflow-hidden">
+        <div className="relative max-h-full max-w-full overflow-hidden bg-neutral-900" style={{
+          aspectRatio: ASPECT_RATIOS[aspectRatio].css,
+          height: aspectRatio === '16:9' ? '100%' : 'auto',
+          width: aspectRatio === '16:9' ? 'auto' : '100%',
+        }}>
+          <video ref={videoRef} playsInline className="absolute inset-0 h-full w-full object-cover" />
+        </div>
         <button onClick={togglePlay}
           className="absolute inset-0 flex items-center justify-center group"
           aria-label={playing ? 'Pause' : 'Play'}>

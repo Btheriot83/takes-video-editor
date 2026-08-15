@@ -1,8 +1,10 @@
 # Takes
 
-A mobile-first, local-only video recorder and editor. Record or import clips,
-trim and reorder them, then export an MP4 without creating an account or
-uploading source media to a server.
+A mobile-first, local-only video recorder and editor. Hold the record button to
+capture a clip and release it to stop, or import existing clips. Choose 16:9,
+4:3, or square framing, switch between front and rear cameras, use supported
+torch and pinch-zoom controls, then trim, split, reorder, and export an MP4
+without creating an account or uploading source media to a server.
 
 ## Development
 
@@ -25,3 +27,14 @@ npm run build
 ```
 
 The production output is written to `dist/`.
+
+For the browser interaction smoke test, start the preview server and run:
+
+```sh
+npm run preview -- --host 127.0.0.1
+npm run smoke
+```
+
+The smoke test uses Chrome mobile/touch emulation, browser camera and microphone
+permissions, and Chromium's synthetic camera. A physical mobile-device pass is
+still the best final check for device-specific torch and optical zoom support.

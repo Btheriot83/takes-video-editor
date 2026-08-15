@@ -51,6 +51,7 @@ export async function getCameraStream(facing: 'user' | 'environment'): Promise<M
 export async function startRecording(
   stream: MediaStream,
   onTick?: (elapsed: number) => void,
+  facing: 'user' | 'environment' = 'environment',
 ): Promise<ActiveRecording> {
   const mimeType = pickMimeType();
   console.log('[rec] mimeType=', mimeType);
@@ -63,8 +64,7 @@ export async function startRecording(
   let seq = 0;
   const chunks: Blob[] = [];
   console.log('[rec] recBegin…');
-  await recBegin({
- mimeType: rec.mimeType || mimeType, startedAt: Date.now(), facing: 'user' });
+  await recBegin({ mimeType: rec.mimeType || mimeType, startedAt: Date.now(), facing });
 
   rec.ondataavailable = (e) => {
     if (e.data && e.data.size > 0) {

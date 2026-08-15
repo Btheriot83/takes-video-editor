@@ -1,42 +1,92 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { FlipHorizontal2, Upload, Pause, Play, Film } from 'lucide-react';
+import { Film, Images, SwitchCamera, Zap, ZapOff } from 'lucide-react';
 import { getCameraStream, startRecording } from '../lib/recorder';
 import type { ActiveRecording } from '../lib/recorder';
 import { useStore } from '../state/store';
-import { fmtTime, clipLen } from '../types/clip';
+import { ASPECT_RATIOS, fmtTime, clipLen } from '../types/clip';
+import type { AspectRatio } from '../types/clip';
+
+type ZoomRange = { min: number; max: number; step: number };
+type ExtendedCapabilities = MediaTrackCapabilities & { zoom?: ZoomRange; torch?: boolean };
+type ExtendedSettings = MediaTrackSettings & { zoom?: number };
+type ExtendedConstraintSet = MediaTrackConstraintSet & { zoom?: number; torch?: boolean };
+
+const RATIOS: AspectRatio[] = ['16:9', '4:3', '1:1'];
+
+function distance(a: { x: number; y: number }, b: { x: number; y: number }) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
 
 export default function Camera() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const recRef = useRef<ActiveRecording | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const pressActiveRef = useRef(false);
+  const stoppingRef = useRef(false);
+  const pointersRef = useRef(new Map<number, { x: number; y: number }>());
+  const pinchRef = useRef<{ distance: number; zoom: number } | null>(null);
+  const zoomFrameRef = useRef<number | null>(null);
+  const pendingZoomRef = useRef<number | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
 
   const [facing, setFacing] = useState<'user' | 'environment'>('environment');
   const [recording, setRecording] = useState(false);
-  const [paused, setPaused] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [streamReady, setStreamReady] = useState(false);
+  const [zoomRange, setZoomRange] = useState<ZoomRange | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [torchSupported, setTorchSupported] = useState(false);
+  const [torchOn, setTorchOn] = useState(false);
+  const [capabilityNotice, setCapabilityNotice] = useState<string | null>(null);
 
-  const { clips, addClipFromBlob, importFiles, setScreen, total } = useStore();
+  const {
+    clips, addClipFromBlob, importFiles, setScreen, total,
+    aspectRatio, setAspectRatio,
+  } = useStore();
 
-  const openCamera = useCallback(async (f: 'user' | 'environment') => {
+  const showCapabilityNotice = useCallback((message: string) => {
+    setCapabilityNotice(message);
+    if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = window.setTimeout(() => setCapabilityNotice(null), 2200);
+  }, []);
+
+  const openCamera = useCallback(async (nextFacing: 'user' | 'environment') => {
     setStreamReady(false);
+    setTorchOn(false);
     try {
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      const s = await getCameraStream(f);
-      streamRef.current = s;
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      const stream = await getCameraStream(nextFacing);
+      const videoTrack = stream.getVideoTracks()[0];
+      const capabilities = videoTrack?.getCapabilities?.() as ExtendedCapabilities | undefined;
+      const settings = videoTrack?.getSettings?.() as ExtendedSettings | undefined;
+      const nextZoomRange = capabilities?.zoom && capabilities.zoom.max > capabilities.zoom.min
+        ? {
+            min: capabilities.zoom.min,
+            max: capabilities.zoom.max,
+            step: capabilities.zoom.step || 0.1,
+          }
+        : null;
+
+      streamRef.current = stream;
+      setZoomRange(nextZoomRange);
+      setZoom(settings?.zoom ?? nextZoomRange?.min ?? 1);
+      setTorchSupported(nextFacing === 'environment' && capabilities?.torch === true);
       setStreamReady(true);
       if (videoRef.current) {
-        videoRef.current.srcObject = s;
+        videoRef.current.srcObject = stream;
         videoRef.current.play().catch(() => {});
       }
       setError(null);
-    } catch (error: unknown) {
+    } catch (cameraError: unknown) {
+      setZoomRange(null);
+      setTorchSupported(false);
       setError(
-        error instanceof DOMException && error.name === 'NotAllowedError'
-          ? 'Camera access was denied. Allow camera & mic permission and try again.'
+        cameraError instanceof DOMException && cameraError.name === 'NotAllowedError'
+          ? 'Camera access was denied. Allow camera and microphone permission, then try again.'
           : 'Could not open a camera on this device.',
       );
     }
@@ -45,142 +95,331 @@ export default function Camera() {
   useEffect(() => {
     openCamera(facing);
     return () => {
-      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     };
   }, [facing, openCamera]);
 
-  // keep recording alive if the tab is hidden (iOS may freeze preview, not the recorder)
-  useEffect(() => {
-    const onVis = () => {
-      if (document.hidden && videoRef.current) videoRef.current.play().catch(() => {});
-    };
-    document.addEventListener('visibilitychange', onVis);
-    return () => document.removeEventListener('visibilitychange', onVis);
+  useEffect(() => () => {
+    if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
+    if (zoomFrameRef.current) window.cancelAnimationFrame(zoomFrameRef.current);
   }, []);
 
-  const toggleRecord = async () => {
-    if (recording) {
-      setRecording(false);
-      setPaused(false);
-      const blob = await recRef.current?.stop();
-      recRef.current = null;
-      setElapsed(0);
-      if (blob && blob.size > 0) {
-        await addClipFromBlob(blob, blob.type);
-      }
-      return;
-    }
-    if (!streamRef.current) { setError('Camera is still starting — try again in a moment.'); return; }
-    setStarting(true);
-    console.log('[cam] startRecording begin');
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.hidden && videoRef.current) videoRef.current.play().catch(() => {});
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
+
+  const finishRecording = useCallback(async (active: ActiveRecording | null) => {
+    if (!active || stoppingRef.current) return;
+    stoppingRef.current = true;
+    setStopping(true);
+    if (recRef.current === active) recRef.current = null;
+    setRecording(false);
     try {
-      recRef.current = await startRecording(streamRef.current, setElapsed);
-      console.log('[cam] startRecording ok');
+      const blob = await active.stop();
+      if (blob.size > 0) await addClipFromBlob(blob, blob.type);
+    } catch (recordingError) {
+      console.error('[cam] stop recording failed', recordingError);
+      setError('The recording could not be saved. Please try again.');
+    } finally {
+      setElapsed(0);
+      stoppingRef.current = false;
+      setStopping(false);
+    }
+  }, [addClipFromBlob]);
+
+  const beginRecording = useCallback(async () => {
+    if (!streamRef.current || starting || recRef.current || stoppingRef.current) return;
+    setStarting(true);
+    try {
+      const active = await startRecording(streamRef.current, setElapsed, facing);
+      recRef.current = active;
       setRecording(true);
-    } catch (err) {
-      console.log('[cam] startRecording failed', String(err));
+      if (!pressActiveRef.current) await finishRecording(active);
+    } catch (recordingError) {
+      console.error('[cam] start recording failed', recordingError);
       setError('Recording is not supported in this browser.');
     } finally {
       setStarting(false);
     }
+  }, [facing, finishRecording, starting]);
+
+  const startHold = useCallback(() => {
+    if (!streamReady || error || starting || stopping) return;
+    pressActiveRef.current = true;
+    void beginRecording();
+  }, [beginRecording, error, starting, stopping, streamReady]);
+
+  const endHold = useCallback(() => {
+    pressActiveRef.current = false;
+    if (recRef.current) void finishRecording(recRef.current);
+  }, [finishRecording]);
+
+  const toggleTorch = async () => {
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (!track || !torchSupported) {
+      showCapabilityNotice('Flash is unavailable on this camera');
+      return;
+    }
+    const next = !torchOn;
+    try {
+      await track.applyConstraints({ advanced: [{ torch: next } as ExtendedConstraintSet] });
+      setTorchOn(next);
+    } catch {
+      setTorchSupported(false);
+      setTorchOn(false);
+      showCapabilityNotice('Flash is unavailable on this camera');
+    }
   };
 
-  const flip = () => setFacing((f) => (f === 'user' ? 'environment' : 'user'));
+  const applyZoom = useCallback((value: number) => {
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (!track || !zoomRange) return;
+    const stepped = Math.round(value / zoomRange.step) * zoomRange.step;
+    const next = Math.min(zoomRange.max, Math.max(zoomRange.min, stepped));
+    pendingZoomRef.current = next;
+    if (zoomFrameRef.current) return;
+    zoomFrameRef.current = window.requestAnimationFrame(() => {
+      zoomFrameRef.current = null;
+      const pending = pendingZoomRef.current;
+      if (pending === null) return;
+      pendingZoomRef.current = null;
+      setZoom(pending);
+      track.applyConstraints({ advanced: [{ zoom: pending } as ExtendedConstraintSet] }).catch(() => {
+        setZoomRange(null);
+        showCapabilityNotice('Pinch zoom is unavailable on this camera');
+      });
+    });
+  }, [showCapabilityNotice, zoomRange]);
+
+  const updatePinchStart = () => {
+    const points = Array.from(pointersRef.current.values());
+    if (points.length === 2) pinchRef.current = { distance: distance(points[0], points[1]), zoom };
+  };
+
+  const onPreviewPointerDown = (event: React.PointerEvent) => {
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    updatePinchStart();
+  };
+
+  const onPreviewPointerMove = (event: React.PointerEvent) => {
+    if (!pointersRef.current.has(event.pointerId)) return;
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    const points = Array.from(pointersRef.current.values());
+    if (points.length !== 2 || !pinchRef.current) return;
+    event.preventDefault();
+    if (!zoomRange) {
+      showCapabilityNotice('Pinch zoom is unavailable on this camera');
+      return;
+    }
+    const scale = distance(points[0], points[1]) / Math.max(1, pinchRef.current.distance);
+    applyZoom(pinchRef.current.zoom * scale);
+  };
+
+  const onPreviewPointerEnd = (event: React.PointerEvent) => {
+    pointersRef.current.delete(event.pointerId);
+    pinchRef.current = null;
+    updatePinchStart();
+  };
+
+  const switchCamera = () => {
+    if (recording || starting) return;
+    setFacing((current) => (current === 'user' ? 'environment' : 'user'));
+  };
+
+  const hasClips = clips.length > 0;
+  const controlsDisabled = recording || starting || stopping;
 
   return (
-    <div className="fixed inset-0 bg-black text-white select-none overflow-hidden">
-      {/* live preview */}
-      <video
-        ref={videoRef}
-        autoPlay
-        playsInline
-        muted
-        className={`absolute inset-0 w-full h-full object-cover ${facing === 'user' ? '-scale-x-100' : ''}`}
-      />
-
-      {/* top bar */}
-      <div className="absolute top-0 inset-x-0 pt-[env(safe-area-inset-top)] px-4 py-3 flex items-center justify-between bg-gradient-to-b from-black/60 to-transparent">
-        <div className="text-sm font-semibold tracking-wide text-white/90">Takes</div>
-        <div className="flex items-center gap-2 text-sm tabular-nums">
-          {recording && <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />}
-          <span className="text-white/90">{recording ? fmtTime(elapsed) : fmtTime(0)}</span>
-          <span className="text-white/50">/ {fmtTime(total)}</span>
+    <div className="fixed inset-0 bg-black text-white select-none overflow-hidden flex flex-col">
+      <header className="relative z-20 shrink-0 pt-[env(safe-area-inset-top)] bg-black px-3 py-2.5 flex items-center justify-between gap-2">
+        <div className="text-sm font-semibold tracking-tight w-14">Takes</div>
+        <div className="flex items-center rounded-full bg-white/10 p-0.5" aria-label="Aspect ratio">
+          {RATIOS.map((ratio) => (
+            <button
+              key={ratio}
+              type="button"
+              disabled={controlsDisabled}
+              aria-pressed={aspectRatio === ratio}
+              onClick={() => setAspectRatio(ratio)}
+              className={`min-h-8 min-w-11 rounded-full px-2 text-[11px] font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:opacity-40 ${
+                aspectRatio === ratio ? 'bg-white text-black' : 'text-white/70'
+              }`}
+            >
+              {ratio}
+            </button>
+          ))}
         </div>
-      </div>
-
-      {error && (
-        <div className="absolute top-16 inset-x-4 bg-neutral-900/95 border border-neutral-700 rounded-xl p-4 text-sm text-center z-20">
-          {error}
+        <div className="w-14 text-right text-sm tabular-nums text-white/80">
+          {recording ? fmtTime(elapsed) : fmtTime(total)}
         </div>
-      )}
+      </header>
 
-      {/* bottom controls */}
-      <div className="absolute bottom-0 inset-x-0 pb-[max(env(safe-area-inset-bottom),1rem)] bg-gradient-to-t from-black/70 via-black/30 to-transparent">
-        {/* clip tray */}
-        {clips.length > 0 && (
+      <main
+        className="relative min-h-0 flex-1 flex items-center justify-center overflow-hidden bg-neutral-950 touch-none"
+        onPointerDown={onPreviewPointerDown}
+        onPointerMove={onPreviewPointerMove}
+        onPointerUp={onPreviewPointerEnd}
+        onPointerCancel={onPreviewPointerEnd}
+      >
+        <div
+          data-camera-frame
+          className="relative max-h-full max-w-full overflow-hidden bg-neutral-900"
+          style={{
+            aspectRatio: ASPECT_RATIOS[aspectRatio].css,
+            height: aspectRatio === '16:9' ? '100%' : 'auto',
+            width: aspectRatio === '16:9' ? 'auto' : '100%',
+          }}
+        >
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            className={`absolute inset-0 h-full w-full object-cover ${facing === 'user' ? '-scale-x-100' : ''}`}
+          />
+
+          <div className="absolute inset-x-0 top-0 h-16 bg-gradient-to-b from-black/50 to-transparent pointer-events-none" />
+          <div className="absolute inset-x-0 bottom-0 h-20 bg-gradient-to-t from-black/55 to-transparent pointer-events-none" />
+
+          <div className="absolute left-1/2 bottom-3 -translate-x-1/2 rounded-full bg-black/65 px-3 py-1.5 text-xs font-semibold tabular-nums shadow-sm" aria-live="polite">
+            {zoom.toFixed(zoom % 1 === 0 ? 0 : 1)}×
+            {!zoomRange && <span className="ml-1.5 font-normal text-white/60">fixed</span>}
+          </div>
+
+          {recording && (
+            <div className="absolute left-3 top-3 flex items-center gap-2 rounded-full bg-black/65 px-3 py-1.5 text-xs font-semibold tabular-nums">
+              <span className="h-2 w-2 rounded-full bg-red-500" />
+              {fmtTime(elapsed)}
+            </div>
+          )}
+        </div>
+
+        {error && (
+          <div role="alert" className="absolute inset-x-4 top-4 z-20 rounded-xl bg-neutral-900 p-4 text-center text-sm shadow-lg">
+            {error}
+          </div>
+        )}
+
+        {capabilityNotice && (
+          <div className="absolute left-1/2 top-4 z-20 -translate-x-1/2 whitespace-nowrap rounded-full bg-neutral-900 px-3 py-2 text-xs shadow-lg" aria-live="polite">
+            {capabilityNotice}
+          </div>
+        )}
+      </main>
+
+      <footer className="relative z-20 shrink-0 bg-black px-4 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-3">
+        {hasClips && (
           <button
+            type="button"
+            disabled={controlsDisabled}
             onClick={() => setScreen('editor')}
-            className="mx-auto mb-3 flex items-center gap-1.5 bg-neutral-900/80 backdrop-blur rounded-full pl-1.5 pr-3 py-1.5 border border-white/10 active:scale-95 transition"
+            className="mx-auto mb-3 flex min-h-11 max-w-full items-center gap-2 rounded-full bg-white/10 px-2 pr-4 text-left transition-colors active:bg-white/15 disabled:opacity-40"
           >
             <span className="flex -space-x-2">
-              {clips.slice(0, 3).map((c) => (
-                <span key={c.id} className="w-7 h-7 rounded-md overflow-hidden border border-black/60 bg-neutral-800">
-                  {c.thumbs[0] && <img src={c.thumbs[0]} className="w-full h-full object-cover" alt="" />}
+              {clips.slice(-3).map((clip) => (
+                <span key={clip.id} className="h-8 w-8 overflow-hidden rounded-md border border-black bg-neutral-800">
+                  {clip.thumbs[0] && <img src={clip.thumbs[0]} className="h-full w-full object-cover" alt="" />}
                 </span>
               ))}
             </span>
-            <span className="text-xs font-medium">
-              {clips.length} clip{clips.length > 1 ? 's' : ''} · {fmtTime(clips.reduce((s, c) => s + clipLen(c), 0))} — Edit
+            <span className="truncate text-xs font-medium">
+              {clips.length} clip{clips.length === 1 ? '' : 's'} · {fmtTime(clips.reduce((sum, clip) => sum + clipLen(clip), 0))}
             </span>
+            <span className="ml-auto text-xs font-semibold">Edit</span>
           </button>
         )}
 
-        <div className="flex items-center justify-between px-8">
-          {/* import */}
+        <div className="grid grid-cols-[3rem_1fr_3rem] items-center gap-5">
           <button
-            onClick={() => fileRef.current?.click()}
-            className="w-12 h-12 rounded-full bg-white/10 backdrop-blur flex items-center justify-center active:scale-90 transition"
-            aria-label="Import video"
+            type="button"
+            onClick={toggleTorch}
+            disabled={!torchSupported || controlsDisabled}
+            aria-label={torchSupported ? (torchOn ? 'Turn flash off' : 'Turn flash on') : 'Flash unavailable'}
+            aria-pressed={torchOn}
+            className="flex h-12 w-12 items-center justify-center rounded-full bg-white/10 transition active:scale-95 disabled:opacity-35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
           >
-            <Upload size={20} />
+            {torchOn ? <Zap size={21} fill="currentColor" /> : <ZapOff size={21} />}
           </button>
 
-          {/* record */}
-          <button
-            onClick={toggleRecord}
-            disabled={starting || !streamReady || !!error}
-            aria-label={recording ? 'Stop recording' : 'Start recording'}
-            className="relative w-[76px] h-[76px] rounded-full border-4 border-white flex items-center justify-center active:scale-95 transition disabled:opacity-40"
-          >
-            <span
-              className={`block bg-red-500 transition-all duration-200 ${
-                recording ? 'w-7 h-7 rounded-md' : 'w-[58px] h-[58px] rounded-full'
-              }`}
-            />
-          </button>
-
-          {/* flip / pause */}
-          {recording ? (
+          <div className="flex flex-col items-center">
             <button
-              onClick={() => {
-                if (!recRef.current) return;
-                if (paused) { recRef.current.resume(); setPaused(false); }
-                else { recRef.current.pause(); setPaused(true); }
+              type="button"
+              disabled={!streamReady || !!error || starting || stopping}
+              aria-label={recording ? 'Release to stop recording' : 'Hold to record'}
+              aria-describedby="record-hint"
+              onContextMenu={(event) => event.preventDefault()}
+              onPointerDown={(event) => {
+                if (event.button !== 0) return;
+                event.preventDefault();
+                event.currentTarget.setPointerCapture?.(event.pointerId);
+                startHold();
               }}
-              className="w-12 h-12 rounded-full bg-white/10 backdrop-blur flex items-center justify-center active:scale-90 transition"
-              aria-label={paused ? 'Resume' : 'Pause'}
+              onPointerUp={(event) => { event.preventDefault(); endHold(); }}
+              onPointerCancel={endHold}
+              onLostPointerCapture={() => { if (pressActiveRef.current) endHold(); }}
+              onKeyDown={(event) => {
+                if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) {
+                  event.preventDefault();
+                  startHold();
+                }
+              }}
+              onKeyUp={(event) => {
+                if (event.key === ' ' || event.key === 'Enter') {
+                  event.preventDefault();
+                  endHold();
+                }
+              }}
+              onBlur={() => { if (pressActiveRef.current) endHold(); }}
+              className={`relative flex h-[78px] w-[78px] items-center justify-center rounded-full border-[5px] border-white transition-transform duration-150 active:scale-95 disabled:opacity-35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white ${recording ? 'scale-110' : ''}`}
             >
-              {paused ? <Play size={20} /> : <Pause size={20} />}
+              <span className={`block bg-red-500 transition-all duration-150 ${recording ? 'h-[62px] w-[62px]' : 'h-[58px] w-[58px] rounded-full'}`} />
+            </button>
+            <span id="record-hint" className="mt-2 text-[11px] font-medium text-white/60">
+              {recording ? 'Release to stop' : 'Hold to record'}
+            </span>
+          </div>
+
+          <button
+            type="button"
+            onClick={switchCamera}
+            disabled={controlsDisabled}
+            aria-label={facing === 'environment' ? 'Switch to front camera' : 'Switch to rear camera'}
+            className="flex h-12 w-12 items-center justify-center rounded-full bg-white/10 transition active:scale-95 disabled:opacity-35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+          >
+            <SwitchCamera size={22} />
+          </button>
+        </div>
+
+        <div className="mt-1 flex items-center justify-between">
+          <button
+            type="button"
+            disabled={controlsDisabled}
+            onClick={() => fileRef.current?.click()}
+            className="flex min-h-11 items-center gap-2 rounded-full px-3 text-xs font-semibold text-white/75 active:bg-white/10 disabled:opacity-35"
+            aria-label="Import videos"
+          >
+            <Images size={18} /> Import
+          </button>
+          <div className="flex items-center gap-1 text-[11px] text-white/45" aria-hidden="true">
+            <Film size={13} /> Local to this device
+          </div>
+          {hasClips ? (
+            <button
+              type="button"
+              disabled={controlsDisabled}
+              onClick={() => setScreen('editor')}
+              className="min-h-11 rounded-full px-3 text-xs font-semibold text-white/75 active:bg-white/10 disabled:opacity-35"
+            >
+              Timeline
             </button>
           ) : (
-            <button
-              onClick={flip}
-              className="w-12 h-12 rounded-full bg-white/10 backdrop-blur flex items-center justify-center active:scale-90 transition"
-              aria-label="Flip camera"
-            >
-              <FlipHorizontal2 size={20} />
-            </button>
+            <span className="w-[72px]" />
           )}
         </div>
 
@@ -190,21 +429,12 @@ export default function Camera() {
           accept="video/*"
           multiple
           hidden
-          onChange={(e) => {
-            if (e.target.files?.length) importFiles(e.target.files);
-            e.target.value = '';
+          onChange={(event) => {
+            if (event.target.files?.length) importFiles(event.target.files);
+            event.target.value = '';
           }}
         />
-      </div>
-
-      {clips.length === 0 && !recording && !error && (
-        <div className="absolute bottom-32 inset-x-0 text-center text-white/70 text-sm pointer-events-none px-8">
-          Tap the red button to record your first clip
-          <div className="mt-1 text-white/40 text-xs flex items-center justify-center gap-1">
-            <Film size={12} /> or import videos with the left button
-          </div>
-        </div>
-      )}
+      </footer>
     </div>
   );
 }

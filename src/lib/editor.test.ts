@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { trimClip, splitClip, moveClip, History, locate, clipStart } from './editor';
-import { clipLen, totalDuration, FRAME } from '../types/clip';
+import { ASPECT_RATIOS, clipLen, totalDuration, FRAME } from '../types/clip';
 import type { Clip } from '../types/clip';
 
 const mk = (id: string, dur: number, trimIn = 0, trimOut?: number): Clip => ({
@@ -101,5 +101,13 @@ describe('locate / clipStart', () => {
     expect(clipStart(cs, 1)).toBe(4);
     expect(clipStart(cs, 2)).toBe(7);
     expect(totalDuration(cs)).toBe(9);
+  });
+});
+
+describe('aspect-ratio export targets', () => {
+  it('keeps every supported frame mapped to its intended output size', () => {
+    expect(ASPECT_RATIOS['16:9']).toMatchObject({ css: '9 / 16', width: 1080, height: 1920 });
+    expect(ASPECT_RATIOS['4:3']).toMatchObject({ css: '3 / 4', width: 1080, height: 1440 });
+    expect(ASPECT_RATIOS['1:1']).toMatchObject({ css: '1 / 1', width: 1080, height: 1080 });
   });
 });

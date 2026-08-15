@@ -1,5 +1,5 @@
-import { clipLen } from '../types/clip';
-import type { Clip } from '../types/clip';
+import { ASPECT_RATIOS, clipLen } from '../types/clip';
+import type { AspectRatio, Clip } from '../types/clip';
 import type { FFmpeg } from '@ffmpeg/ffmpeg';
 
 // We load @ffmpeg/ffmpeg's ESM build from same-origin static files
@@ -43,6 +43,7 @@ export interface ExportResult {
 export async function exportMp4(
   clips: Clip[],
   getBlob: (key: string) => Promise<Blob | undefined>,
+  aspectRatio: AspectRatio,
   onProgress?: (phase: string, p: number) => void,
 ): Promise<ExportResult> {
   if (!clips.length) throw new Error('Nothing to export');
@@ -67,12 +68,14 @@ export async function exportMp4(
     args.push('-ss', String(clips[i].trimIn), '-t', String(clipLen(clips[i])), '-i', inputs[i]);
   }
 
-  // per-clip normalize: 1080x1920 contain + pad, 30fps, reset ts; audio 48k stereo
+  const output = ASPECT_RATIOS[aspectRatio];
+
+  // Per-clip normalize to the selected portrait frame, 30fps, reset timestamps.
   const parts: string[] = [];
   for (let i = 0; i < clips.length; i++) {
     parts.push(
-      `[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
-        `pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v${i}]`,
+      `[${i}:v]scale=${output.width}:${output.height}:force_original_aspect_ratio=increase,` +
+        `crop=${output.width}:${output.height},setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v${i}]`,
     );
     parts.push(
       `[${i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`,

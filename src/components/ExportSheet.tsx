@@ -4,11 +4,13 @@ import { useStore } from '../state/store';
 import { getBlob } from '../lib/db';
 import { exportMp4, shareFile, downloadBlob } from '../lib/ffmpeg';
 import { totalDuration, fmtTime } from '../types/clip';
+import { ASPECT_RATIOS } from '../types/clip';
 
 type Phase = 'idle' | 'working' | 'done' | 'error';
 
 export default function ExportSheet({ onClose }: { onClose: () => void }) {
   const clips = useStore((s) => s.clips);
+  const aspectRatio = useStore((s) => s.aspectRatio);
   const [phase, setPhase] = useState<Phase>('idle');
   const [label, setLabel] = useState('');
   const [progress, setProgress] = useState(0);
@@ -21,7 +23,7 @@ export default function ExportSheet({ onClose }: { onClose: () => void }) {
     setPhase('working');
     setError(null);
     try {
-      const res = await exportMp4(clips, getBlob, (l, p) => { setLabel(l); setProgress(p); });
+      const res = await exportMp4(clips, getBlob, aspectRatio, (l, p) => { setLabel(l); setProgress(p); });
       resultRef.current = res.blob;
       setPhase('done');
     } catch (error: unknown) {
@@ -51,7 +53,8 @@ export default function ExportSheet({ onClose }: { onClose: () => void }) {
 
         <div className="text-sm text-white/60 mb-4 space-y-1">
           <div className="flex justify-between"><span>Format</span><span className="text-white/90">MP4 · H.264 + AAC</span></div>
-          <div className="flex justify-between"><span>Resolution</span><span className="text-white/90">1080 × 1920</span></div>
+          <div className="flex justify-between"><span>Frame</span><span className="text-white/90">{aspectRatio}</span></div>
+          <div className="flex justify-between"><span>Resolution</span><span className="text-white/90">{ASPECT_RATIOS[aspectRatio].width} × {ASPECT_RATIOS[aspectRatio].height}</span></div>
           <div className="flex justify-between"><span>Duration</span><span className="text-white/90">{fmtTime(totalDuration(clips))}</span></div>
           <div className="flex justify-between"><span>Watermark / metadata</span><span className="text-white/90">None</span></div>
         </div>

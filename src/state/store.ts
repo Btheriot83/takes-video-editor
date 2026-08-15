@@ -1,6 +1,6 @@
 import { create } from 'zustand';
-import { totalDuration, clipLen } from '../types/clip';
-import type { Clip } from '../types/clip';
+import { totalDuration, clipLen, DEFAULT_ASPECT_RATIO } from '../types/clip';
+import type { AspectRatio, Clip } from '../types/clip';
 import { History, trimClip, splitClip, moveClip, duplicateClip, uid } from '../lib/editor';
 import {
   saveProject, loadProject, saveBlob, getBlob, deleteBlob, recRecover, gcBlobs, clearProject,
@@ -20,6 +20,7 @@ interface State {
   canRedo: boolean;
   recoveredNotice: string | null;
   total: number;
+  aspectRatio: AspectRatio;
 
   init: () => Promise<void>;
   addClipFromBlob: (blob: Blob, mimeType: string) => Promise<Clip>;
@@ -27,6 +28,7 @@ interface State {
   select: (id: string | null) => void;
   setScreen: (s: Screen) => void;
   setPlayhead: (t: number) => void;
+  setAspectRatio: (aspectRatio: AspectRatio) => void;
 
   commit: (next: Clip[], selectId?: string | null) => void;
   undo: () => void;
@@ -43,10 +45,10 @@ interface State {
 const history = new History();
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-function persist(clips: Clip[]) {
+function persist(clips: Clip[], aspectRatio: AspectRatio) {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    saveProject(clips).catch(() => {});
+    saveProject(clips, aspectRatio).catch(() => {});
     // NOTE: no blob GC here — undo/redo can restore clips referencing older
     // blobs. Orphaned blobs are reclaimed on newProject / clearAllData.
   }, 400);
@@ -62,6 +64,7 @@ export const useStore = create<State>((set, get) => ({
   canRedo: false,
   recoveredNotice: null,
   total: 0,
+  aspectRatio: DEFAULT_ASPECT_RATIO,
 
   init: async () => {
     // crash/interruption recovery: an unfinished recording session?
@@ -90,6 +93,7 @@ export const useStore = create<State>((set, get) => ({
         selectedId: existing[0]?.id ?? null,
         screen: existing.length ? 'editor' : 'camera',
         recoveredNotice: notice,
+        aspectRatio: p.aspectRatio ?? DEFAULT_ASPECT_RATIO,
         ready: true,
       });
     } else {
@@ -118,7 +122,7 @@ export const useStore = create<State>((set, get) => ({
     const clips = [...get().clips, clip];
     history.push(get().clips);
     set({ clips, selectedId: clip.id, total: totalDuration(clips), canUndo: history.canUndo, canRedo: false });
-    persist(clips);
+    persist(clips, get().aspectRatio);
     return clip;
   },
 
@@ -133,6 +137,10 @@ export const useStore = create<State>((set, get) => ({
   select: (id) => set({ selectedId: id }),
   setScreen: (s) => set({ screen: s }),
   setPlayhead: (t) => set({ playhead: t }),
+  setAspectRatio: (aspectRatio) => {
+    set({ aspectRatio });
+    persist(get().clips, aspectRatio);
+  },
 
   commit: (next, selectId) => {
     history.push(get().clips);
@@ -143,20 +151,20 @@ export const useStore = create<State>((set, get) => ({
       canUndo: history.canUndo,
       canRedo: history.canRedo,
     });
-    persist(next);
+    persist(next, get().aspectRatio);
   },
 
   undo: () => {
     const prev = history.undo(get().clips);
     if (!prev) return;
     set({ clips: prev, total: totalDuration(prev), canUndo: history.canUndo, canRedo: history.canRedo });
-    persist(prev);
+    persist(prev, get().aspectRatio);
   },
   redo: () => {
     const next = history.redo(get().clips);
     if (!next) return;
     set({ clips: next, total: totalDuration(next), canUndo: history.canUndo, canRedo: history.canRedo });
-    persist(next);
+    persist(next, get().aspectRatio);
   },
 
   trimSelected: (trimIn, trimOut) => {
@@ -209,7 +217,7 @@ export const useStore = create<State>((set, get) => ({
     await clearProject().catch(() => {});
     history.clear();
     set({ clips: [], selectedId: null, screen: 'camera', playhead: 0, total: 0, canUndo: false, canRedo: false });
-    await saveProject([]);
+    await saveProject([], get().aspectRatio);
   },
 
   dismissNotice: () => set({ recoveredNotice: null }),
