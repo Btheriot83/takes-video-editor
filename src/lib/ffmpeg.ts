@@ -1,6 +1,7 @@
 import { clipLen, exportDimensions } from '../types/clip';
 import type { AspectRatio, Clip, ExportQuality } from '../types/clip';
 import type { FFmpeg } from '@ffmpeg/ffmpeg';
+import { planWebCodecsEncode, renderVideoWebCodecs } from './webcodecs-export';
 
 // We load @ffmpeg/ffmpeg's ESM build from same-origin static files
 // (public/ffesm) instead of the vite-bundled worker: the bundled module
@@ -157,6 +158,67 @@ export async function exportMp4(
     console.warn('[export] lossless join was incompatible; rendering instead');
     await ffmpeg.deleteFile(concatFile).catch(() => {});
     await ffmpeg.deleteFile('out.mp4').catch(() => {});
+  }
+
+  // Fast path: hardware (or native software) H.264 via WebCodecs. wasm x264
+  // cannot finish 2160x3840 on real devices, so 4K depends on this path; it is
+  // also used for 1080p renders when available. Audio is still produced by
+  // ffmpeg.wasm (audio-only AAC encode is fast) and the two are remuxed with
+  // "-c copy", so the result stays a normal faststart MP4.
+  const plan = await planWebCodecsEncode(output.width, output.height, quality);
+  if (plan) {
+    try {
+      console.log('[export] using webcodecs encoder:', plan.config.codec, plan.config.hardwareAcceleration ?? 'default');
+      onProgress?.('Rendering video', 0.05);
+      const videoBytes = await renderVideoWebCodecs(clips, blobs, output.width, output.height, plan,
+        (p) => onProgress?.('Rendering video', 0.05 + p * 0.65));
+
+      onProgress?.('Encoding audio', 0.72);
+      const audioParts: string[] = [];
+      for (let i = 0; i < clips.length; i++) {
+        const len = clipLen(clips[i]);
+        audioParts.push(
+          `[${i}:a]aresample=48000:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,` +
+            `asetpts=PTS-STARTPTS,apad=whole_dur=${len},atrim=end=${len}[a${i}]`,
+        );
+      }
+      audioParts.push(`${clips.map((_, i) => `[a${i}]`).join('')}concat=n=${clips.length}:v=0:a=1[aout]`);
+      const audioArgs: string[] = ['-fflags', '+genpts'];
+      for (let i = 0; i < clips.length; i++) {
+        audioArgs.push('-ss', String(clips[i].trimIn), '-t', String(clipLen(clips[i])), '-i', inputs[i]);
+      }
+      audioArgs.push(
+        '-filter_complex', audioParts.join(';'), '-map', '[aout]',
+        '-c:a', 'aac', '-b:a', '128k', '-vn', 'audio.m4a',
+      );
+      const audioProgress = ({ time }: { time: number }) => {
+        onProgress?.('Encoding audio', 0.72 + Math.min(0.2, (time / 1_000_000 / total) * 0.2));
+      };
+      ffmpeg.on('progress', audioProgress);
+      const audioCode = await ffmpeg.exec(audioArgs);
+      ffmpeg.off('progress', audioProgress);
+      if (audioCode !== 0) throw new Error('audio encode failed');
+
+      onProgress?.('Finalizing', 0.94);
+      await ffmpeg.writeFile('wcvideo.mp4', videoBytes);
+      const muxCode = await ffmpeg.exec([
+        '-i', 'wcvideo.mp4', '-i', 'audio.m4a',
+        '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy',
+        '-movflags', '+faststart', '-map_metadata', '-1', '-metadata', 'encoder=',
+        'out.mp4',
+      ]);
+      if (muxCode !== 0) throw new Error('final mux failed');
+
+      const muxed = await ffmpeg.readFile('out.mp4');
+      const bytes = (muxed as Uint8Array).byteLength;
+      const blob = new Blob([new Uint8Array(muxed as Uint8Array).buffer as ArrayBuffer], { type: 'video/mp4' });
+      for (const n of [...inputs, 'wcvideo.mp4', 'audio.m4a', 'out.mp4']) ffmpeg.deleteFile(n).catch(() => {});
+      onProgress?.('Done', 1);
+      return { blob, bytes, seconds: (performance.now() - started) / 1000, mode: 'transcoded' };
+    } catch (error) {
+      console.warn('[export] webcodecs path failed; falling back to wasm encoder', error);
+      for (const n of ['wcvideo.mp4', 'audio.m4a', 'out.mp4']) ffmpeg.deleteFile(n).catch(() => {});
+    }
   }
 
   const args: string[] = [];
