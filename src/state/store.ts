@@ -3,7 +3,7 @@ import { totalDuration, clipLen, DEFAULT_ASPECT_RATIO } from '../types/clip';
 import type { AspectRatio, Clip } from '../types/clip';
 import { History, trimClip, splitClip, moveClip, duplicateClip, uid } from '../lib/editor';
 import {
-  saveProject, loadProject, saveBlob, getBlob, deleteBlob, recRecover, gcBlobs, clearProject,
+  saveProject, loadProject, saveBlob, getBlob, deleteBlob, recRecover, recFinalize, gcBlobs, clearProject,
 } from '../lib/db';
 import { probeVideo } from '../lib/recorder';
 import { makeThumbs } from '../lib/thumbs';
@@ -48,10 +48,17 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 function persist(clips: Clip[], aspectRatio: AspectRatio) {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
+    saveTimer = null;
     saveProject(clips, aspectRatio).catch(() => {});
     // NOTE: no blob GC here — undo/redo can restore clips referencing older
     // blobs. Orphaned blobs are reclaimed on newProject / clearAllData.
   }, 400);
+}
+
+async function persistNow(clips: Clip[], aspectRatio: AspectRatio) {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = null;
+  await saveProject(clips, aspectRatio);
 }
 
 export const useStore = create<State>((set, get) => ({
@@ -67,48 +74,51 @@ export const useStore = create<State>((set, get) => ({
   aspectRatio: DEFAULT_ASPECT_RATIO,
 
   init: async () => {
-    // crash/interruption recovery: an unfinished recording session?
     let notice: string | null = null;
     try {
-      const rec = await recRecover();
-      if (rec && rec.blob.size > 10_000) {
-        try {
-          const clip = await get().addClipFromBlob(rec.blob, rec.mimeType);
-          notice = `Recovered an interrupted recording (${clipLen(clip).toFixed(1)}s).`;
-        } catch {
-          notice = null;
-        }
-      }
-    } catch { /* ignore */ }
-
-    const p = await loadProject().catch(() => undefined);
-    if (p && p.clips.length) {
+      // Restore completed clips first so an interrupted recording is appended
+      // instead of being replaced by the older saved project.
+      const p = await loadProject().catch(() => undefined);
       const existing: Clip[] = [];
-      for (const c of p.clips) {
-        if (await getBlob(c.blobKey)) existing.push(c);
+      if (p?.clips.length) {
+        for (const clip of p.clips) {
+          try {
+            if (await getBlob(clip.blobKey)) existing.push(clip);
+          } catch {
+            // A single damaged entry must not leave the whole app on Loading.
+          }
+        }
       }
       set({
         clips: existing,
         total: totalDuration(existing),
         selectedId: existing[0]?.id ?? null,
         screen: existing.length ? 'editor' : 'camera',
-        recoveredNotice: notice,
         // Empty projects always open in the requested vertical default.
         // Existing projects retain their chosen frame for editing/export.
-        aspectRatio: existing.length ? (p.aspectRatio ?? DEFAULT_ASPECT_RATIO) : DEFAULT_ASPECT_RATIO,
-        ready: true,
+        aspectRatio: existing.length ? (p?.aspectRatio ?? DEFAULT_ASPECT_RATIO) : DEFAULT_ASPECT_RATIO,
       });
-    } else {
+
+      const rec = await recRecover();
+      if (rec && rec.blob.size > 10_000) {
+        const clip = await get().addClipFromBlob(rec.blob, rec.mimeType);
+        await recFinalize();
+        notice = `Recovered an interrupted recording (${clipLen(clip).toFixed(1)}s).`;
+      }
+    } catch (error) {
+      console.error('[store] restore failed', error);
+      notice = 'Some saved media could not be restored. New recordings are still available.';
+    } finally {
       set({ ready: true, recoveredNotice: notice });
     }
   },
 
   addClipFromBlob: async (blob, mimeType) => {
-    const meta = await probeVideo(blob);
     const blobKey = uid();
+    // Persist the irreplaceable media before doing any decoder work. Camera
+    // recovery data is kept until this clip and its project entry are durable.
     await saveBlob(blobKey, blob);
-    let thumbs: string[] = [];
-    try { thumbs = await makeThumbs(blob, 4); } catch { /* non-fatal */ }
+    const meta = await probeVideo(blob);
     const clip: Clip = {
       id: uid(),
       blobKey,
@@ -119,12 +129,22 @@ export const useStore = create<State>((set, get) => ({
       width: meta.width,
       height: meta.height,
       createdAt: Date.now(),
-      thumbs,
+      thumbs: [],
     };
     const clips = [...get().clips, clip];
+    await persistNow(clips, get().aspectRatio);
     history.push(get().clips);
     set({ clips, selectedId: clip.id, total: totalDuration(clips), canUndo: history.canUndo, canRedo: false });
-    persist(clips, get().aspectRatio);
+
+    // Thumbnail decoding is expensive and can monopolize iPhone media
+    // decoders. It must never keep the record button in a stopping state.
+    void makeThumbs(blob, 4).then(async (thumbs) => {
+      const latest = get().clips;
+      if (!latest.some((item) => item.id === clip.id)) return;
+      const withThumbs = latest.map((item) => (item.id === clip.id ? { ...item, thumbs } : item));
+      set({ clips: withThumbs });
+      persist(withThumbs, get().aspectRatio);
+    }).catch(() => { /* thumbnails are non-essential */ });
     return clip;
   },
 

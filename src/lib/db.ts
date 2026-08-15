@@ -73,7 +73,7 @@ export async function recRecover(): Promise<{ mimeType: string; blob: Blob } | n
   const parts: Blob[] = [];
   for (const k of keys) parts.push(await d.get('rec', k));
   const blob = new Blob(parts, { type: meta.mimeType });
-  await recFinalize();
+  // The caller clears recovery only after the reconstructed clip is durable.
   return { mimeType: meta.mimeType, blob };
 }
 

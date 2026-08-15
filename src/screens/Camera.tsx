@@ -109,7 +109,7 @@ export default function Camera() {
 
   useEffect(() => {
     const onVisibilityChange = () => {
-      if (document.hidden && videoRef.current) videoRef.current.play().catch(() => {});
+      if (!document.hidden && videoRef.current) videoRef.current.play().catch(() => {});
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => document.removeEventListener('visibilitychange', onVisibilityChange);
@@ -123,7 +123,15 @@ export default function Camera() {
     setRecording(false);
     try {
       const blob = await active.stop();
-      if (blob.size > 0) await addClipFromBlob(blob, blob.type);
+      if (blob.size > 0) {
+        await addClipFromBlob(blob, blob.type);
+        // Clear crash-recovery chunks only after the media and project entry
+        // are both safely stored.
+        await active.finalize();
+      } else {
+        await active.finalize();
+        throw new Error('The browser returned an empty recording');
+      }
     } catch (recordingError) {
       console.error('[cam] stop recording failed', recordingError);
       setError('The recording could not be saved. Please try again.');

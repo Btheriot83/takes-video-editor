@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ArrowLeft, Undo2, Redo2, Scissors, Copy, Trash2, Play, Share2, Plus,
+  ArrowLeft, Undo2, Redo2, Scissors, Copy, Trash2, Play, Download, Plus,
   ChevronLeft, ChevronRight,
 } from 'lucide-react';
 import { useStore } from '../state/store';
@@ -26,7 +26,15 @@ export default function Editor() {
   const [playing, setPlaying] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [clipUrls, setClipUrls] = useState<Record<string, string>>({});
+  const clipUrlsRef = useRef<Record<string, string>>({});
   const fileRef = useRef<HTMLInputElement>(null);
+
+  clipUrlsRef.current = clipUrls;
+
+  useEffect(() => () => {
+    Object.values(clipUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));
+    clipUrlsRef.current = {};
+  }, []);
 
   const total = useMemo(() => totalDuration(clips), [clips]);
   const selected = clips.find((c) => c.id === selectedId) ?? null;
@@ -154,7 +162,7 @@ export default function Editor() {
             className="p-2 rounded-lg active:bg-white/10 disabled:opacity-30"><Redo2 size={18} /></button>
           <button onClick={() => setExportOpen(true)} disabled={!clips.length}
             className="ml-1 bg-white text-black text-sm font-semibold px-3.5 py-1.5 rounded-full active:scale-95 disabled:opacity-30 flex items-center gap-1.5">
-            <Share2 size={15} /> Export
+            <Download size={15} /> Save video
           </button>
         </div>
       </div>

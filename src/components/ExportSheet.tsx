@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { X, Download, Share2, CheckCircle2 } from 'lucide-react';
 import { useStore } from '../state/store';
 import { getBlob } from '../lib/db';
@@ -16,21 +16,31 @@ export default function ExportSheet({ onClose }: { onClose: () => void }) {
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const resultRef = useRef<Blob | null>(null);
+  const startedRef = useRef(false);
 
-  const filename = `take-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.mp4`;
+  const filenameRef = useRef(`take-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.mp4`);
+  const filename = filenameRef.current;
 
-  const start = async () => {
+  const start = useCallback(async () => {
     setPhase('working');
     setError(null);
     try {
       const res = await exportMp4(clips, getBlob, aspectRatio, (l, p) => { setLabel(l); setProgress(p); });
       resultRef.current = res.blob;
+      downloadBlob(res.blob, filename);
       setPhase('done');
     } catch (error: unknown) {
       setError(error instanceof Error ? error.message : 'Export failed');
       setPhase('error');
     }
-  };
+  }, [aspectRatio, clips, filename]);
+
+  useEffect(() => {
+    if (startedRef.current) return;
+    startedRef.current = true;
+    const timer = window.setTimeout(() => void start(), 0);
+    return () => window.clearTimeout(timer);
+  }, [start]);
 
   const share = async () => {
     if (!resultRef.current) return;
@@ -44,7 +54,7 @@ export default function ExportSheet({ onClose }: { onClose: () => void }) {
       <div role="dialog" aria-modal="true" aria-labelledby="export-title"
         className="relative w-full sm:max-w-sm bg-neutral-900 rounded-t-2xl sm:rounded-2xl border border-white/10 p-5 pb-[max(env(safe-area-inset-bottom),1.25rem)]">
         <div className="flex items-center justify-between mb-4">
-          <h2 id="export-title" className="font-semibold">Export video</h2>
+          <h2 id="export-title" className="font-semibold">Save video</h2>
           {phase !== 'working' && (
             <button onClick={onClose} className="p-1.5 rounded-lg active:bg-white/10" aria-label="Close">
               <X size={18} />
@@ -60,12 +70,7 @@ export default function ExportSheet({ onClose }: { onClose: () => void }) {
           <div className="flex justify-between"><span>Watermark / metadata</span><span className="text-white/90">None</span></div>
         </div>
 
-        {phase === 'idle' && (
-          <button onClick={start}
-            className="w-full bg-white text-black font-semibold py-3 rounded-xl active:scale-[0.98]">
-            Start export
-          </button>
-        )}
+        {phase === 'idle' && <p className="text-sm text-white/60">Preparing your video…</p>}
 
         {phase === 'working' && (
           <div>
@@ -82,7 +87,7 @@ export default function ExportSheet({ onClose }: { onClose: () => void }) {
         {phase === 'done' && (
           <div className="space-y-2">
             <div className="flex items-center gap-2 text-emerald-400 text-sm">
-              <CheckCircle2 size={18} /> Export complete
+              <CheckCircle2 size={18} /> Saved to this device
             </div>
             <button onClick={share}
               className="w-full bg-white text-black font-semibold py-3 rounded-xl active:scale-[0.98] flex items-center justify-center gap-2">

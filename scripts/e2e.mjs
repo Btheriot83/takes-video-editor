@@ -152,15 +152,20 @@ for (let i = 0; i < 3; i++) {
   await cdp.send('Input.dispatchTouchEvent', { type: releaseType, touchPoints: [] });
   await page.waitForFunction(() => document.querySelector('[data-record-state]')?.getAttribute('data-record-state') !== 'recording', null, { timeout: 750 });
   const releaseLatency = Date.now() - releaseStarted;
-  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 10000 });
+  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 1500 });
   await page.waitForTimeout(600);
   if (mediaRecorderStarts !== i + 1) throw new Error(`expected ${i + 1} recorder starts, got ${mediaRecorderStarts}`);
   log(`clip ${i + 1} recorded; ${releaseType} stopped in ${releaseLatency}ms`);
 }
 await page.screenshot({ path: `${OUT}/2-recorded.png` });
 
+// A reload must recover the durable session with every completed clip.
+await page.reload();
+await page.waitForSelector('[data-editor-frame]', { timeout: 10000 });
+if (await page.locator('[data-clip]').count() !== 3) throw new Error('reload did not preserve all 3 clips');
+log('reload preserved all completed clips');
+
 // go to editor
-await page.click('text=Edit');
 await page.waitForSelector('text=Split', { timeout: 15000 });
 await page.waitForTimeout(1500); // thumbnails
 await page.screenshot({ path: `${OUT}/3-editor.png` });
@@ -242,23 +247,18 @@ log(`after split: ${afterSplit} clips`);
 if (afterSplit !== 4) throw new Error(`split failed: expected 4 clips, got ${afterSplit}`);
 await page.screenshot({ path: `${OUT}/5-split.png` });
 
-// export
-await page.click('text=Export');
-await page.waitForSelector('text=Start export', { timeout: 10000 });
-const exportDialog = page.getByRole('dialog', { name: 'Export video' });
+// One tap starts the stitch/export and downloads the final MP4.
+const automaticDownload = page.waitForEvent('download', { timeout: 300000 });
+await page.click('text=Save video');
+const exportDialog = page.getByRole('dialog', { name: 'Save video' });
 await exportDialog.getByText('9:16 portrait', { exact: true }).waitFor();
 await exportDialog.getByText('1080 × 1920', { exact: true }).waitFor();
-await page.click('text=Start export');
 log('export started (ffmpeg.wasm)…');
-await page.waitForSelector('text=Export complete', { timeout: 300000 });
+const download = await automaticDownload;
+await page.waitForSelector('text=Saved to this device', { timeout: 300000 });
 log('export complete');
 await page.screenshot({ path: `${OUT}/6-exported.png` });
 
-// download and save
-const [download] = await Promise.all([
-  page.waitForEvent('download', { timeout: 60000 }),
-  page.click('text=Download MP4'),
-]);
 const path = `${OUT}/exported.mp4`;
 await download.saveAs(path);
 const size = fs.statSync(path).size;

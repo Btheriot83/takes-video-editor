@@ -15,11 +15,9 @@ await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }
 await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 10000 });
 await page.waitForTimeout(800);
 await page.click('text=Edit');
-await page.waitForSelector('text=Export', { timeout: 10000 });
+await page.waitForSelector('text=Save video', { timeout: 10000 });
 await page.waitForTimeout(500);
-await page.click('text=Export');
-await page.waitForSelector('text=Start export');
-await page.click('text=Start export');
+await page.click('text=Save video');
 console.log('--- export clicked, watching 60s ---');
 for (let i = 0; i < 12; i++) {
   await page.waitForTimeout(5000);

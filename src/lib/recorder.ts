@@ -22,6 +22,7 @@ export function pickMimeType(): string {
 
 export interface ActiveRecording {
   stop: () => Promise<Blob>;
+  finalize: () => Promise<void>;
   pause: () => void;
   resume: () => void;
   paused: boolean;
@@ -63,13 +64,15 @@ export async function startRecording(
 
   let seq = 0;
   const chunks: Blob[] = [];
+  const pendingChunkWrites: Promise<void>[] = [];
   console.log('[rec] recBegin…');
   await recBegin({ mimeType: rec.mimeType || mimeType, startedAt: Date.now(), facing });
 
   rec.ondataavailable = (e) => {
     if (e.data && e.data.size > 0) {
       chunks.push(e.data);
-      recChunk(seq++, e.data).catch(() => {});
+      const write = recChunk(seq++, e.data).catch(() => {});
+      pendingChunkWrites.push(write);
     }
   };
 
@@ -90,16 +93,43 @@ export async function startRecording(
     get paused() { return rec.state === 'paused'; },
     pause: () => { if (rec.state === 'recording') rec.pause(); },
     resume: () => { if (rec.state === 'paused') rec.resume(); },
+    finalize: async () => {
+      await Promise.all(pendingChunkWrites);
+      await recFinalize();
+    },
     stop: () =>
-      new Promise<Blob>((resolve) => {
+      new Promise<Blob>((resolve, reject) => {
+        let settled = false;
+        const timeout = window.setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          clearInterval(timer);
+          reject(new Error('Timed out while stopping the recording'));
+        }, 5000);
         rec.onstop = () => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timeout);
           clearInterval(timer);
           const blob = new Blob(chunks, { type: rec.mimeType || mimeType });
-          recFinalize().catch(() => {});
           resolve(blob);
         };
+        rec.onerror = () => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timeout);
+          clearInterval(timer);
+          reject(new Error('The browser failed to stop the recording'));
+        };
         try { rec.requestData(); } catch { /* noop */ }
-        rec.stop();
+        try {
+          rec.stop();
+        } catch (error) {
+          settled = true;
+          window.clearTimeout(timeout);
+          clearInterval(timer);
+          reject(error);
+        }
       }),
   };
 }
@@ -112,7 +142,16 @@ export function probeVideo(blob: Blob): Promise<{ duration: number; width: numbe
     v.preload = 'metadata';
     v.muted = true;
     v.playsInline = true;
-    const done = () => URL.revokeObjectURL(url);
+    const timeout = window.setTimeout(() => {
+      done();
+      reject(new Error('Timed out while reading the recorded clip'));
+    }, 5000);
+    const done = () => {
+      window.clearTimeout(timeout);
+      v.removeAttribute('src');
+      v.load();
+      URL.revokeObjectURL(url);
+    };
     v.onloadedmetadata = () => {
       // some webm recordings report Infinity; seek to force duration computation
       if (v.duration === Infinity || isNaN(v.duration)) {
