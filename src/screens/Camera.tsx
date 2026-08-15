@@ -3,8 +3,8 @@ import { Film, Images, SwitchCamera, Zap, ZapOff } from 'lucide-react';
 import { getCameraStream, startRecording } from '../lib/recorder';
 import type { ActiveRecording } from '../lib/recorder';
 import { useStore } from '../state/store';
-import { ASPECT_RATIOS, fmtTime, clipLen } from '../types/clip';
-import type { AspectRatio } from '../types/clip';
+import { ASPECT_RATIOS, fmtTime, clipLen, isUltraHDCapture } from '../types/clip';
+import type { AspectRatio, CaptureQuality } from '../types/clip';
 
 type ZoomRange = { min: number; max: number; step: number };
 type ExtendedCapabilities = MediaTrackCapabilities & { zoom?: ZoomRange; torch?: boolean };
@@ -13,6 +13,7 @@ type ExtendedConstraintSet = MediaTrackConstraintSet & { zoom?: number; torch?: 
 type ActiveHold = { kind: 'pointer' | 'touch'; id: number } | { kind: 'keyboard'; id: 'keyboard' };
 
 const RATIOS: AspectRatio[] = ['16:9', '4:3', '1:1'];
+const QUALITIES: CaptureQuality[] = ['HD', '4K'];
 
 function distance(a: { x: number; y: number }, b: { x: number; y: number }) {
   return Math.hypot(a.x - b.x, a.y - b.y);
@@ -48,7 +49,7 @@ export default function Camera() {
 
   const {
     clips, addClipFromBlob, importFiles, setScreen, total,
-    aspectRatio, setAspectRatio,
+    aspectRatio, setAspectRatio, captureQuality, setCaptureQuality,
   } = useStore();
 
   const showCapabilityNotice = useCallback((message: string) => {
@@ -57,12 +58,12 @@ export default function Camera() {
     noticeTimerRef.current = window.setTimeout(() => setCapabilityNotice(null), 2200);
   }, []);
 
-  const openCamera = useCallback(async (nextFacing: 'user' | 'environment') => {
+  const openCamera = useCallback(async (nextFacing: 'user' | 'environment', quality: CaptureQuality) => {
     setStreamReady(false);
     setTorchOn(false);
     try {
       streamRef.current?.getTracks().forEach((track) => track.stop());
-      const stream = await getCameraStream(nextFacing);
+      const stream = await getCameraStream(nextFacing, quality);
       const videoTrack = stream.getVideoTracks()[0];
       const capabilities = videoTrack?.getCapabilities?.() as ExtendedCapabilities | undefined;
       const settings = videoTrack?.getSettings?.() as ExtendedSettings | undefined;
@@ -79,6 +80,11 @@ export default function Camera() {
       setZoom(settings?.zoom ?? nextZoomRange?.min ?? 1);
       setTorchSupported(nextFacing === 'environment' && capabilities?.torch === true);
       setCaptureSize({ width: settings?.width, height: settings?.height, frameRate: settings?.frameRate });
+      // The capture badge always reflects the size the camera actually
+      // delivered; be explicit when a 4K request could not be honored.
+      if (quality === '4K' && !isUltraHDCapture(settings?.width, settings?.height)) {
+        showCapabilityNotice('4K not available on this camera');
+      }
       setStreamReady(true);
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
@@ -95,15 +101,15 @@ export default function Camera() {
           : 'Could not open a camera on this device.',
       );
     }
-  }, []);
+  }, [showCapabilityNotice]);
 
   useEffect(() => {
-    openCamera(facing);
+    openCamera(facing, captureQuality);
     return () => {
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     };
-  }, [facing, openCamera]);
+  }, [facing, captureQuality, openCamera]);
 
   useEffect(() => () => {
     if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
@@ -299,21 +305,39 @@ export default function Camera() {
     <div className="fixed inset-0 bg-black text-white select-none overflow-hidden flex flex-col">
       <header className="relative z-20 grid shrink-0 grid-cols-2 items-center gap-x-2 bg-black px-3 pb-2 pt-[max(env(safe-area-inset-top),0.625rem)] sm:grid-cols-[1fr_auto_1fr]">
         <div className="order-1 text-sm font-semibold tracking-tight">Takes</div>
-        <div className="order-3 col-span-2 mt-2 flex w-full items-center rounded-full bg-white/10 p-0.5 sm:order-2 sm:col-span-1 sm:mt-0 sm:w-auto" role="group" aria-label="Aspect ratio">
-          {RATIOS.map((ratio) => (
-            <button
-              key={ratio}
-              type="button"
-              disabled={controlsDisabled}
-              aria-pressed={aspectRatio === ratio}
-              onClick={() => setAspectRatio(ratio)}
-              className={`min-h-11 min-w-11 flex-1 rounded-full px-2 text-[11px] font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:opacity-40 sm:min-h-8 sm:flex-none ${
-                aspectRatio === ratio ? 'bg-white text-black' : 'text-white/70'
-              }`}
-            >
-              {ratio}
-            </button>
-          ))}
+        <div className="order-3 col-span-2 mt-2 flex w-full items-center gap-1.5 sm:order-2 sm:col-span-1 sm:mt-0 sm:w-auto">
+          <div className="flex min-w-0 flex-1 items-center rounded-full bg-white/10 p-0.5 sm:flex-none" role="group" aria-label="Aspect ratio">
+            {RATIOS.map((ratio) => (
+              <button
+                key={ratio}
+                type="button"
+                disabled={controlsDisabled}
+                aria-pressed={aspectRatio === ratio}
+                onClick={() => setAspectRatio(ratio)}
+                className={`min-h-11 min-w-11 flex-1 rounded-full px-2 text-[11px] font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:opacity-40 sm:min-h-8 sm:flex-none ${
+                  aspectRatio === ratio ? 'bg-white text-black' : 'text-white/70'
+                }`}
+              >
+                {ratio}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center rounded-full bg-white/10 p-0.5" role="group" aria-label="Capture quality">
+            {QUALITIES.map((quality) => (
+              <button
+                key={quality}
+                type="button"
+                disabled={controlsDisabled}
+                aria-pressed={captureQuality === quality}
+                onClick={() => setCaptureQuality(quality)}
+                className={`min-h-11 min-w-11 flex-1 rounded-full px-2 text-[11px] font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:opacity-40 sm:min-h-8 sm:flex-none ${
+                  captureQuality === quality ? 'bg-white text-black' : 'text-white/70'
+                }`}
+              >
+                {quality}
+              </button>
+            ))}
+          </div>
         </div>
         <div className="order-2 text-right text-sm tabular-nums text-white/80 sm:order-3">
           {recording ? fmtTime(elapsed) : fmtTime(total)}
@@ -330,6 +354,7 @@ export default function Camera() {
         <div
           data-camera-frame
           data-frame-ratio={ASPECT_RATIOS[aspectRatio].outputLabel}
+          data-capture-quality={captureQuality}
           data-capture-width={captureSize?.width}
           data-capture-height={captureSize?.height}
           data-capture-frame-rate={captureSize?.frameRate}

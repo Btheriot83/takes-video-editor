@@ -1,4 +1,6 @@
 import { recBegin, recChunk, recFinalize } from './db';
+import { CAPTURE_DIMENSIONS, isUltraHDCapture } from '../types/clip';
+import type { CaptureQuality } from '../types/clip';
 
 // Prefer H.264 in MP4: it is hardware-encoded on virtually all phones, so the
 // capture keeps its full frame rate. VP9/VP8 fallbacks are software encoders
@@ -34,14 +36,32 @@ export interface ActiveRecording {
   paused: boolean;
 }
 
-export async function getCameraStream(facing: 'user' | 'environment'): Promise<MediaStream> {
+/** Portrait-convention video constraints for a capture quality. */
+export function captureConstraints(facing: 'user' | 'environment', quality: CaptureQuality): MediaTrackConstraints {
+  const size = CAPTURE_DIMENSIONS[quality];
+  return {
+    facingMode: { ideal: facing },
+    width: { ideal: size.width },
+    height: { ideal: size.height },
+    frameRate: { ideal: 30, max: 30 },
+  };
+}
+
+/**
+ * Recording bitrate matched to the delivered capture size. 4K-class frames
+ * need roughly 4x the bits of 1080x1920 to keep the same visual quality;
+ * everything else stays at the proven HD rate.
+ */
+export function captureVideoBitrate(width?: number, height?: number): number {
+  return isUltraHDCapture(width, height) ? 30_000_000 : 6_000_000;
+}
+
+export async function getCameraStream(
+  facing: 'user' | 'environment',
+  quality: CaptureQuality = 'HD',
+): Promise<MediaStream> {
   const base: MediaStreamConstraints = {
-    video: {
-      facingMode: { ideal: facing },
-      width: { ideal: 1080 },
-      height: { ideal: 1920 },
-      frameRate: { ideal: 30, max: 30 },
-    },
+    video: captureConstraints(facing, quality),
     audio: { echoCancellation: true, noiseSuppression: true },
   };
   try {
@@ -64,10 +84,13 @@ export async function startRecording(
   const mimeType = pickMimeType();
   const videoSettings = stream.getVideoTracks()[0]?.getSettings?.();
   const audioSettings = stream.getAudioTracks()[0]?.getSettings?.();
-  console.log('[rec] capture=', { mimeType, videoSettings, audioSettings });
+  // Bitrate follows what the camera actually delivers, not what was requested,
+  // so a 4K request that fell back to 1080x1920 is not encoded at 4K rates.
+  const videoBitsPerSecond = captureVideoBitrate(videoSettings?.width, videoSettings?.height);
+  console.log('[rec] capture=', { mimeType, videoSettings, audioSettings, videoBitsPerSecond });
   const rec = new MediaRecorder(stream, {
     mimeType: mimeType || undefined,
-    videoBitsPerSecond: 6_000_000,
+    videoBitsPerSecond,
     audioBitsPerSecond: 128_000,
   });
 

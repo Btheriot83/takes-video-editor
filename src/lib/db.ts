@@ -1,7 +1,7 @@
 import { openDB } from 'idb';
 import type { IDBPDatabase } from 'idb';
-import type { AspectRatio, Clip, Project } from '../types/clip';
-import { DEFAULT_ASPECT_RATIO } from '../types/clip';
+import type { AspectRatio, CaptureQuality, Clip, Project } from '../types/clip';
+import { DEFAULT_ASPECT_RATIO, DEFAULT_CAPTURE_QUALITY } from '../types/clip';
 
 const DB_NAME = 'takes-db';
 const PROJECT_ID = 'current';
@@ -35,8 +35,12 @@ export async function deleteBlob(key: string): Promise<void> {
   await (await db()).delete('blobs', key);
 }
 
-export async function saveProject(clips: Clip[], aspectRatio: AspectRatio = DEFAULT_ASPECT_RATIO): Promise<void> {
-  const p: Project = { id: PROJECT_ID, clips, updatedAt: Date.now(), name: 'Untitled take', aspectRatio };
+export async function saveProject(
+  clips: Clip[],
+  aspectRatio: AspectRatio = DEFAULT_ASPECT_RATIO,
+  captureQuality: CaptureQuality = DEFAULT_CAPTURE_QUALITY,
+): Promise<void> {
+  const p: Project = { id: PROJECT_ID, clips, updatedAt: Date.now(), name: 'Untitled take', aspectRatio, captureQuality };
   await (await db()).put('project', p, PROJECT_ID);
 }
 
