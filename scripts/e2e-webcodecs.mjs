@@ -59,6 +59,7 @@ await page.locator('[data-editor-frame]').waitFor();
 await page.getByText('Export video', { exact: true }).click();
 const dialog = page.getByRole('dialog', { name: 'Export video' });
 await dialog.getByText(/4K · 2160 × 3840/).waitFor();
+await dialog.getByRole('button', { name: 'Start export' }).click();
 await dialog.getByText('Video ready to share or download').waitFor({ timeout: 300000 });
 const downloadPromise = page.waitForEvent('download', { timeout: 60000 });
 await dialog.getByRole('button', { name: 'Download MP4' }).click();
