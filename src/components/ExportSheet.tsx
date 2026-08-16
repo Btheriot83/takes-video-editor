@@ -102,7 +102,9 @@ export default function ExportSheet({ onClose, quality, onQualityChange }: {
 
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center">
-      <div className="absolute inset-0 bg-black/70" onClick={requestClose} />
+      {/* While an export runs, a stray backdrop tap must not silently discard
+          minutes of encoding — cancelling stays an explicit act (Cancel/X). */}
+      <div className="absolute inset-0 bg-black/70" onClick={phase === 'working' ? undefined : requestClose} />
       <div role="dialog" aria-modal="true" aria-labelledby="export-title"
         className="relative w-full sm:max-w-sm bg-neutral-900 rounded-t-2xl sm:rounded-2xl border border-white/10 p-5 pb-[max(env(safe-area-inset-bottom),1.25rem)]">
         <div className="flex items-center justify-between mb-4">
