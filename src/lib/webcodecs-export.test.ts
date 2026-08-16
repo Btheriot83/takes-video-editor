@@ -38,3 +38,59 @@ describe('avcLevelFor', () => {
     expect(avcLevelFor(2160, 3840, 0)).toBe(0x33);
   });
 });
+
+import { bitstreamIsSync, naluLengthSize } from './webcodecs-export';
+
+const nalu = (lengthSize: number, header: number, payload = 2) => {
+  const len = payload + 1;
+  const bytes = [];
+  for (let i = lengthSize - 1; i >= 0; i--) bytes.push((len >> (8 * i)) & 0xff);
+  bytes.push(header);
+  for (let i = 0; i < payload; i++) bytes.push(0);
+  return bytes;
+};
+
+describe('bitstreamIsSync', () => {
+  it('detects an H.264 IDR slice as sync', () => {
+    // SPS (7) + PPS (8) + IDR (5)
+    const data = new Uint8Array([...nalu(4, 0x67), ...nalu(4, 0x68), ...nalu(4, 0x65)]);
+    expect(bitstreamIsSync(data, 4, 'avc')).toBe(true);
+  });
+
+  it('detects an H.264 non-IDR slice as delta — the fMP4 all-sync trap', () => {
+    // Fragmented MP4 default sample flags can mark every sample sync; the
+    // bitstream (non-IDR slice, type 1) is authoritative.
+    const data = new Uint8Array(nalu(4, 0x41)); // nal_ref_idc=2, type 1
+    expect(bitstreamIsSync(data, 4, 'avc')).toBe(false);
+  });
+
+  it('honors non-default NAL length prefix sizes', () => {
+    const data = new Uint8Array(nalu(2, 0x65));
+    expect(bitstreamIsSync(data, 2, 'avc')).toBe(true);
+  });
+
+  it('detects HEVC IRAP as sync and non-IRAP as delta', () => {
+    const idr = new Uint8Array(nalu(4, 19 << 1)); // IDR_W_RADL (19)
+    const trail = new Uint8Array(nalu(4, 1 << 1)); // TRAIL_R (1)
+    expect(bitstreamIsSync(idr, 4, 'hevc')).toBe(true);
+    expect(bitstreamIsSync(trail, 4, 'hevc')).toBe(false);
+  });
+
+  it('returns null on unparsable bitstreams (fallback to container flag)', () => {
+    expect(bitstreamIsSync(new Uint8Array([0, 0, 0, 200, 0x65]), 4, 'avc')).toBe(null);
+    expect(bitstreamIsSync(new Uint8Array([]), 4, 'avc')).toBe(null);
+  });
+});
+
+describe('naluLengthSize', () => {
+  it('reads lengthSizeMinusOne from avcC byte 4', () => {
+    const avcC = new Uint8Array([1, 0x64, 0x00, 0x28, 0xff]); // 0xff & 3 = 3 -> 4
+    expect(naluLengthSize(avcC, 'avc')).toBe(4);
+    const avcC2 = new Uint8Array([1, 0x64, 0x00, 0x28, 0xfd]); // & 3 = 1 -> 2
+    expect(naluLengthSize(avcC2, 'avc')).toBe(2);
+  });
+
+  it('defaults to 4 without a description', () => {
+    expect(naluLengthSize(undefined, 'avc')).toBe(4);
+  });
+});

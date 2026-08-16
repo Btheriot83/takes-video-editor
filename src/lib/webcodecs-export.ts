@@ -434,8 +434,53 @@ interface DemuxedClip {
   codedWidth: number;
   codedHeight: number;
   description?: Uint8Array;
-  /** timescale-converted samples in decode order; data copied out of mp4box */
+  /** true when the source is fragmented MP4 (moof/trun — Safari MediaRecorder) */
+  fragmented: boolean;
+  /** timescale-converted samples in DECODE order; data copied out of mp4box */
   samples: Array<{ isSync: boolean; tsUs: number; durUs: number; data: Uint8Array }>;
+}
+
+/**
+ * Derive keyframe-ness from the AVC/HEVC bitstream itself: walk the sample's
+ * length-prefixed NAL units and look for an IDR (H.264 type 5) / IRAP (HEVC
+ * types 16-23) slice. Container sync flags cannot be trusted in fragmented
+ * MP4: trun/tfhd default sample flags routinely mark EVERY sample as sync
+ * (observed with Safari MediaRecorder output), and feeding a delta frame to
+ * VideoDecoder as type 'key' is an instant "Decoder failure". Returns null
+ * when the bitstream is unparsable (caller falls back to the container flag).
+ */
+export function bitstreamIsSync(
+  data: Uint8Array,
+  lengthSize: number,
+  kind: 'avc' | 'hevc',
+): boolean | null {
+  let offset = 0;
+  let sawIdr: boolean | null = null;
+  while (offset + lengthSize <= data.length) {
+    let naluLength = 0;
+    for (let i = 0; i < lengthSize; i++) naluLength = naluLength * 256 + data[offset + i];
+    offset += lengthSize;
+    if (naluLength <= 0 || offset + naluLength > data.length) return sawIdr;
+    const nalType = kind === 'avc' ? data[offset] & 0x1f : (data[offset] >> 1) & 0x3f;
+    if (kind === 'avc') {
+      if (nalType === 5) return true; // IDR slice
+      if (nalType >= 1 && nalType <= 4) sawIdr = false; // non-IDR slice/partition
+    } else {
+      if (nalType >= 16 && nalType <= 23) return true; // IRAP (BLA/IDR/CRA)
+      if (nalType <= 9) sawIdr = false; // non-IRAP VCL slice
+    }
+    offset += naluLength;
+  }
+  return sawIdr;
+}
+
+/** NAL length-prefix size from the avcC/hvcC description (defaults to 4). */
+export function naluLengthSize(description: Uint8Array | undefined, kind: 'avc' | 'hevc'): number {
+  if (!description) return 4;
+  // avcC: lengthSizeMinusOne lives in byte 4; hvcC: byte 21 (ISO 14496-15).
+  const index = kind === 'avc' ? 4 : 21;
+  if (description.length <= index) return 4;
+  return (description[index] & 0x03) + 1;
 }
 
 /**
@@ -465,7 +510,7 @@ function decoderDescription(file: ISOFile, trackId: number): Uint8Array | undefi
  * correct fileStart offsets; sample payloads are copied out and the originals
  * released batch-by-batch so mp4box never holds the whole mdat.
  */
-async function demuxClip(blob: Blob, signal?: AbortSignal): Promise<DemuxedClip> {
+export async function demuxClip(blob: Blob, signal?: AbortSignal): Promise<DemuxedClip> {
   const file = createFile();
   let movie: Movie | null = null;
   let demuxError: string | null = null;
@@ -493,9 +538,11 @@ async function demuxClip(blob: Blob, signal?: AbortSignal): Promise<DemuxedClip>
     file.setExtractionOptions(found.id, null, { nbSamples: 100 });
     file.start();
   };
+  let fragmented = false;
   file.onSamples = (id: number, _user: unknown, batch: Sample[]) => {
     for (const sample of batch) {
       if (!sample.data) continue;
+      if (sample.moof_number !== undefined) fragmented = true;
       samples.push({
         isSync: sample.is_sync,
         tsUs: Math.round((sample.cts * 1_000_000) / sample.timescale),
@@ -525,11 +572,44 @@ async function demuxClip(blob: Blob, signal?: AbortSignal): Promise<DemuxedClip>
   if (!movie || !readyTrack) throw new Error('mp4 demux produced no movie metadata');
   if (!samples.length) throw new Error('mp4 demux produced no video samples');
 
+  const isMoofBacked = (file as unknown as { moofs?: unknown[] }).moofs;
+  if (Array.isArray(isMoofBacked) && isMoofBacked.length > 0) fragmented = true;
+  const description = decoderDescription(file, readyTrack.id);
+  const codec = readyTrack.codec;
+
+  // Defensive sync flags: in fragmented MP4 the container's is_sync comes from
+  // trun/tfhd default flags and is frequently wrong (all-sync). For AVC/HEVC
+  // the bitstream itself is authoritative — inspect each sample's NAL units
+  // and only fall back to the container flag when parsing fails.
+  const kind: 'avc' | 'hevc' | null =
+    /^(avc1|avc3)/.test(codec) ? 'avc' : /^(hvc1|hev1)/.test(codec) ? 'hevc' : null;
+  let syncFixes = 0;
+  if (kind) {
+    const lengthSize = naluLengthSize(description, kind);
+    for (const sample of samples) {
+      const derived = bitstreamIsSync(sample.data, lengthSize, kind);
+      if (derived !== null && derived !== sample.isSync) {
+        sample.isSync = derived;
+        syncFixes += 1;
+      }
+    }
+  }
+
+  const syncCount = samples.reduce((n, s) => n + (s.isSync ? 1 : 0), 0);
+  exportLog(
+    `demux: codec=${codec} ${readyTrack.video?.width ?? readyTrack.track_width}x${
+      readyTrack.video?.height ?? readyTrack.track_height
+    } samples=${samples.length} sync=${syncCount}${syncFixes ? ` (container flags corrected on ${syncFixes})` : ''} frag=${
+      fragmented ? 'yes' : 'no'
+    } desc=${description ? `${description.byteLength}B` : 'none'}`,
+  );
+
   const demuxed: DemuxedClip = {
-    codec: readyTrack.codec,
+    codec,
     codedWidth: readyTrack.video?.width ?? readyTrack.track_width,
     codedHeight: readyTrack.video?.height ?? readyTrack.track_height,
-    description: decoderDescription(file, readyTrack.id),
+    description,
+    fragmented,
     samples,
   };
   file.stop();
@@ -562,7 +642,7 @@ function decoderTick(state: RenderState, signal?: AbortSignal): Promise<void> {
  * frames before trimIn are closed immediately, frames in [trimIn, trimOut)
  * are kept, and feeding stops at the first sample cts >= trimOut.
  */
-async function captureClipViaDecoder(
+export async function captureClipViaDecoder(
   clip: Clip,
   blob: Blob,
   canvas: OffscreenCanvas,
@@ -578,6 +658,9 @@ async function captureClipViaDecoder(
   // rejects — level 00 is not a defined VP9 level. Offer a normalized
   // candidate with a generous level (5.1 covers 4K@60) as a fallback; the
   // level only advertises capability, decoders accept content below it.
+  // AVC/HEVC always use the track's EXACT codec string from stsd
+  // (avc1.PPCCLL); only the malformed-level vp09 case gets a normalized
+  // second candidate, and the exact string is still tried first.
   const codecCandidates = [demuxed.codec];
   const vp9BadLevel = demuxed.codec.match(/^vp09\.(\d{2})\.00\.(.+)$/);
   if (vp9BadLevel) codecCandidates.push(`vp09.${vp9BadLevel[1]}.51.${vp9BadLevel[2]}`);
@@ -608,12 +691,19 @@ async function captureClipViaDecoder(
   }
 
   let captured = 0;
+  let fed = 0;
+  let decodedOut = 0;
   let firstT = -1; // clip-local anchor, seconds (first KEPT frame)
   const pending: VideoFrame[] = [];
   let decodeFailure: unknown = null;
+  // Field-diagnosable failure text: the export sheet's Technical details must
+  // pinpoint the stage, not just Safari's generic "Decoder failure".
+  const failureContext = () =>
+    `codec=${demuxed.codec}, fed=${fed} chunks, out=${decodedOut} frames, kept=${captured}, frag=${demuxed.fragmented ? 'yes' : 'no'}`;
   const decoder = new VideoDecoder({
     output: (frame) => {
       state.lastActivity = Date.now();
+      decodedOut += 1;
       // Trim in decoder output: pre-trimIn frames close immediately, and
       // anything at/after trimOut (decode-order stragglers) closes too.
       if (frame.timestamp < trimInUs || frame.timestamp >= trimOutUs) {
@@ -629,7 +719,10 @@ async function captureClipViaDecoder(
 
   const throwIfBroken = () => {
     if (signal?.aborted) throw abortError();
-    if (decodeFailure) throw decodeFailure instanceof Error ? decodeFailure : new Error(String(decodeFailure));
+    if (decodeFailure) {
+      const message = decodeFailure instanceof Error ? decodeFailure.message : String(decodeFailure);
+      throw new Error(`decoder failure (${message}; ${failureContext()})`);
+    }
     if (state.error) throw state.error instanceof Error ? state.error : new Error(String(state.error));
   };
 
@@ -661,6 +754,10 @@ async function captureClipViaDecoder(
   };
 
   try {
+    // optimizeForLatency deliberately NOT set: it instructs the decoder to
+    // suppress output reordering, which misbehaves on sources that do carry
+    // B-frames (imports); our backpressure already bounds the queue, and the
+    // flush loop consumes any frames a conservative decoder holds back.
     decoder.configure({
       codec: demuxed.codec,
       description: demuxed.description,
@@ -668,17 +765,23 @@ async function captureClipViaDecoder(
       codedHeight: demuxed.codedHeight,
     });
 
+    // Feed in DECODE order (mp4box extraction order), never cts-sorted.
     for (let i = startIndex; i < demuxed.samples.length; i++) {
       const sample = demuxed.samples[i];
       if (sample.tsUs >= trimOutUs) break; // stop feeding past trimOut
       throwIfBroken();
       state.lastActivity = Date.now();
       decoder.decode(new EncodedVideoChunk({
-        type: sample.isSync ? 'key' : 'delta',
+        // First fed chunk is always 'key': feeding starts at a sync sample by
+        // construction, and a first chunk typed 'delta' (possible when fMP4
+        // sync flags are broken AND bitstream inspection failed) is an
+        // immediate decoder error on every engine.
+        type: fed === 0 || sample.isSync ? 'key' : 'delta',
         timestamp: sample.tsUs,
         duration: sample.durUs,
         data: sample.data,
       }));
+      fed += 1;
       // Backpressure: bounded decode queue and bounded pool of live frames.
       while (pending.length > 0 && (pending.length > 2 || decoder.decodeQueueSize > 4)) {
         await consume(pending.shift()!);
@@ -702,7 +805,10 @@ async function captureClipViaDecoder(
       await decoderTick(state, signal);
     }
     throwIfBroken();
-    if (flushError) throw flushError instanceof Error ? flushError : new Error(String(flushError));
+    if (flushError) {
+      const message = flushError instanceof Error ? flushError.message : String(flushError);
+      throw new Error(`decoder flush failed (${message}; ${failureContext()})`);
+    }
     while (pending.length > 0) await consume(pending.shift()!);
   } finally {
     for (const frame of pending.splice(0)) frame.close();
@@ -727,6 +833,36 @@ export async function renderVideoWebCodecs(
   width: number,
   height: number,
   plan: WebCodecsPlan,
+  onProgress?: (p: number) => void,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  if (signal?.aborted) throw abortError();
+  let attemptUsedDecoder = false;
+  try {
+    return await renderVideoAttempt(clips, blobs, width, height, plan, true,
+      (used) => { attemptUsedDecoder = used; }, onProgress, signal);
+  } catch (error) {
+    // Full-render safety net: a decoder-path death AFTER frames reached the
+    // muxer cannot be retried per-clip (duplicate frames), so restart the
+    // whole render once — fresh muxer, encoder and state — with the decoder
+    // path disabled, giving the element path a genuine shot before the caller
+    // falls back to wasm (which 4K mobile cannot survive). Aborts and renders
+    // that never touched the decoder path propagate unchanged.
+    if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error;
+    if (!attemptUsedDecoder) throw error;
+    exportLog(`render restart: element-only after decoder failure (${error instanceof Error ? error.message : error})`);
+    return await renderVideoAttempt(clips, blobs, width, height, plan, false, () => {}, onProgress, signal);
+  }
+}
+
+async function renderVideoAttempt(
+  clips: Clip[],
+  blobs: Blob[],
+  width: number,
+  height: number,
+  plan: WebCodecsPlan,
+  allowDecoderPath: boolean,
+  onDecoderUsed: (used: boolean) => void,
   onProgress?: (p: number) => void,
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
@@ -807,7 +943,8 @@ export async function renderVideoWebCodecs(
       // when the decoder path failed without contributing any frames — once
       // frames reached the muxer a rerun would duplicate them, so propagate.
       let captured = false;
-      if (decoderPathEligible(clips[i], blobs[i])) {
+      if (allowDecoderPath && decoderPathEligible(clips[i], blobs[i])) {
+        onDecoderUsed(true);
         try {
           await captureClipViaDecoder(clips[i], blobs[i], canvas, ctx, encoder, state, progress, signal);
           captured = true;
