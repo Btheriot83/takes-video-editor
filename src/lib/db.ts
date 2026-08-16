@@ -160,7 +160,7 @@ export async function clearProject(): Promise<void> {
 // In memory mode these silently no-op: crash recovery is meaningless when the
 // recovery data itself would die with the tab.
 
-export async function recBegin(meta: { mimeType: string; startedAt: number; facing: string }): Promise<void> {
+export async function recBegin(meta: { mimeType: string; startedAt: number; facing: 'user' | 'environment' }): Promise<void> {
   await withFallback(
     'recovery write failed',
     async (d) => {
@@ -183,7 +183,7 @@ export async function recFinalize(): Promise<void> {
     () => {},
   );
 }
-export async function recRecover(): Promise<{ mimeType: string; blob: Blob } | null> {
+export async function recRecover(): Promise<{ mimeType: string; blob: Blob; facing: 'user' | 'environment' } | null> {
   return withFallback(
     'recovery read failed',
     async (d) => {
@@ -196,7 +196,7 @@ export async function recRecover(): Promise<{ mimeType: string; blob: Blob } | n
       for (const k of keys) parts.push(await d.get('rec', k));
       const blob = new Blob(parts, { type: meta.mimeType });
       // The caller clears recovery only after the reconstructed clip is durable.
-      return { mimeType: meta.mimeType, blob };
+      return { mimeType: meta.mimeType, blob, facing: meta.facing === 'user' ? 'user' : 'environment' };
     },
     () => null,
   );

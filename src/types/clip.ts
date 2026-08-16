@@ -1,6 +1,7 @@
 export type AspectRatio = '16:9' | '4:3' | '1:1';
 export type ExportQuality = '1080p' | '4K';
 export type CaptureQuality = 'HD' | '4K';
+export type ClipFraming = 'cover' | 'contain';
 
 export const DEFAULT_ASPECT_RATIO: AspectRatio = '16:9';
 export const DEFAULT_CAPTURE_QUALITY: CaptureQuality = 'HD';
@@ -79,6 +80,13 @@ export interface Clip {
   /** Provenance; legacy clips loaded without it default to 'import' for safety. */
   source: ClipSource;
   /**
+   * How the source is placed inside the selected project frame. Selfie clips
+   * use `contain` so the browser's narrower portrait frame never punches in
+   * on the user's face; legacy, imported, and rear-camera clips default to
+   * `cover` for backwards compatibility.
+   */
+  framing?: ClipFraming;
+  /**
    * MediaRecorder.mimeType stamped at record time — the recorder's ACTUAL
    * negotiated codec string, distinct from `mimeType` (which comes from
    * blob.type and can be bare "video/mp4"). Provenance-trusted remux requires
@@ -101,6 +109,11 @@ export interface Clip {
   createdAt: number;
   /** thumbnails (jpeg dataURLs), sparse */
   thumbs: string[];
+}
+
+/** Runtime-safe framing for persisted clips created before this field. */
+export function clipFraming(clip: { framing?: ClipFraming }): ClipFraming {
+  return clip.framing === 'contain' ? 'contain' : 'cover';
 }
 
 export interface Project {

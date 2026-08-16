@@ -145,9 +145,26 @@ await page.getByRole('button', { name: '16:9', exact: true }).click();
 // conventional front/rear switch must reopen the alternate facing request
 await page.getByRole('button', { name: 'Switch to front camera' }).click();
 await page.waitForSelector('button[aria-label="Switch to rear camera"]:not([disabled])', { timeout: 15000 });
+const selfiePreview = page.locator('[data-camera-preview]');
+const selfieState = await selfiePreview.evaluate((video) => ({
+  objectFit: getComputedStyle(video).objectFit,
+  framing: video.getAttribute('data-preview-framing'),
+  constraints: video.srcObject?.getVideoTracks?.()[0]?.getConstraints?.() ?? {},
+}));
+if (selfieState.objectFit !== 'contain' || selfieState.framing !== 'contain') {
+  throw new Error(`selfie preview still crops the sensor: ${JSON.stringify(selfieState)}`);
+}
+if (!JSON.stringify(selfieState.constraints.resizeMode ?? '').includes('none')) {
+  throw new Error(`selfie camera did not request an uncropped native mode: ${JSON.stringify(selfieState.constraints)}`);
+}
+await page.screenshot({ path: `${OUT}/1-selfie-full-frame.png` });
 await page.getByRole('button', { name: 'Switch to rear camera' }).click();
 await page.waitForSelector('button[aria-label="Switch to front camera"]:not([disabled])', { timeout: 15000 });
-log('front/rear switch verified');
+if (await selfiePreview.getAttribute('data-preview-framing') !== 'cover' ||
+    await selfiePreview.evaluate((video) => getComputedStyle(video).objectFit) !== 'cover') {
+  throw new Error('rear camera did not restore cover framing');
+}
+log('full-frame selfie and rear-camera framing verified');
 
 // fake Chromium camera exposes no torch; the UI must state that honestly
 const flash = page.getByRole('button', { name: /Flash/ });
@@ -180,7 +197,10 @@ if (!fallbackVisible && !/([2-9]|1\.[1-9])×/.test(zoomText)) throw new Error('p
 log(fallbackVisible ? 'pinch zoom fallback verified' : 'pinch zoom verified');
 
 // Assistive technologies activate a button through its click contract rather
-// than pointerdown/up. That path must start and stop a real saved recording.
+// than pointerdown/up. Record this first clip on the selfie camera so its
+// full-frame metadata is exercised through persistence, editing, and export.
+await page.getByRole('button', { name: 'Switch to front camera' }).click();
+await page.waitForSelector('button[aria-label="Switch to rear camera"]:not([disabled])', { timeout: 15000 });
 await page.getByRole('button', { name: 'Tap to record' }).evaluate((button) => button.click());
 await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
 await page.waitForTimeout(2100);
@@ -188,7 +208,9 @@ await page.getByRole('button', { name: 'Stop recording' }).evaluate((button) => 
 await page.waitForSelector('[data-saved-notice]', { timeout: 5000 });
 await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 5000 });
 if (mediaRecorderStarts !== 1) throw new Error(`assistive click started ${mediaRecorderStarts} recorders`);
-log('assistive click record/stop path verified');
+await page.getByRole('button', { name: 'Switch to rear camera' }).click();
+await page.waitForSelector('button[aria-label="Switch to front camera"]:not([disabled])', { timeout: 15000 });
+log('assistive click recorded a full-frame selfie clip and returned to rear camera');
 
 // Record 3 additional clips of ~2s each: clips 2-3 via the classic hold
 // gesture (touchEnd / touchCancel releases), clip 4 via the tap-toggle path.
@@ -296,6 +318,15 @@ await page.waitForTimeout(1500); // thumbnails
 await page.screenshot({ path: `${OUT}/3-editor.png` });
 log('editor open');
 
+await page.waitForFunction(() => {
+  const editor = document.querySelector('[data-editor-playhead]');
+  const slot = editor?.getAttribute('data-editor-active-slot');
+  const video = document.querySelector(`[data-editor-video-slot="${slot}"]`);
+  return video instanceof HTMLVideoElement &&
+    video.dataset.editorFraming === 'contain' && getComputedStyle(video).objectFit === 'contain';
+});
+log('selfie clip kept full-frame contain framing after reload in the editor');
+
 const editorFrame = page.locator('[data-editor-frame]');
 const editorBox = await editorFrame.boundingBox();
 if (Math.abs(editorBox.width / editorBox.height - 9 / 16) > 0.03) throw new Error('editor frame is not portrait 9:16');
@@ -396,6 +427,9 @@ const handoffStartOffset = Number(await page.locator('[data-editor-playhead]').g
 if (!Number.isFinite(handoffStartOffset) || handoffStartOffset > 50) {
   throw new Error(`clip handoff skipped ${handoffStartOffset}ms of the incoming clip`);
 }
+const rearPlaybackSlot = await page.locator('[data-editor-playhead]').getAttribute('data-editor-active-slot');
+const rearPlaybackFraming = await page.locator(`[data-editor-video-slot="${rearPlaybackSlot}"]`).getAttribute('data-editor-framing');
+if (rearPlaybackFraming !== 'cover') throw new Error(`rear clip framing was ${rearPlaybackFraming}, expected cover`);
 log(`cross-clip playback verified at ${crossClipRate.toFixed(2)}x; handoff ${handoffGap.toFixed(1)}ms; opening offset ${handoffStartOffset.toFixed(1)}ms`);
 await page.click('button[aria-label="Pause"]');
 await page.click('text=Split');

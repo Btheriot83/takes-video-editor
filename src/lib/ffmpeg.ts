@@ -1,4 +1,4 @@
-import { clipLen, exportDimensions } from '../types/clip';
+import { clipFraming, clipLen, exportDimensions } from '../types/clip';
 import { classifyMp4CopySafety } from './mp4-meta';
 import { copyPathRejections, recorderProvenanceTrust, remuxProbeDecision } from './export-gate';
 import type { AspectRatio, Clip, ExportQuality } from '../types/clip';
@@ -652,6 +652,8 @@ async function runExport(
   }
 
   // Per-clip normalize to the selected portrait frame and reset timestamps.
+  // Selfie clips preserve the full sensor frame with black padding; rear,
+  // imported, and legacy clips retain the established centered cover crop.
   // Deliberately NO fps=30 CFR conversion here: camera captures are variable
   // frame rate, and snapping jittery/short timestamps onto a rigid 30fps grid
   // duplicated and dropped frames (measured ~28-40% duplicates), which is
@@ -669,9 +671,13 @@ async function runExport(
   const parts: string[] = [];
   for (let i = 0; i < clips.length; i++) {
     const len = clipLen(clips[i]);
+    const framing = clipFraming(clips[i]) === 'contain'
+      ? `scale=${output.width}:${output.height}:force_original_aspect_ratio=decrease,` +
+        `pad=${output.width}:${output.height}:(ow-iw)/2:(oh-ih)/2:color=black`
+      : `scale=${output.width}:${output.height}:force_original_aspect_ratio=increase,` +
+        `crop=${output.width}:${output.height}:(in_w-out_w)/2:(in_h-out_h)/2`;
     parts.push(
-      `[${i}:v]scale=${output.width}:${output.height}:force_original_aspect_ratio=increase,` +
-        `crop=${output.width}:${output.height}:(in_w-out_w)/2:(in_h-out_h)/2,setsar=1,format=yuv420p,settb=AVTB,` +
+      `[${i}:v]${framing},setsar=1,format=yuv420p,settb=AVTB,` +
         `setpts=PTS-STARTPTS,trim=end=${len}[v${i}]`,
     );
     parts.push(audioChain(i, len, probes[i].hasAudio));

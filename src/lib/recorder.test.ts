@@ -16,6 +16,11 @@ describe('captureConstraints', () => {
     expect(c.height).toEqual({ ideal: 3840 });
     expect(c.frameRate).toEqual({ ideal: 30, max: 30 });
     expect(c.facingMode).toEqual({ ideal: 'user' });
+    expect(c.resizeMode).toEqual({ exact: 'none' });
+  });
+  it('does not let the browser crop the native selfie sensor to meet portrait ideals', () => {
+    expect(captureConstraints('user', 'HD').resizeMode).toEqual({ exact: 'none' });
+    expect(captureConstraints('environment', 'HD').resizeMode).toBeUndefined();
   });
   it('capture dimensions stay portrait (width < height)', () => {
     for (const { width, height } of Object.values(CAPTURE_DIMENSIONS)) {
@@ -33,6 +38,7 @@ describe('ultraHDRetryConstraints', () => {
   });
   it('keeps the 30fps ceiling on the retry', () => {
     expect(ultraHDRetryConstraints('user').frameRate).toEqual({ ideal: 30, max: 30 });
+    expect(ultraHDRetryConstraints('user').resizeMode).toEqual({ exact: 'none' });
   });
   it('offers advanced sets for both orientations, landscape first', () => {
     const c = ultraHDRetryConstraints('user');

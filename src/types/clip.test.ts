@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { clipMatchesOutput, exportDimensions, isUltraHDCapture } from './clip';
+import { clipFraming, clipMatchesOutput, exportDimensions, isUltraHDCapture } from './clip';
 
 const out4kPortrait = exportDimensions('16:9', '4K'); // 2160x3840
 
@@ -46,5 +46,13 @@ describe('isUltraHDCapture', () => {
     expect(isUltraHDCapture(2160, 2160)).toBe(true);
     expect(isUltraHDCapture(1080, 1920)).toBe(false);
     expect(isUltraHDCapture(undefined, undefined)).toBe(false);
+  });
+});
+
+describe('clipFraming', () => {
+  it('keeps legacy clips on cover and honors full-frame selfie clips', () => {
+    expect(clipFraming({})).toBe('cover');
+    expect(clipFraming({ framing: 'cover' })).toBe('cover');
+    expect(clipFraming({ framing: 'contain' })).toBe('contain');
   });
 });

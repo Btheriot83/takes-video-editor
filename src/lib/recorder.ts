@@ -2,6 +2,12 @@ import { recBegin, recChunk, recFinalize } from './db';
 import { CAPTURE_DIMENSIONS, isUltraHDCapture } from '../types/clip';
 import type { CaptureQuality } from '../types/clip';
 
+export type CameraFacing = 'user' | 'environment';
+export type CameraTrackConstraints = MediaTrackConstraints & {
+  /** Present in the Media Capture spec but missing from older lib.dom types. */
+  resizeMode?: { exact: 'none' };
+};
+
 // Prefer H.264 in MP4: it is hardware-encoded on virtually all phones, so the
 // capture keeps its full frame rate. VP9/VP8 fallbacks are software encoders
 // that can starve 1080x1920 capture down to ~20fps on mobile — the source of
@@ -43,16 +49,24 @@ export interface ActiveRecording {
    * be silently concat-copied together.
    */
   mimeType: string;
+  /** Camera used when this recording started; stable even after UI switches. */
+  facing: CameraFacing;
 }
 
 /** Portrait-convention video constraints for a capture quality. */
-export function captureConstraints(facing: 'user' | 'environment', quality: CaptureQuality): MediaTrackConstraints {
+export function captureConstraints(facing: CameraFacing, quality: CaptureQuality): CameraTrackConstraints {
   const size = CAPTURE_DIMENSIONS[quality];
   return {
     facingMode: { ideal: facing },
     width: { ideal: size.width },
     height: { ideal: size.height },
     frameRate: { ideal: 30, max: 30 },
+    // A portrait width/height request is allowed to make the browser crop a
+    // native 3:4 selfie sensor before the app even receives it. Require the
+    // uncropped native mode for the front camera; unsupported constraints are
+    // ignored by the browser and the UI/export contain framing is the second
+    // line of defense.
+    ...(facing === 'user' ? { resizeMode: { exact: 'none' } } : {}),
   };
 }
 
@@ -63,13 +77,14 @@ export function captureConstraints(facing: 'user' | 'environment', quality: Capt
  * landscape ideals — plus advanced exact sets for both orientations — lets
  * WebKit pick the real 4K mode.
  */
-export function ultraHDRetryConstraints(facing: 'user' | 'environment'): MediaTrackConstraints {
+export function ultraHDRetryConstraints(facing: CameraFacing): CameraTrackConstraints {
   const size = CAPTURE_DIMENSIONS['4K'];
   return {
     facingMode: { ideal: facing },
     width: { ideal: size.height },
     height: { ideal: size.width },
     frameRate: { ideal: 30, max: 30 },
+    ...(facing === 'user' ? { resizeMode: { exact: 'none' } } : {}),
     advanced: [
       { width: size.height, height: size.width },
       { width: size.width, height: size.height },
@@ -92,7 +107,7 @@ export function captureVideoBitrate(width?: number, height?: number): number {
 }
 
 export async function getCameraStream(
-  facing: 'user' | 'environment',
+  facing: CameraFacing,
   quality: CaptureQuality = 'HD',
 ): Promise<MediaStream> {
   const audio: MediaTrackConstraints = { echoCancellation: true, noiseSuppression: true };
@@ -133,7 +148,7 @@ export async function getCameraStream(
 export async function startRecording(
   stream: MediaStream,
   onTick?: (elapsed: number) => void,
-  facing: 'user' | 'environment' = 'environment',
+  facing: CameraFacing = 'environment',
 ): Promise<ActiveRecording> {
   const mimeType = pickMimeType();
   const videoSettings = stream.getVideoTracks()[0]?.getSettings?.();
@@ -184,6 +199,7 @@ export async function startRecording(
 
   return {
     get mimeType() { return rec.mimeType || mimeType; },
+    facing,
     get paused() { return rec.state === 'paused'; },
     pause: () => { if (rec.state === 'recording') rec.pause(); },
     resume: () => { if (rec.state === 'paused') rec.resume(); },

@@ -4,7 +4,7 @@ import {
   ChevronLeft, ChevronRight,
 } from 'lucide-react';
 import { useStore } from '../state/store';
-import { ASPECT_RATIOS, clipLen, totalDuration, fmtTime, FRAME, exportDimensions, isUltraHDCapture } from '../types/clip';
+import { ASPECT_RATIOS, clipFraming, clipLen, totalDuration, fmtTime, FRAME, exportDimensions, isUltraHDCapture } from '../types/clip';
 import type { Clip, ExportQuality } from '../types/clip';
 import { getBlob } from '../lib/db';
 import { prepareExportAssets } from '../lib/ffmpeg';
@@ -129,6 +129,9 @@ export default function Editor() {
     const clip = clips[index];
     const url = clip && clipUrls[clip.blobKey];
     if (!v || !clip || !url) return false;
+    const framing = clipFraming(clip);
+    v.style.objectFit = framing;
+    v.dataset.editorFraming = framing;
     if (slotIndexRef.current[slot] !== index || v.src !== url) {
       v.pause();
       v.muted = slot !== activeSlotRef.current;
@@ -377,7 +380,7 @@ export default function Editor() {
           {[0, 1].map((slot) => (
             <video key={slot} ref={(video) => { videoRefs.current[slot as VideoSlot] = video; }}
               data-editor-video-slot={slot} playsInline preload="auto" muted={slot !== activeSlot}
-              className={`absolute inset-0 h-full w-full object-cover transition-none ${slot === activeSlot ? 'opacity-100' : 'opacity-0'}`} />
+              className={`absolute inset-0 h-full w-full transition-none ${slot === activeSlot ? 'opacity-100' : 'opacity-0'}`} />
           ))}
         </div>
         <button onClick={togglePlay}
@@ -687,7 +690,9 @@ function Timeline({
                 {c.thumbs.length > 0 ? (
                   Array.from({ length: Math.max(1, Math.round(w / 44)) }).map((_, k) => (
                     <img key={k} src={c.thumbs[k % c.thumbs.length]} alt=""
-                      className="h-full flex-1 object-cover pointer-events-none" draggable={false} />
+                      className={`h-full flex-1 bg-black pointer-events-none ${
+                        clipFraming(c) === 'contain' ? 'object-contain' : 'object-cover'
+                      }`} draggable={false} />
                   ))
                 ) : (
                   <div className="w-full h-full bg-neutral-800" />

@@ -1,9 +1,10 @@
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { createFile, DataStream, Endianness, Log, MP4BoxBuffer } from 'mp4box';
 import type { ISOFile, Movie, Sample, Track } from 'mp4box';
-import { clipLen } from '../types/clip';
-import type { Clip, ExportQuality } from '../types/clip';
+import { clipFraming, clipLen } from '../types/clip';
+import type { Clip, ClipFraming, ExportQuality } from '../types/clip';
 import { exportLog } from './export-log';
+import { framePlacement } from './framing';
 
 /**
  * WebCodecs render path: decode each clip in an offscreen <video>, step it
@@ -335,8 +336,8 @@ const isReorderedChunksError = (error: unknown): boolean =>
   !!error && typeof error === 'object' && (error as { reorderedChunks?: boolean }).reorderedChunks === true;
 
 /**
- * Scale/crop a decoded frame to the output size, preferring a single
- * GPU-accelerated createImageBitmap crop+resize over the 2D-canvas draw +
+ * Scale/place a decoded frame to the output size, preferring a single
+ * GPU-accelerated createImageBitmap cover crop+resize over the 2D-canvas draw +
  * readback that dominated per-frame cost on phones (a 1080p->4K upscale
  * through a 33MP canvas ran at single-digit fps on iPhone). Falls back to the
  * canvas path permanently on the first failure (older engines lack resize
@@ -443,7 +444,7 @@ function getGlScaler(W: number, H: number): GlScaler | null {
     const aPos = gl.getAttribLocation(program, 'a_pos');
     gl.enableVertexAttribArray(aPos);
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-    // Dynamic texcoord buffer: rewritten per frame with the cover-crop rect.
+    // Dynamic texcoord buffer: rewritten per frame with the source rect.
     const texBuf = gl.createBuffer();
     if (!texBuf) throw new Error('createBuffer failed');
     gl.bindBuffer(gl.ARRAY_BUFFER, texBuf);
@@ -484,13 +485,14 @@ export function releaseFrameScaler(): void {
   }
 }
 
-/** Scale/crop via the WebGL quad; null means fall through to 2D canvas. */
+/** Scale/place via the WebGL quad; null means fall through to 2D canvas. */
 function scaleFrameGl(
   frame: VideoFrame,
   timestamp: number,
   duration: number,
   W: number,
   H: number,
+  framing: ClipFraming,
 ): VideoFrame | null {
   const s = getGlScaler(W, H);
   if (!s) return null;
@@ -498,24 +500,28 @@ function scaleFrameGl(
     const { gl } = s;
     const vw = frame.displayWidth;
     const vh = frame.displayHeight;
-    // Same cover-crop math as the bitmap rung, expressed as texcoords.
-    const scale = Math.max(W / vw, H / vh);
-    const sw = Math.min(vw, Math.round(W / scale));
-    const sh = Math.min(vh, Math.round(H / scale));
-    const sx = Math.floor((vw - sw) / 2);
-    const sy = Math.floor((vh - sh) / 2);
+    const placement = framePlacement(vw, vh, W, H, framing);
+    const source = placement.source;
+    const output = placement.output;
+    if (framing === 'contain') {
+      gl.clearColor(0, 0, 0, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+    // CSS/canvas placement uses a top-left origin; WebGL viewports start at
+    // the bottom-left. This is usually symmetric, but convert it explicitly.
+    gl.viewport(output.x, H - output.y - output.height, output.width, output.height);
     // No UNPACK_FLIP_Y_WEBGL: the uploaded image keeps its top row at v=0, so
-    // top-of-crop texcoords go on the TOP (y=+1) vertices — the flipped-v quad
+    // top-of-source texcoords go on the TOP (y=+1) vertices — the flipped-v quad
     // renders upright (verified programmatically by the e2e orientation check).
-    const u0 = sx / vw;
-    const u1 = (sx + sw) / vw;
-    const vTop = sy / vh;
-    const vBot = (sy + sh) / vh;
+    const u0 = source.x / vw;
+    const u1 = (source.x + source.width) / vw;
+    const vTop = source.y / vh;
+    const vBot = (source.y + source.height) / vh;
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame as unknown as TexImageSource);
     gl.bindBuffer(gl.ARRAY_BUFFER, s.texBuf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-      u0, vBot, u1, vBot, // bottom vertices sample bottom of crop
-      u0, vTop, u1, vTop, // top vertices sample top of crop
+      u0, vBot, u1, vBot, // bottom vertices sample bottom of source rect
+      u0, vTop, u1, vTop, // top vertices sample top of source rect
     ]), gl.DYNAMIC_DRAW);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     if (gl.getError() !== gl.NO_ERROR || gl.isContextLost()) {
@@ -536,22 +542,19 @@ async function scaleFrame(
   duration: number,
   canvas: OffscreenCanvas,
   ctx: OffscreenCanvasRenderingContext2D,
+  framing: ClipFraming,
 ): Promise<VideoFrame> {
   const vw = frame.displayWidth;
   const vh = frame.displayHeight;
   const W = canvas.width;
   const H = canvas.height;
   const skipBitmapForTest = scalerOverride() === 'webgl';
-  if (!skipBitmapForTest && !bitmapResizeBroken && typeof createImageBitmap === 'function') {
+  if (framing === 'cover' && !skipBitmapForTest && !bitmapResizeBroken && typeof createImageBitmap === 'function') {
     try {
       // Cover semantics: crop the centered source rect whose aspect matches
       // the output, then resize — one GPU op instead of draw + readback.
-      const scale = Math.max(W / vw, H / vh);
-      const sw = Math.min(vw, Math.round(W / scale));
-      const sh = Math.min(vh, Math.round(H / scale));
-      const sx = Math.floor((vw - sw) / 2);
-      const sy = Math.floor((vh - sh) / 2);
-      const bitmap = await createImageBitmap(frame, sx, sy, sw, sh, {
+      const source = framePlacement(vw, vh, W, H, framing).source;
+      const bitmap = await createImageBitmap(frame, source.x, source.y, source.width, source.height, {
         resizeWidth: W,
         resizeHeight: H,
         resizeQuality: 'medium',
@@ -573,31 +576,41 @@ async function scaleFrame(
     }
   }
   // Middle rung: WebGL textured-quad scale (GPU, no 33MP 2D readback).
-  const glFrame = scaleFrameGl(frame, timestamp, duration, W, H);
+  const glFrame = scaleFrameGl(frame, timestamp, duration, W, H, framing);
   if (glFrame) {
     logScaler('webgl');
     return glFrame;
   }
   logScaler('canvas2d');
-  drawCover(ctx, frame, vw, vh, W, H);
+  drawFrame(ctx, frame, vw, vh, W, H, framing);
   return new VideoFrame(canvas, { timestamp, duration });
 }
 
-function drawCover(
+function drawFrame(
   ctx: OffscreenCanvasRenderingContext2D,
   source: CanvasImageSource,
   vw: number,
   vh: number,
   width: number,
   height: number,
+  framing: ClipFraming,
 ) {
-  // Same semantics as the wasm filter chain:
-  // scale=W:H:force_original_aspect_ratio=increase + centered crop.
-  if (!vw || !vh) throw new Error('source has no dimensions');
-  const scale = Math.max(width / vw, height / vh);
-  const dw = vw * scale;
-  const dh = vh * scale;
-  ctx.drawImage(source, (width - dw) / 2, (height - dh) / 2, dw, dh);
+  const placement = framePlacement(vw, vh, width, height, framing);
+  if (framing === 'contain') {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, width, height);
+  }
+  ctx.drawImage(
+    source,
+    placement.source.x,
+    placement.source.y,
+    placement.source.width,
+    placement.source.height,
+    placement.output.x,
+    placement.output.y,
+    placement.output.width,
+    placement.output.height,
+  );
 }
 
 /**
@@ -695,6 +708,7 @@ async function captureClipViaElement(
 ): Promise<void> {
   const url = URL.createObjectURL(blob);
   const len = clipLen(clip);
+  const framing = clipFraming(clip);
   const base = state.offsetUs;
   const EPS = 1e-4;
   const diag = () =>
@@ -774,7 +788,7 @@ async function captureClipViaElement(
         // Timestamps must be strictly increasing for the muxer.
         if (ts <= state.lastTs) ts = state.lastTs + 1_000;
         state.lastTs = ts;
-        drawCover(ctx, video, video.videoWidth, video.videoHeight, canvas.width, canvas.height);
+        drawFrame(ctx, video, video.videoWidth, video.videoHeight, canvas.width, canvas.height, framing);
         // Explicit non-negative duration (see decoder path note).
         const frameDuration = Number.isFinite(minDelta) && minDelta > 0 ? Math.round(minDelta * 1_000_000) : 33_333;
         const frame = new VideoFrame(canvas, { timestamp: ts, duration: frameDuration });
@@ -1146,7 +1160,7 @@ function decoderTick(state: RenderState, signal?: AbortSignal): Promise<void> {
 
 /**
  * PRIMARY capture path: demux the clip with mp4box.js, decode its samples with
- * VideoDecoder, cover-crop each kept frame onto the shared canvas and hand it
+ * VideoDecoder, place each kept frame onto the shared canvas and hand it
  * to the encoder. No media elements are involved, so none of the iOS <video>
  * lifecycle pathologies apply. Timestamp semantics are identical to the
  * element path: the first kept frame anchors the clip (rel + state.offsetUs),
@@ -1196,6 +1210,7 @@ export async function captureClipViaDecoder(
   demuxed.codec = codec;
 
   const len = clipLen(clip);
+  const framing = clipFraming(clip);
   const base = state.offsetUs;
   const trimInUs = Math.round(clip.trimIn * 1_000_000);
   const trimOutUs = Math.round(clip.trimOut * 1_000_000);
@@ -1262,7 +1277,7 @@ export async function captureClipViaDecoder(
         // roughly halves per-frame cost on the dominant path.
         out = new VideoFrame(frame, { timestamp: ts, duration });
       } else {
-        out = await scaleFrame(frame, ts, duration, canvas, ctx);
+        out = await scaleFrame(frame, ts, duration, canvas, ctx, framing);
       }
       const keyFrame = state.frames === 0 || ts - state.lastKeyTs >= 2_000_000;
       if (keyFrame) state.lastKeyTs = ts;

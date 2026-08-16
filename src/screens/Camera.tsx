@@ -5,7 +5,7 @@ import type { ActiveRecording } from '../lib/recorder';
 import { storageMode } from '../lib/db';
 import { prepareExportAssets } from '../lib/ffmpeg';
 import { useStore } from '../state/store';
-import { ASPECT_RATIOS, fmtTime, clipLen, isUltraHDCapture } from '../types/clip';
+import { ASPECT_RATIOS, fmtTime, clipFraming, clipLen, isUltraHDCapture } from '../types/clip';
 import type { AspectRatio, CaptureQuality } from '../types/clip';
 
 type ZoomRange = { min: number; max: number; step: number };
@@ -92,7 +92,7 @@ export default function Camera() {
       const stream = await getCameraStream(nextFacing, quality);
       const videoTrack = stream.getVideoTracks()[0];
       const capabilities = videoTrack?.getCapabilities?.() as ExtendedCapabilities | undefined;
-      const settings = videoTrack?.getSettings?.() as ExtendedSettings | undefined;
+      let settings = videoTrack?.getSettings?.() as ExtendedSettings | undefined;
       const nextZoomRange = capabilities?.zoom && capabilities.zoom.max > capabilities.zoom.min
         ? {
             min: capabilities.zoom.min,
@@ -103,7 +103,25 @@ export default function Camera() {
 
       streamRef.current = stream;
       setZoomRange(nextZoomRange);
-      setZoom(settings?.zoom ?? nextZoomRange?.min ?? 1);
+      let nextZoom = settings?.zoom ?? nextZoomRange?.min ?? 1;
+      // Some phones reopen the front camera at a remembered/default digital
+      // zoom above its widest capability. Always start a selfie at the
+      // camera's minimum, while leaving pinch zoom available afterwards.
+      if (nextFacing === 'user' && nextZoomRange && nextZoom > nextZoomRange.min) {
+        try {
+          const current = videoTrack.getConstraints?.() ?? {};
+          await videoTrack.applyConstraints({
+            ...current,
+            advanced: [
+              ...(current.advanced ?? []),
+              { zoom: nextZoomRange.min } as ExtendedConstraintSet,
+            ],
+          });
+          settings = videoTrack.getSettings?.() as ExtendedSettings | undefined;
+          nextZoom = settings?.zoom ?? nextZoomRange.min;
+        } catch { /* full-frame contain still prevents an app-level punch-in */ }
+      }
+      setZoom(nextZoom);
       setTorchSupported(nextFacing === 'environment' && capabilities?.torch === true);
       setCaptureSize({ width: settings?.width, height: settings?.height, frameRate: settings?.frameRate });
       // The capture badge always reflects the size the camera actually
@@ -175,7 +193,14 @@ export default function Camera() {
         // available for the next recording instead of competing in parallel.
         // Stamp the recorder's ACTUAL negotiated codec string: provenance
         // trust for remux requires it to match across every clip in the set.
-        const clip = await addClipFromBlob(blob, blob.type, false, 'recording', active.mimeType);
+        const clip = await addClipFromBlob(
+          blob,
+          blob.type,
+          false,
+          'recording',
+          active.mimeType,
+          active.facing === 'user' ? 'contain' : 'cover',
+        );
         // Unmissable saved confirmation: users reported not knowing whether
         // releasing the button actually kept the clip.
         const count = useStore.getState().clips.length;
@@ -393,6 +418,10 @@ export default function Camera() {
 
   const switchCamera = () => {
     if (recording || starting) return;
+    // Disable camera-dependent controls in the same event as the label flip;
+    // otherwise there is one render where the UI says "rear camera" while
+    // the previous stream is still live and tappable.
+    setStreamReady(false);
     setFacing((current) => (current === 'user' ? 'environment' : 'user'));
   };
 
@@ -413,7 +442,7 @@ export default function Camera() {
   };
 
   const hasClips = clips.length > 0;
-  const controlsDisabled = recording || starting || stopping;
+  const controlsDisabled = recording || starting || stopping || !streamReady;
 
   return (
     <div className="fixed inset-0 bg-black text-white select-none overflow-hidden flex flex-col">
@@ -496,7 +525,11 @@ export default function Camera() {
             autoPlay
             playsInline
             muted
-            className={`absolute inset-0 h-full w-full object-cover ${facing === 'user' ? '-scale-x-100' : ''}`}
+            data-camera-preview
+            data-preview-framing={facing === 'user' ? 'contain' : 'cover'}
+            className={`absolute inset-0 h-full w-full ${
+              facing === 'user' ? 'object-contain -scale-x-100' : 'object-cover'
+            }`}
           />
 
           <div className="absolute inset-x-0 top-0 h-16 bg-gradient-to-b from-black/50 to-transparent pointer-events-none" />
@@ -587,7 +620,13 @@ export default function Camera() {
                     clip.id === poppedClipId && index === shown.length - 1 ? 'animate-thumb-pop' : ''
                   }`}
                 >
-                  {clip.thumbs[0] && <img src={clip.thumbs[0]} className="h-full w-full object-cover" alt="" />}
+                  {clip.thumbs[0] && (
+                    <img
+                      src={clip.thumbs[0]}
+                      className={`h-full w-full bg-black ${clipFraming(clip) === 'contain' ? 'object-contain' : 'object-cover'}`}
+                      alt=""
+                    />
+                  )}
                 </span>
               ))}
             </span>
