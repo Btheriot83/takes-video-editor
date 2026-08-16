@@ -14,7 +14,7 @@ await page.waitForTimeout(2000);
 await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
 await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 10000 });
 await page.waitForTimeout(800);
-await page.click('text=Edit');
+await page.getByRole('button', { name: /Done recording\. Review \d+ clips?/ }).click();
 await page.waitForSelector('text=Save video', { timeout: 10000 });
 await page.waitForTimeout(500);
 await page.click('text=Save video');

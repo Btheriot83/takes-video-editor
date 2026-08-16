@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Film, Images, SwitchCamera, Zap, ZapOff } from 'lucide-react';
+import { ArrowRight, Film, Images, SwitchCamera, Zap, ZapOff } from 'lucide-react';
 import { getCameraStream, startRecording } from '../lib/recorder';
 import type { ActiveRecording } from '../lib/recorder';
 import { storageMode } from '../lib/db';
@@ -575,10 +575,11 @@ export default function Camera() {
             type="button"
             disabled={controlsDisabled}
             onClick={() => setScreen('editor')}
-            aria-label={`Edit ${clips.length} clip${clips.length === 1 ? '' : 's'}`}
-            className="mx-auto mb-3 flex min-h-11 max-w-full items-center gap-2 rounded-full bg-white px-2 pr-1.5 text-left text-black shadow-lg transition-colors active:bg-white/85 disabled:opacity-40"
+            aria-label={`Done recording. Review ${clips.length} clip${clips.length === 1 ? '' : 's'}`}
+            data-review-clips
+            className="mx-auto mb-3 flex min-h-14 w-full max-w-md items-center gap-3 rounded-xl bg-white px-3 py-2 text-left text-black shadow-lg transition-colors active:bg-white/85 disabled:opacity-40"
           >
-            <span className="flex -space-x-2">
+            <span className="flex shrink-0 -space-x-2" aria-hidden="true">
               {clips.slice(-3).map((clip, index, shown) => (
                 <span
                   key={clip.id}
@@ -590,10 +591,14 @@ export default function Camera() {
                 </span>
               ))}
             </span>
-            <span className="truncate text-xs font-semibold">
-              {clips.length} clip{clips.length === 1 ? '' : 's'} · {fmtTime(clips.reduce((sum, clip) => sum + clipLen(clip), 0))}
+            <span className="min-w-0 flex-1">
+              <span className="block text-[10px] font-medium leading-tight text-black/60">Done recording?</span>
+              <span className="mt-0.5 block truncate text-sm font-semibold leading-tight">
+                Review {clips.length} clip{clips.length === 1 ? '' : 's'}
+                <span className="hidden min-[360px]:inline"> · {fmtTime(clips.reduce((sum, clip) => sum + clipLen(clip), 0))}</span>
+              </span>
             </span>
-            <span className="ml-auto rounded-full bg-black px-3 py-1.5 text-xs font-bold text-white">Edit</span>
+            <ArrowRight className="shrink-0" size={20} strokeWidth={2.25} aria-hidden="true" />
           </button>
         )}
 
@@ -688,7 +693,7 @@ export default function Camera() {
           <div className="flex items-center justify-self-center gap-1 whitespace-nowrap text-[11px] text-white/60">
             <Film size={13} aria-hidden="true" /> Stored locally
           </div>
-          {/* The clip pill directly above is the single timeline entry point;
+          {/* The review action directly above is the single timeline entry point;
               keeping another “Timeline” button here crowded the trust copy at
               320px and created two equally loud routes to the same screen. */}
           <span aria-hidden="true" />

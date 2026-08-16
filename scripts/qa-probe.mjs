@@ -100,7 +100,7 @@ await measure('camera-with-clips');
 await page.setViewportSize({ width: 390, height: 844 });
 await page.waitForTimeout(300);
 
-await page.getByText('Edit', { exact: true }).click();
+await page.getByRole('button', { name: /Done recording\. Review \d+ clips?/ }).click();
 await page.waitForSelector('text=Split', { timeout: 15000 });
 await page.waitForTimeout(800);
 // select first clip so trim controls appear

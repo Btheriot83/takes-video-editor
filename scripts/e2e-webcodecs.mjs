@@ -60,7 +60,7 @@ for (let index = 0; index < clipCount; index++) {
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
   await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 2000 });
 }
-await page.getByText('Edit', { exact: true }).click();
+await page.getByRole('button', { name: /Done recording\. Review \d+ clips?/ }).click();
 await page.locator('[data-editor-frame]').waitFor();
 
 // Snapshot the source clips (straight out of IndexedDB) so ffprobe can count

@@ -12,6 +12,7 @@ fs.mkdirSync(OUT, { recursive: true });
 
 const errors = [];
 let mediaRecorderStarts = 0;
+let encoderPrefetchRequestAt = null;
 const browser = await chromium.launch({
   executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   args: [
@@ -36,6 +37,11 @@ page.on('console', (m) => {
   if (m.type() === 'error') errors.push(`${t} (${m.location().url || 'unknown URL'})`);
 });
 page.on('pageerror', (e) => errors.push(String(e)));
+page.on('request', (request) => {
+  if (!encoderPrefetchRequestAt && request.url().includes('/ffmpeg/ffmpeg-core.wasm')) {
+    encoderPrefetchRequestAt = Date.now();
+  }
+});
 page.on('response', (response) => {
   if (response.status() >= 400) errors.push(`HTTP ${response.status()} ${response.url()}`);
 });
@@ -259,13 +265,32 @@ for (let i = 0; i < 3; i++) {
 }
 await page.screenshot({ path: `${OUT}/2-recorded.png` });
 
+// Once the user has the clips they want, the next step must be explicit,
+// finger-sized, fully visible on the narrow supported viewport, and actually
+// open the review/editor screen. "Edit" alone did not explain that flow.
+const reviewClips = page.getByRole('button', { name: 'Done recording. Review 4 clips' });
+await reviewClips.waitFor();
+if (!encoderPrefetchRequestAt) throw new Error('multi-clip encoder download did not start during recording flow');
+await page.setViewportSize({ width: 320, height: 568 });
+const reviewBox = await reviewClips.boundingBox();
+const reviewViewport = page.viewportSize();
+if (!reviewBox || reviewBox.height < 44 || reviewBox.x < 0 || reviewBox.y < 0 ||
+    reviewBox.x + reviewBox.width > reviewViewport.width || reviewBox.y + reviewBox.height > reviewViewport.height) {
+  throw new Error(`review-clips action is clipped or undersized at 320x568: ${JSON.stringify(reviewBox)}`);
+}
+await page.screenshot({ path: `${OUT}/2-recorded-compact.png` });
+await page.setViewportSize({ width: 390, height: 844 });
+await reviewClips.click();
+await page.waitForSelector('[data-editor-frame]', { timeout: 10000 });
+log('clear post-recording review action and early encoder download verified at 320x568');
+
 // A reload must recover the durable session with every completed clip.
 await page.reload();
 await page.waitForSelector('[data-editor-frame]', { timeout: 10000 });
 if (await page.locator('[data-clip]').count() !== 4) throw new Error('reload did not preserve all 4 clips');
 log('reload preserved all completed clips');
 
-// go to editor
+// Continue in the editor after the explicit review action and reload proof.
 await page.waitForSelector('text=Split', { timeout: 15000 });
 await page.waitForTimeout(1500); // thumbnails
 await page.screenshot({ path: `${OUT}/3-editor.png` });
@@ -410,6 +435,10 @@ await exportDialog.getByRole('button', { name: 'Start export' }).click();
 log('export started (ffmpeg.wasm)…');
 await page.waitForSelector('text=Video ready to share or download', { timeout: 300000 });
 if (await page.getByText('Saved to this device').count()) throw new Error('UI falsely claimed the file was saved');
+const resultStats = await page.locator('[data-export-result-stats]').textContent();
+if (!resultStats || !/ready in .*no upload needed/.test(resultStats)) {
+  throw new Error(`export size/speed handoff is unclear: "${resultStats}"`);
+}
 log('export ready without false save claim');
 await page.screenshot({ path: `${OUT}/6-exported.png` });
 
@@ -427,7 +456,7 @@ await page.evaluate(() => {
 const downloadPromise = page.waitForEvent('download', { timeout: 60000 });
 await page.getByRole('button', { name: 'Download MP4' }).click();
 const download = await downloadPromise;
-await page.getByText(/Download requested/).waitFor();
+await page.getByText(/Download started from this device — no upload/).waitFor();
 const path = `${OUT}/exported.mp4`;
 await download.saveAs(path);
 const size = fs.statSync(path).size;

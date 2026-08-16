@@ -12,6 +12,7 @@ fs.mkdirSync(OUT, { recursive: true });
 
 const errors = [];
 const recorderEvidence = [];
+let encoderCoreRequests = 0;
 const browser = await chromium.launch({
   executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   args: [
@@ -33,6 +34,9 @@ page.on('console', (message) => {
   if (message.text().startsWith('[rec]')) recorderEvidence.push(message.text());
   if (message.type() === 'error') errors.push(message.text());
 });
+page.on('request', (request) => {
+  if (request.url().includes('/ffmpeg/ffmpeg-core.wasm')) encoderCoreRequests += 1;
+});
 page.on('pageerror', (error) => errors.push(String(error)));
 
 await page.goto(BASE, { waitUntil: 'load' });
@@ -53,7 +57,7 @@ for (let index = 0; index < clipCount; index++) {
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
   await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 2000 * SLACK });
 }
-await page.getByText('Edit', { exact: true }).click();
+await page.getByRole('button', { name: new RegExp(`Done recording\\. Review ${clipCount} clip`) }).click();
 
 const frame = page.locator('[data-editor-frame]');
 await frame.waitFor();
@@ -72,6 +76,9 @@ if (await frame.getAttribute('data-export-width') !== expectedWidth || await fra
   throw new Error(`${exportQuality} portrait metadata is not ${expectedWidth}x${expectedHeight}`);
 }
 await dialog.getByText(new RegExp(`${exportQuality} · ${expectedWidth} × ${expectedHeight}`)).waitFor();
+if (clipCount === 1 && encoderCoreRequests !== 0) {
+  throw new Error('one-clip review downloaded the encoder before export started');
+}
 // Steering UX: choosing 4K over HD-capture clips must surface the upscale
 // hint (and 1080p must not) — fake-camera clips here are HD-class.
 const hintCount = await dialog.locator('[data-upscale-hint]').count();

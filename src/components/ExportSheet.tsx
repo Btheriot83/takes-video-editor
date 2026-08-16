@@ -9,8 +9,19 @@ import { ASPECT_RATIOS } from '../types/clip';
 import type { ExportQuality } from '../types/clip';
 
 type Phase = 'idle' | 'working' | 'ready' | 'shared' | 'error';
+type ResultStats = { bytes: number; seconds: number };
 
 const QUALITIES: ExportQuality[] = ['1080p', '4K'];
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+function formatSeconds(seconds: number): string {
+  if (seconds < 0.1) return 'under 0.1s';
+  return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+}
 
 export default function ExportSheet({ onClose, quality, onQualityChange, onExportStart, onExportEnd }: {
   onClose: () => void;
@@ -29,6 +40,7 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
   const [error, setError] = useState<string | null>(null);
   const [handoffNotice, setHandoffNotice] = useState<string | null>(null);
   const [exportMode, setExportMode] = useState<'native' | 'remuxed' | 'transcoded' | null>(null);
+  const [resultStats, setResultStats] = useState<ResultStats | null>(null);
   const resultRef = useRef<Blob | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const dialogRef = useRef<HTMLDialogElement | null>(null);
@@ -41,6 +53,8 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
     setPhase('working');
     setError(null);
     setProgress(0);
+    setHandoffNotice(null);
+    setResultStats(null);
     const controller = new AbortController();
     abortRef.current = controller;
     onExportStart?.();
@@ -49,6 +63,7 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
         (l, p) => { setLabel(l); setProgress(p); }, controller.signal);
       resultRef.current = res.blob;
       setExportMode(res.mode);
+      setResultStats({ bytes: res.bytes, seconds: res.seconds });
       setPhase('ready');
     } catch (error: unknown) {
       if (error instanceof DOMException && error.name === 'AbortError') {
@@ -130,7 +145,7 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
     if (!resultRef.current) return;
     const requested = downloadBlob(resultRef.current, filename);
     setHandoffNotice(requested
-      ? 'Download requested. On iPhone, check Files › Downloads. The browser cannot confirm placement in Photos.'
+      ? 'Download started from this device — no upload. On iPhone, check Files › Downloads; the browser cannot confirm placement in Photos.'
       : 'The browser could not start the download. Try Share instead.');
   };
 
@@ -242,6 +257,11 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
               {exportMode === 'remuxed' && 'Clips joined without re-encoding.'}
               {exportMode === 'transcoded' && `Rendered at ${quality} output resolution.`}
             </p>
+            {resultStats && (
+              <p data-export-result-stats className="text-xs font-medium text-white/70">
+                {formatBytes(resultStats.bytes)} · ready in {formatSeconds(resultStats.seconds)} · no upload needed
+              </p>
+            )}
             <button onClick={share}
               className="w-full bg-white text-black font-semibold py-3 rounded-xl active:scale-[0.98] flex items-center justify-center gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
               <Share2 size={17} /> Save to Photos / Share
@@ -249,9 +269,10 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
             <p className="text-[11px] leading-snug text-white/50">
               Opens the system sheet — save to Photos, iCloud Drive, Google Drive, AirDrop, or send it anywhere.
             </p>
-            <button onClick={download}
-              className="w-full bg-white/10 font-medium py-3 rounded-xl active:scale-[0.98] flex items-center justify-center gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
+            <button onClick={download} aria-label="Download MP4"
+              className="w-full bg-white/10 font-medium py-3 px-4 rounded-xl active:scale-[0.98] flex items-center justify-center gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
               <Download size={17} /> Download MP4
+              {resultStats && <span className="text-xs font-normal text-white/55">· {formatBytes(resultStats.bytes)}</span>}
             </button>
             {handoffNotice && <p role="status" className="text-xs leading-relaxed text-white/55">{handoffNotice}</p>}
             {/* Success-state diagnostics: the same breadcrumb tail as the error

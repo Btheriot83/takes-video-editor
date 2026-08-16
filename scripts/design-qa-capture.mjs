@@ -35,7 +35,7 @@ for (let i = 0; i < 2; i++) {
   await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 10000 });
 }
 
-await page.getByText('Edit', { exact: true }).click();
+await page.getByRole('button', { name: /Done recording\. Review \d+ clips?/ }).click();
 await page.waitForSelector('text=Split', { timeout: 15000 });
 await page.waitForTimeout(1000);
 await page.setViewportSize({ width: 430, height: 799 });

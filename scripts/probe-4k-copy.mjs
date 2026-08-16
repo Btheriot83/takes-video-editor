@@ -63,7 +63,7 @@ async function run({ clipCount, aspect, expectCopy }) {
     await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 20000 });
   }
 
-  await page.getByText('Edit', { exact: true }).click();
+  await page.getByRole('button', { name: /Done recording\. Review \d+ clips?/ }).click();
   await page.locator('[data-editor-frame]').waitFor();
   await page.getByText('Export video', { exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Export video' });

@@ -35,7 +35,7 @@ await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 500
 await page.waitForTimeout(1500);
 await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
 await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 2000 });
-await page.getByText('Edit', { exact: true }).click();
+await page.getByRole('button', { name: /Done recording\. Review \d+ clips?/ }).click();
 await page.locator('[data-editor-frame]').waitFor();
 
 await page.getByText('Export video', { exact: true }).click();

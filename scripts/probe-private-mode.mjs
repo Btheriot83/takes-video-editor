@@ -131,7 +131,7 @@ async function runScenario(scenario, { full }) {
     log('3 clips recorded; notice stayed one-time');
 
     // edit: open the editor, trim clip 2's right edge
-    await page.getByText('Edit', { exact: true }).click();
+    await page.getByRole('button', { name: /Done recording\. Review \d+ clips?/ }).click();
     await page.waitForSelector('[data-editor-frame]', { timeout: 10000 });
     if (await page.locator('[data-clip]').count() !== 3) throw new Error('editor did not show all 3 in-memory clips');
     const clips = page.locator('[data-clip]');
