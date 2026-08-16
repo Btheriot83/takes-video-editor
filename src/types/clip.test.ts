@@ -50,9 +50,10 @@ describe('isUltraHDCapture', () => {
 });
 
 describe('clipFraming', () => {
-  it('keeps legacy clips on cover and honors full-frame selfie clips', () => {
+  it('keeps camera recordings vertical and preserves explicit imported fits', () => {
     expect(clipFraming({})).toBe('cover');
     expect(clipFraming({ framing: 'cover' })).toBe('cover');
-    expect(clipFraming({ framing: 'contain' })).toBe('contain');
+    expect(clipFraming({ source: 'recording', framing: 'contain' })).toBe('cover');
+    expect(clipFraming({ source: 'import', framing: 'contain' })).toBe('contain');
   });
 });

@@ -80,10 +80,9 @@ export interface Clip {
   /** Provenance; legacy clips loaded without it default to 'import' for safety. */
   source: ClipSource;
   /**
-   * How the source is placed inside the selected project frame. Selfie clips
-   * use `contain` so the browser's narrower portrait frame never punches in
-   * on the user's face; legacy, imported, and rear-camera clips default to
-   * `cover` for backwards compatibility.
+   * How the source is placed inside the selected project frame. Camera clips
+   * use `cover` for a true vertical composition. `contain` remains available
+   * for imported media that explicitly opts into a fit-with-padding layout.
    */
   framing?: ClipFraming;
   /**
@@ -111,8 +110,13 @@ export interface Clip {
   thumbs: string[];
 }
 
-/** Runtime-safe framing for persisted clips created before this field. */
-export function clipFraming(clip: { framing?: ClipFraming }): ClipFraming {
+/**
+ * Runtime-safe framing for persisted clips. A short-lived release stored
+ * front-camera recordings as `contain`, producing a landscape strip inside
+ * the portrait frame; normalize those recordings back to vertical fill.
+ */
+export function clipFraming(clip: { framing?: ClipFraming; source?: ClipSource }): ClipFraming {
+  if (clip.source === 'recording') return 'cover';
   return clip.framing === 'contain' ? 'contain' : 'cover';
 }
 

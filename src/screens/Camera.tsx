@@ -30,6 +30,24 @@ function distance(a: { x: number; y: number }, b: { x: number; y: number }) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
+/** Wait until the preview reports the frame it will actually display/record. */
+async function waitForPreviewMetadata(video: HTMLVideoElement): Promise<void> {
+  if (video.readyState >= HTMLMediaElement.HAVE_METADATA && video.videoWidth && video.videoHeight) return;
+  await new Promise<void>((resolve) => {
+    let timeout = 0;
+    const done = () => {
+      video.removeEventListener('loadedmetadata', done);
+      window.clearTimeout(timeout);
+      resolve();
+    };
+    video.addEventListener('loadedmetadata', done);
+    // A camera stream can occasionally omit the event after a rapid switch.
+    // Do not leave the capture UI disabled forever; track settings remain the
+    // honest fallback below when intrinsic dimensions are still unavailable.
+    timeout = window.setTimeout(done, 2500);
+  });
+}
+
 export default function Camera() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -119,21 +137,32 @@ export default function Camera() {
           });
           settings = videoTrack.getSettings?.() as ExtendedSettings | undefined;
           nextZoom = settings?.zoom ?? nextZoomRange.min;
-        } catch { /* full-frame contain still prevents an app-level punch-in */ }
+        } catch { /* portrait fill still starts from the widest mode the browser supplied */ }
       }
       setZoom(nextZoom);
       setTorchSupported(nextFacing === 'environment' && capabilities?.torch === true);
-      setCaptureSize({ width: settings?.width, height: settings?.height, frameRate: settings?.frameRate });
+      const preview = videoRef.current;
+      if (preview) {
+        preview.srcObject = stream;
+        await waitForPreviewMetadata(preview);
+        if (streamRef.current !== stream) return;
+        await preview.play().catch(() => {});
+      }
+      // videoWidth/videoHeight describe the actual display-oriented frame.
+      // Track settings can claim 1080x1920 while an iOS MediaRecorder blob is
+      // still landscape; showing the intrinsic size keeps the badge truthful
+      // and waiting for it prevents recording during orientation setup.
+      setCaptureSize({
+        width: preview?.videoWidth || settings?.width,
+        height: preview?.videoHeight || settings?.height,
+        frameRate: settings?.frameRate,
+      });
       // The capture badge always reflects the size the camera actually
       // delivered; be explicit when a 4K request could not be honored.
       if (quality === '4K' && !isUltraHDCapture(settings?.width, settings?.height)) {
         showCapabilityNotice('4K not available on this camera');
       }
       setStreamReady(true);
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.play().catch(() => {});
-      }
       setError(null);
     } catch (cameraError: unknown) {
       setZoomRange(null);
@@ -199,7 +228,7 @@ export default function Camera() {
           false,
           'recording',
           active.mimeType,
-          active.facing === 'user' ? 'contain' : 'cover',
+          'cover',
         );
         // Unmissable saved confirmation: users reported not knowing whether
         // releasing the button actually kept the clip.
@@ -480,12 +509,12 @@ export default function Camera() {
                 <span className="relative">
                   {quality}
                   {/* Subtle steer: someone who last exported at 4K but is
-                      capturing HD is giving up the instant no-re-encode 4K
-                      export. A dot, not a modal. */}
+                      capturing HD will require a full 4K upscale next time.
+                      A dot, not a modal. */}
                   {quality === '4K' && captureQuality === 'HD' && lastExportQuality === '4K' && (
                     <span
                       data-capture-4k-nudge
-                      title="You last exported in 4K — capturing in 4K makes 4K export instant"
+                      title="You last exported in 4K — capture in 4K to avoid a slower upscale"
                       className="absolute -right-1.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-400"
                     />
                   )}
@@ -526,10 +555,8 @@ export default function Camera() {
             playsInline
             muted
             data-camera-preview
-            data-preview-framing={facing === 'user' ? 'contain' : 'cover'}
-            className={`absolute inset-0 h-full w-full ${
-              facing === 'user' ? 'object-contain -scale-x-100' : 'object-cover'
-            }`}
+            data-preview-framing="cover"
+            className={`absolute inset-0 h-full w-full object-cover ${facing === 'user' ? '-scale-x-100' : ''}`}
           />
 
           <div className="absolute inset-x-0 top-0 h-16 bg-gradient-to-b from-black/50 to-transparent pointer-events-none" />

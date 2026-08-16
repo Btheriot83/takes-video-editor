@@ -49,24 +49,29 @@ export interface ActiveRecording {
    * be silently concat-copied together.
    */
   mimeType: string;
-  /** Camera used when this recording started; stable even after UI switches. */
-  facing: CameraFacing;
 }
 
-/** Portrait-convention video constraints for a capture quality. */
+/**
+ * Camera constraints in the source's primary orientation. WebKit evaluates
+ * camera modes in landscape even while an iPhone is held vertically, then
+ * flips width/height in getSettings() for the delivered portrait track. A
+ * portrait-shaped front-camera request instead selected an unmodified
+ * landscape mode, which our preview could only letterbox or heavily crop.
+ */
 export function captureConstraints(facing: CameraFacing, quality: CaptureQuality): CameraTrackConstraints {
   const size = CAPTURE_DIMENSIONS[quality];
+  const front = facing === 'user';
   return {
     facingMode: { ideal: facing },
-    width: { ideal: size.width },
-    height: { ideal: size.height },
+    width: { ideal: front ? size.height : size.width },
+    height: { ideal: front ? size.width : size.height },
     frameRate: { ideal: 30, max: 30 },
-    // A portrait width/height request is allowed to make the browser crop a
-    // native 3:4 selfie sensor before the app even receives it. Require the
-    // uncropped native mode for the front camera; unsupported constraints are
-    // ignored by the browser and the UI/export contain framing is the second
-    // line of defense.
-    ...(facing === 'user' ? { resizeMode: { exact: 'none' } } : {}),
+    ...(front ? {
+      aspectRatio: { ideal: size.height / size.width },
+      // Preserve the native field of view. Device orientation supplies the
+      // portrait rotation; CSS/export perform the single final frame crop.
+      resizeMode: { exact: 'none' },
+    } : {}),
   };
 }
 
@@ -118,9 +123,9 @@ export async function getCameraStream(
   try {
     let stream = await navigator.mediaDevices.getUserMedia(base);
     if (quality === '4K' && !streamIsUltraHD(stream)) {
-      // iOS resolves portrait 2160x3840 ideals to 1920x1080 (see
-      // ultraHDRetryConstraints). Retry ONCE with landscape ideals before
-      // letting the Camera screen show the "4K not available" notice.
+      // iOS can resolve a 4K ideal to 1080p (see ultraHDRetryConstraints).
+      // Retry ONCE with exact 4K candidates before letting the Camera screen
+      // show the "4K not available" notice.
       stream.getTracks().forEach((track) => track.stop());
       try {
         const retry = await navigator.mediaDevices.getUserMedia({
@@ -128,10 +133,10 @@ export async function getCameraStream(
           audio,
         });
         if (streamIsUltraHD(retry)) return retry;
-        // Still not 4K-class: discard the landscape stream so preview and
-        // recording keep the portrait convention.
+        // Still not 4K-class: discard the retry and reopen the base stream so
+        // the selected camera owns its normal fallback behavior.
         retry.getTracks().forEach((track) => track.stop());
-      } catch { /* retry constraints rejected; reopen the portrait stream */ }
+      } catch { /* retry constraints rejected; reopen the base stream */ }
       stream = await navigator.mediaDevices.getUserMedia(base);
     }
     return stream;
@@ -199,7 +204,6 @@ export async function startRecording(
 
   return {
     get mimeType() { return rec.mimeType || mimeType; },
-    facing,
     get paused() { return rec.state === 'paused'; },
     pause: () => { if (rec.state === 'recording') rec.pause(); },
     resume: () => { if (rec.state === 'paused') rec.resume(); },

@@ -10,16 +10,21 @@ describe('captureConstraints', () => {
     expect(c.frameRate).toEqual({ ideal: 30, max: 30 });
     expect(c.facingMode).toEqual({ ideal: 'environment' });
   });
-  it('requests portrait 2160x3840 for 4K and keeps the 30fps ceiling', () => {
+  it('requests the front 4K sensor in its primary landscape orientation', () => {
     const c = captureConstraints('user', '4K');
-    expect(c.width).toEqual({ ideal: 2160 });
-    expect(c.height).toEqual({ ideal: 3840 });
+    expect(c.width).toEqual({ ideal: 3840 });
+    expect(c.height).toEqual({ ideal: 2160 });
+    expect(c.aspectRatio).toEqual({ ideal: 16 / 9 });
     expect(c.frameRate).toEqual({ ideal: 30, max: 30 });
     expect(c.facingMode).toEqual({ ideal: 'user' });
     expect(c.resizeMode).toEqual({ exact: 'none' });
   });
-  it('does not let the browser crop the native selfie sensor to meet portrait ideals', () => {
-    expect(captureConstraints('user', 'HD').resizeMode).toEqual({ exact: 'none' });
+  it('lets WebKit rotate a native front-camera mode instead of boxing a landscape stream', () => {
+    const front = captureConstraints('user', 'HD');
+    expect(front.width).toEqual({ ideal: 1920 });
+    expect(front.height).toEqual({ ideal: 1080 });
+    expect(front.aspectRatio).toEqual({ ideal: 16 / 9 });
+    expect(front.resizeMode).toEqual({ exact: 'none' });
     expect(captureConstraints('environment', 'HD').resizeMode).toBeUndefined();
   });
   it('capture dimensions stay portrait (width < height)', () => {

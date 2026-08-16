@@ -26,7 +26,7 @@ interface State {
    * Last export quality the user explicitly chose, persisted across sessions.
    * Read by the Camera screen to badge the 4K capture toggle when someone who
    * exports at 4K is still capturing HD (an HD capture forces an upscale
-   * transcode instead of the instant copy-path 4K export).
+   * transcode instead of a copy-path 4K export).
    */
   lastExportQuality: ExportQuality | null;
   setLastExportQuality: (quality: ExportQuality) => void;
@@ -147,7 +147,7 @@ export const useStore = create<State>((set, get) => ({
           true,
           'recording',
           rec.mimeType,
-          rec.facing === 'user' ? 'contain' : 'cover',
+          'cover',
         );
         await recFinalize();
         notice = `Recovered an interrupted recording (${clipLen(clip).toFixed(1)}s).`;

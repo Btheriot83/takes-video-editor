@@ -149,22 +149,38 @@ const selfiePreview = page.locator('[data-camera-preview]');
 const selfieState = await selfiePreview.evaluate((video) => ({
   objectFit: getComputedStyle(video).objectFit,
   framing: video.getAttribute('data-preview-framing'),
+  intrinsicWidth: video.videoWidth,
+  intrinsicHeight: video.videoHeight,
   constraints: video.srcObject?.getVideoTracks?.()[0]?.getConstraints?.() ?? {},
 }));
-if (selfieState.objectFit !== 'contain' || selfieState.framing !== 'contain') {
-  throw new Error(`selfie preview still crops the sensor: ${JSON.stringify(selfieState)}`);
+const selfieFrame = page.locator('[data-camera-frame]');
+const reportedSelfieSize = {
+  width: Number(await selfieFrame.getAttribute('data-capture-width')),
+  height: Number(await selfieFrame.getAttribute('data-capture-height')),
+};
+if (reportedSelfieSize.width !== selfieState.intrinsicWidth || reportedSelfieSize.height !== selfieState.intrinsicHeight) {
+  throw new Error(`capture badge did not report the displayed selfie frame: ${JSON.stringify({ reportedSelfieSize, selfieState })}`);
+}
+if (selfieState.objectFit !== 'cover' || selfieState.framing !== 'cover') {
+  throw new Error(`selfie preview is not an edge-to-edge portrait fill: ${JSON.stringify(selfieState)}`);
 }
 if (!JSON.stringify(selfieState.constraints.resizeMode ?? '').includes('none')) {
   throw new Error(`selfie camera did not request an uncropped native mode: ${JSON.stringify(selfieState.constraints)}`);
 }
-await page.screenshot({ path: `${OUT}/1-selfie-full-frame.png` });
+const requestedWidth = Number(selfieState.constraints.width?.ideal ?? selfieState.constraints.width);
+const requestedHeight = Number(selfieState.constraints.height?.ideal ?? selfieState.constraints.height);
+const requestedAspect = Number(selfieState.constraints.aspectRatio?.ideal ?? selfieState.constraints.aspectRatio);
+if (!(requestedWidth > requestedHeight) || Math.abs(requestedAspect - 16 / 9) > 0.01) {
+  throw new Error(`selfie camera did not request a native primary-orientation mode: ${JSON.stringify(selfieState)}`);
+}
+await page.screenshot({ path: `${OUT}/1-selfie-vertical.png` });
 await page.getByRole('button', { name: 'Switch to rear camera' }).click();
 await page.waitForSelector('button[aria-label="Switch to front camera"]:not([disabled])', { timeout: 15000 });
 if (await selfiePreview.getAttribute('data-preview-framing') !== 'cover' ||
     await selfiePreview.evaluate((video) => getComputedStyle(video).objectFit) !== 'cover') {
   throw new Error('rear camera did not restore cover framing');
 }
-log('full-frame selfie and rear-camera framing verified');
+log('edge-to-edge vertical selfie and rear-camera framing verified');
 
 // fake Chromium camera exposes no torch; the UI must state that honestly
 const flash = page.getByRole('button', { name: /Flash/ });
@@ -198,7 +214,7 @@ log(fallbackVisible ? 'pinch zoom fallback verified' : 'pinch zoom verified');
 
 // Assistive technologies activate a button through its click contract rather
 // than pointerdown/up. Record this first clip on the selfie camera so its
-// full-frame metadata is exercised through persistence, editing, and export.
+// vertical-fill behavior is exercised through persistence, editing, and export.
 await page.getByRole('button', { name: 'Switch to front camera' }).click();
 await page.waitForSelector('button[aria-label="Switch to rear camera"]:not([disabled])', { timeout: 15000 });
 await page.getByRole('button', { name: 'Tap to record' }).evaluate((button) => button.click());
@@ -210,7 +226,7 @@ await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])',
 if (mediaRecorderStarts !== 1) throw new Error(`assistive click started ${mediaRecorderStarts} recorders`);
 await page.getByRole('button', { name: 'Switch to rear camera' }).click();
 await page.waitForSelector('button[aria-label="Switch to front camera"]:not([disabled])', { timeout: 15000 });
-log('assistive click recorded a full-frame selfie clip and returned to rear camera');
+log('assistive click recorded a vertical selfie clip and returned to rear camera');
 
 // Record 3 additional clips of ~2s each: clips 2-3 via the classic hold
 // gesture (touchEnd / touchCancel releases), clip 4 via the tap-toggle path.
@@ -323,9 +339,9 @@ await page.waitForFunction(() => {
   const slot = editor?.getAttribute('data-editor-active-slot');
   const video = document.querySelector(`[data-editor-video-slot="${slot}"]`);
   return video instanceof HTMLVideoElement &&
-    video.dataset.editorFraming === 'contain' && getComputedStyle(video).objectFit === 'contain';
+    video.dataset.editorFraming === 'cover' && getComputedStyle(video).objectFit === 'cover';
 });
-log('selfie clip kept full-frame contain framing after reload in the editor');
+log('selfie clip kept edge-to-edge vertical framing after reload in the editor');
 
 const editorFrame = page.locator('[data-editor-frame]');
 const editorBox = await editorFrame.boundingBox();

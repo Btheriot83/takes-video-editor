@@ -213,12 +213,12 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
               ))}
             </div>
             <p className="mt-1.5 text-[11px] leading-snug text-white/55">1080p exports faster. 4K is larger and can take much longer on this device.</p>
-            {/* 4K-capture clips can export at 4K instantly (no re-encode);
-                HD-capture clips forced to 4K take the slow upscale render.
-                Say so before the user commits to the wait. */}
+            {/* HD-capture clips forced to 4K require a slow upscale render.
+                Say so before the user commits to the wait without promising
+                a duration for device-dependent copy/remux paths. */}
             {quality === '4K' && !clips.some((c) => isUltraHDCapture(c.width, c.height)) && (
               <p data-upscale-hint className="mt-1.5 text-[11px] leading-snug text-amber-300/90">
-                Recorded in 1080p — 4K will upscale and render slower. Record with the 4K camera toggle for instant 4K export.
+                Recorded in 1080p — 4K will upscale and render slower. Record with the 4K camera toggle to avoid this upscale.
               </p>
             )}
           </div>
@@ -248,7 +248,7 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
         )}
 
         {phase === 'ready' && (
-          <div className="space-y-2">
+          <div className="space-y-2" data-export-ready data-export-mode={exportMode ?? undefined}>
             <div className="flex items-center gap-2 text-emerald-400 text-sm">
               <CheckCircle2 size={18} /> Video ready to share or download
             </div>

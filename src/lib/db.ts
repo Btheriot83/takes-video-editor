@@ -183,7 +183,7 @@ export async function recFinalize(): Promise<void> {
     () => {},
   );
 }
-export async function recRecover(): Promise<{ mimeType: string; blob: Blob; facing: 'user' | 'environment' } | null> {
+export async function recRecover(): Promise<{ mimeType: string; blob: Blob } | null> {
   return withFallback(
     'recovery read failed',
     async (d) => {
@@ -196,7 +196,7 @@ export async function recRecover(): Promise<{ mimeType: string; blob: Blob; faci
       for (const k of keys) parts.push(await d.get('rec', k));
       const blob = new Blob(parts, { type: meta.mimeType });
       // The caller clears recovery only after the reconstructed clip is durable.
-      return { mimeType: meta.mimeType, blob, facing: meta.facing === 'user' ? 'user' : 'environment' };
+      return { mimeType: meta.mimeType, blob };
     },
     () => null,
   );
