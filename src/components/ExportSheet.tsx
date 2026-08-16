@@ -3,6 +3,7 @@ import { X, Download, Share2, CheckCircle2 } from 'lucide-react';
 import { useStore } from '../state/store';
 import { getBlob } from '../lib/db';
 import { exportMp4, shareFile, downloadBlob } from '../lib/ffmpeg';
+import { exportLogTail } from '../lib/export-log';
 import { totalDuration, fmtTime, exportDimensions } from '../types/clip';
 import { ASPECT_RATIOS } from '../types/clip';
 import type { ExportQuality } from '../types/clip';
@@ -204,6 +205,12 @@ export default function ExportSheet({ onClose, quality, onQualityChange }: {
         {phase === 'error' && (
           <div className="space-y-2">
             <p className="text-sm text-red-400">{error}</p>
+            {/* The breadcrumb tail turns a field failure report (often a
+                screenshot from a phone) into an actionable diagnosis. */}
+            <details className="text-[10px] text-white/40">
+              <summary className="cursor-pointer select-none py-1">Technical details</summary>
+              <pre className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap break-all rounded bg-black/40 p-2 leading-relaxed">{exportLogTail().join('\n') || 'no log entries'}</pre>
+            </details>
             <button onClick={() => void start()}
               className="w-full bg-white text-black font-semibold py-3 rounded-xl active:scale-[0.98] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
               Try again

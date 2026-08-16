@@ -2,6 +2,7 @@ import { clipLen, exportDimensions } from '../types/clip';
 import type { AspectRatio, Clip, ExportQuality } from '../types/clip';
 import type { FFmpeg } from '@ffmpeg/ffmpeg';
 import { planWebCodecsEncode, renderVideoWebCodecs } from './webcodecs-export';
+import { clearExportLog, exportLog } from './export-log';
 
 // We load @ffmpeg/ffmpeg's ESM build from same-origin static files
 // (public/ffesm) instead of the vite-bundled worker: the bundled module
@@ -216,6 +217,9 @@ async function runExport(
   };
   throwIfAborted();
   const started = performance.now();
+  clearExportLog();
+  let webcodecsFailure: string | null = null;
+  exportLog(`export start: ${clips.length} clip(s), ${quality}, ${aspectRatio}`);
   onProgress?.('Reading clips', 0);
   const blobs: Blob[] = [];
   for (let i = 0; i < clips.length; i++) {
@@ -278,7 +282,7 @@ async function runExport(
       onProgress?.('Done', 1);
       return { blob, bytes, seconds: (performance.now() - started) / 1000, mode: 'remuxed' };
     }
-    console.warn('[export] lossless join was incompatible; rendering instead');
+    exportLog('lossless join was incompatible; rendering instead');
     await ffmpeg.deleteFile(concatFile).catch(() => {});
     await ffmpeg.deleteFile('out.mp4').catch(() => {});
   }
@@ -296,14 +300,13 @@ async function runExport(
   const plan = await planWebCodecsEncode(output.width, output.height, quality, maxSourceFps);
   if (plan) {
     try {
-      console.log('[export] using webcodecs encoder:', plan.config.codec, plan.config.hardwareAcceleration ?? 'default');
-      onProgress?.('Rendering video', 0.05);
-      let videoBytes: Uint8Array | null = await renderVideoWebCodecs(
-        clips, blobs, output.width, output.height, plan,
-        (p) => onProgress?.('Rendering video', 0.05 + p * 0.65), signal);
+      exportLog(`using webcodecs encoder: ${plan.config.codec} ${plan.config.hardwareAcceleration ?? 'default'}`);
 
-      throwIfAborted();
-      onProgress?.('Encoding audio', 0.72);
+      // Audio FIRST: it is fast (audio-only wasm encode) and lets the source
+      // clips be freed from MEMFS before the multi-hundred-MB 4K video buffer
+      // starts growing — peak memory is what kills iPhone Safari tabs on
+      // longer multi-clip exports.
+      onProgress?.('Encoding audio', 0.03);
       const audioParts: string[] = [];
       for (let i = 0; i < clips.length; i++) {
         audioParts.push(audioChain(i, clipLen(clips[i]), probes[i].hasAudio));
@@ -318,18 +321,21 @@ async function runExport(
         '-c:a', 'aac', '-b:a', '128k', '-vn', 'audio.m4a',
       );
       const audioProgress = ({ time }: { time: number }) => {
-        onProgress?.('Encoding audio', 0.72 + Math.min(0.2, (time / 1_000_000 / total) * 0.2));
+        onProgress?.('Encoding audio', 0.03 + Math.min(0.05, (time / 1_000_000 / total) * 0.05));
       };
       ffmpeg.on('progress', audioProgress);
       const audioCode = await ffmpeg.exec(audioArgs);
       ffmpeg.off('progress', audioProgress);
       if (audioCode !== 0) throw new Error('audio encode failed');
+      exportLog('audio track encoded');
 
-      // Peak-memory control: the source clips are no longer needed once the
-      // audio track exists. Freeing them BEFORE the encoded 4K video is copied
-      // into MEMFS keeps sources + encoded video from being resident at the
-      // same time (>1GB transient on ~60s 4K exports, an iOS jetsam risk).
+      // Sources are no longer needed in MEMFS (the render reads the blobs).
       for (const name of inputs) await ffmpeg.deleteFile(name).catch(() => {});
+
+      onProgress?.('Rendering video', 0.09);
+      let videoBytes: Uint8Array | null = await renderVideoWebCodecs(
+        clips, blobs, output.width, output.height, plan,
+        (p) => onProgress?.('Rendering video', 0.09 + p * 0.83), signal);
 
       throwIfAborted();
       onProgress?.('Finalizing', 0.94);
@@ -344,6 +350,7 @@ async function runExport(
       // Intermediates are dead weight whether or not the mux worked.
       for (const n of ['wcvideo.mp4', 'audio.m4a']) await ffmpeg.deleteFile(n).catch(() => {});
       if (muxCode !== 0) throw new Error('final mux failed');
+      exportLog('video+audio muxed');
 
       const muxed = await ffmpeg.readFile('out.mp4');
       const bytes = (muxed as Uint8Array).byteLength;
@@ -353,6 +360,8 @@ async function runExport(
       return { blob, bytes, seconds: (performance.now() - started) / 1000, mode: 'transcoded' };
     } catch (error) {
       if (signal?.aborted) throw abortError();
+      webcodecsFailure = error instanceof Error ? error.message : String(error);
+      exportLog(`webcodecs path failed (${webcodecsFailure}); falling back to wasm encoder`);
       console.warn('[export] webcodecs path failed; falling back to wasm encoder', error);
       for (const n of ['wcvideo.mp4', 'audio.m4a', 'out.mp4']) ffmpeg.deleteFile(n).catch(() => {});
       // The inputs may already have been freed for peak-memory reasons;
@@ -433,7 +442,12 @@ async function runExport(
   console.log('[export] args:', args.join(' '));
   const ok = await ffmpeg.exec(args);
   ffmpeg.off('progress', progressCb);
-  if (ok !== 0) throw new Error('Export failed (encoder error)');
+  if (ok !== 0) {
+    exportLog('wasm encode failed');
+    throw new Error(webcodecsFailure
+      ? `Export failed: hardware path (${webcodecsFailure}), then software encoder error`
+      : 'Export failed (encoder error)');
+  }
 
   const data = await ffmpeg.readFile('out.mp4');
   const bytes = (data as Uint8Array).byteLength;

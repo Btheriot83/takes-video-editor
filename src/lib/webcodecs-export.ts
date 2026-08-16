@@ -1,6 +1,7 @@
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { clipLen } from '../types/clip';
 import type { Clip, ExportQuality } from '../types/clip';
+import { exportLog } from './export-log';
 
 /**
  * WebCodecs render path: decode each clip in an offscreen <video>, step it
@@ -296,8 +297,8 @@ async function captureClip(
       t = next;
     }
     if (!captured) throw new Error('no frames captured from clip');
-    console.log(
-      `[export] webcodecs captured ${captured} frames (${(len).toFixed(2)}s clip, min frame delta ${
+    exportLog(
+      `webcodecs captured ${captured} frames (${(len).toFixed(2)}s clip, min frame delta ${
         Number.isFinite(minDelta) ? (minDelta * 1000).toFixed(1) : 'n/a'
       }ms)`,
     );
@@ -366,17 +367,38 @@ export async function renderVideoWebCodecs(
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('canvas 2d unavailable');
 
-  const video = document.createElement('video');
-  video.muted = true;
-  video.playsInline = true;
-  video.preload = 'auto';
+  // Each clip gets a FRESH <video> element. Reusing one element across many
+  // blob-src swaps starves iOS Safari of decoder sessions (AVPlayer-backed
+  // elements release their hardware decoder lazily), which made multi-clip
+  // exports fail on the third clip while one- and two-clip exports passed.
+  const makeVideo = () => {
+    const v = document.createElement('video');
+    v.muted = true;
+    v.playsInline = true;
+    v.preload = 'auto';
+    return v;
+  };
 
   try {
     encoder.configure(plan.config);
     for (let i = 0; i < clips.length; i++) {
       const done = clips.slice(0, i).reduce((s, c) => s + clipLen(c), 0);
-      await captureClip(clips[i], blobs[i], video, canvas, ctx, encoder, state, (s) =>
-        onProgress?.(Math.min(0.99, (done + s) / total)), signal);
+      const progress = (s: number) => onProgress?.(Math.min(0.99, (done + s) / total));
+      exportLog(`clip ${i + 1}/${clips.length}: decode+capture start`);
+      const framesBefore = state.frames;
+      try {
+        await captureClip(clips[i], blobs[i], makeVideo(), canvas, ctx, encoder, state, progress, signal);
+      } catch (error) {
+        // Retry only when the clip contributed nothing yet — a mid-clip retry
+        // would re-encode frames already handed to the muxer.
+        if (signal?.aborted || state.error || state.frames !== framesBefore) throw error;
+        // One retry with another fresh element and a breather: transient
+        // decoder-session exhaustion (iOS) recovers once the previous
+        // element's release completes.
+        exportLog(`clip ${i + 1} capture failed (${error instanceof Error ? error.message : error}); retrying once`);
+        await new Promise((r) => setTimeout(r, 400));
+        await captureClip(clips[i], blobs[i], makeVideo(), canvas, ctx, encoder, state, progress, signal);
+      }
     }
     await encoder.flush();
     if (signal?.aborted) throw abortError();
@@ -391,6 +413,6 @@ export async function renderVideoWebCodecs(
     }
   }
   onProgress?.(1);
-  console.log(`[export] webcodecs total frames encoded: ${state.frames}`);
+  exportLog(`webcodecs total frames encoded: ${state.frames}`);
   return new Uint8Array(muxer.target.buffer);
 }
