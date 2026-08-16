@@ -89,7 +89,7 @@ if (Math.min(capW, capH) >= 2160) {
   log(`4K capture delivered (${capW}x${capH})`);
 } else {
   await page.getByText('4K not available on this camera').waitFor({ timeout: 3000 });
-  const badge = await page.getByText(/^Camera /).textContent();
+  const badge = await page.locator('[data-capture-badge]').textContent();
   if (capW && capH && !badge.includes(`${capW}×${capH}`)) throw new Error(`capture badge "${badge}" does not reflect actual ${capW}x${capH}`);
   log(`4K unavailable fallback verified (actual ${capW || '?'}x${capH || '?'} shown honestly)`);
 }
@@ -205,10 +205,12 @@ log('editor open');
 const editorFrame = page.locator('[data-editor-frame]');
 const editorBox = await editorFrame.boundingBox();
 if (Math.abs(editorBox.width / editorBox.height - 9 / 16) > 0.03) throw new Error('editor frame is not portrait 9:16');
-if (await editorFrame.getAttribute('data-export-width') !== '2160' || await editorFrame.getAttribute('data-export-height') !== '3840') {
-  throw new Error('editor default export metadata is not 4K portrait 2160x3840');
+// These fake-camera clips are HD, so the export default must be the source
+// class (1080p), keeping the native/remux fast paths instead of a 4K upscale.
+if (await editorFrame.getAttribute('data-export-width') !== '1080' || await editorFrame.getAttribute('data-export-height') !== '1920') {
+  throw new Error('editor default export metadata is not the 1080p source class (1080x1920)');
 }
-log('editor portrait frame and default 4K export verified');
+log('editor portrait frame and source-matched 1080p default export verified');
 
 const clipCount = await page.locator('[data-clip]').count();
 log(`timeline clips: ${clipCount}`);
@@ -285,12 +287,18 @@ await page.screenshot({ path: `${OUT}/5-split.png` });
 await page.click('text=Export video');
 const exportDialog = page.getByRole('dialog', { name: 'Export video' });
 await exportDialog.getByText('9:16 portrait', { exact: true }).waitFor();
-await exportDialog.getByText(/4K · 2160 × 3840/).waitFor();
-// Quality is decided inside the export sheet with finger-sized controls.
-// Keep the broad smoke quick; the dedicated 4K smoke verifies 2160x3840.
+// HD-only sources open the sheet on 1080p; switching to 4K and back must
+// update the live export metadata. Controls stay finger-sized.
+await exportDialog.getByText(/1080p · 1080 × 1920/).waitFor();
 const quality1080 = exportDialog.getByRole('button', { name: '1080p', exact: true });
+const quality4k = exportDialog.getByRole('button', { name: '4K', exact: true });
+if (await quality1080.getAttribute('aria-pressed') !== 'true') throw new Error('export quality did not default to the 1080p source class');
 const qualityBox = await quality1080.boundingBox();
 if (!qualityBox || qualityBox.height < 44) throw new Error(`1080p quality control is ${qualityBox?.height}px tall, expected at least 44`);
+await quality4k.click();
+if (await quality4k.getAttribute('aria-pressed') !== 'true') throw new Error('4K quality selection was not pressed');
+if (await editorFrame.getAttribute('data-export-width') !== '2160') throw new Error('4K selection did not update export metadata');
+await exportDialog.getByText(/4K · 2160 × 3840/).waitFor();
 await quality1080.click();
 if (await quality1080.getAttribute('aria-pressed') !== 'true') throw new Error('1080p quality selection was not pressed');
 if (await editorFrame.getAttribute('data-export-width') !== '1080') throw new Error('1080p selection did not update export metadata');

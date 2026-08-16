@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { captureConstraints, captureVideoBitrate } from './recorder';
+import { captureConstraints, captureVideoBitrate, ultraHDRetryConstraints } from './recorder';
 import { CAPTURE_DIMENSIONS, isUltraHDCapture } from '../types/clip';
 
 describe('captureConstraints', () => {
@@ -20,6 +20,28 @@ describe('captureConstraints', () => {
   it('capture dimensions stay portrait (width < height)', () => {
     for (const { width, height } of Object.values(CAPTURE_DIMENSIONS)) {
       expect(width).toBeLessThan(height);
+    }
+  });
+});
+
+describe('ultraHDRetryConstraints', () => {
+  it('retries with landscape 3840x2160 ideals (iOS lists camera modes in landscape)', () => {
+    const c = ultraHDRetryConstraints('environment');
+    expect(c.width).toEqual({ ideal: 3840 });
+    expect(c.height).toEqual({ ideal: 2160 });
+    expect(c.facingMode).toEqual({ ideal: 'environment' });
+  });
+  it('keeps the 30fps ceiling on the retry', () => {
+    expect(ultraHDRetryConstraints('user').frameRate).toEqual({ ideal: 30, max: 30 });
+  });
+  it('offers advanced sets for both orientations, landscape first', () => {
+    const c = ultraHDRetryConstraints('user');
+    expect(c.advanced).toEqual([
+      { width: 3840, height: 2160 },
+      { width: 2160, height: 3840 },
+    ]);
+    for (const set of c.advanced ?? []) {
+      expect(isUltraHDCapture(set.width as number, set.height as number)).toBe(true);
     }
   });
 });

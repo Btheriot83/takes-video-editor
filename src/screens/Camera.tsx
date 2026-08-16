@@ -380,14 +380,17 @@ export default function Camera() {
             {ASPECT_RATIOS[aspectRatio].outputLabel}
           </div>
 
-          {/* One shared bottom row keeps the capture badge and zoom status from
-              overlapping when the portrait frame gets narrow (e.g. 320x568). */}
-          <div className="absolute inset-x-2 bottom-3 flex items-center justify-between gap-2 pointer-events-none">
-            <div className="min-w-0 truncate rounded-full bg-black/65 px-2.5 py-1.5 text-[10px] text-white/70">
-              Camera {captureSize?.width && captureSize?.height ? `${captureSize.width}×${captureSize.height}` : 'device managed'}
+          {/* One shared, wrappable bottom row: on narrow frames (320x568) the
+              zoom pill wraps to its own line so the capture badge keeps the
+              full resolution visible instead of truncating. */}
+          <div className="absolute inset-x-2 bottom-3 flex flex-wrap items-center gap-x-2 gap-y-1 pointer-events-none">
+            {/* No "Camera" prefix: at 320px-wide viewports the prefix truncated
+                the actual resolution away, hiding the honesty affordance. */}
+            <div data-capture-badge className="min-w-0 truncate rounded-full bg-black/65 px-2.5 py-1.5 text-[10px] text-white/70">
+              {captureSize?.width && captureSize?.height ? `${captureSize.width}×${captureSize.height}` : 'device managed'}
               {captureSize?.frameRate ? ` · ${captureSize.frameRate.toFixed(0)} fps` : ''}
             </div>
-            <div className="shrink-0 rounded-full bg-black/65 px-3 py-1.5 text-xs font-semibold tabular-nums shadow-sm" aria-live="polite">
+            <div className="ml-auto shrink-0 rounded-full bg-black/65 px-3 py-1.5 text-xs font-semibold tabular-nums shadow-sm" aria-live="polite">
               {zoom.toFixed(zoom % 1 === 0 ? 0 : 1)}×
               {!zoomRange && <span className="ml-1.5 font-normal text-white/60">fixed</span>}
             </div>

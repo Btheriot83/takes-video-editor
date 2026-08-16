@@ -58,8 +58,12 @@ const frame = page.locator('[data-editor-frame]');
 await frame.waitFor();
 await page.getByText('Export video', { exact: true }).click();
 const dialog = page.getByRole('dialog', { name: 'Export video' });
+// The sheet defaults to the source class (1080p for HD fake-camera clips),
+// so always click the quality under test explicitly.
 if (exportQuality === '1080p') {
   await dialog.getByRole('button', { name: '1080p', exact: true }).click();
+} else {
+  await dialog.getByRole('button', { name: '4K', exact: true }).click();
 }
 const expectedWidth = exportQuality === '4K' ? '2160' : '1080';
 const expectedHeight = exportQuality === '4K' ? '3840' : '1920';

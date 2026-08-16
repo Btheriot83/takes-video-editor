@@ -4,7 +4,7 @@ import {
   ChevronLeft, ChevronRight,
 } from 'lucide-react';
 import { useStore } from '../state/store';
-import { ASPECT_RATIOS, clipLen, totalDuration, fmtTime, FRAME, exportDimensions } from '../types/clip';
+import { ASPECT_RATIOS, clipLen, totalDuration, fmtTime, FRAME, exportDimensions, isUltraHDCapture } from '../types/clip';
 import type { Clip, ExportQuality } from '../types/clip';
 import { getBlob } from '../lib/db';
 import { locate, clipStart } from '../lib/editor';
@@ -66,7 +66,12 @@ export default function Editor() {
   const [activeSlot, setActiveSlot] = useState<VideoSlot>(0);
   const [handoffGapMs, setHandoffGapMs] = useState<number | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
-  const [exportQuality, setExportQuality] = useState<ExportQuality>('4K');
+  // Export quality defaults to the highest source class: 4K only when a clip
+  // actually carries 4K-class frames, else 1080p so all-HD projects keep the
+  // native/remux fast paths instead of a forced upscale transcode. An explicit
+  // user choice always wins.
+  const exportQualityTouchedRef = useRef(false);
+  const [exportQuality, setExportQuality] = useState<ExportQuality>('1080p');
   const [clipUrls, setClipUrls] = useState<Record<string, string>>({});
   const clipUrlsRef = useRef<Record<string, string>>({});
   const fileRef = useRef<HTMLInputElement>(null);
@@ -76,6 +81,16 @@ export default function Editor() {
   useEffect(() => () => {
     Object.values(clipUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));
     clipUrlsRef.current = {};
+  }, []);
+
+  useEffect(() => {
+    if (exportQualityTouchedRef.current) return;
+    setExportQuality(clips.some((c) => isUltraHDCapture(c.width, c.height)) ? '4K' : '1080p');
+  }, [clips]);
+
+  const chooseExportQuality = useCallback((quality: ExportQuality) => {
+    exportQualityTouchedRef.current = true;
+    setExportQuality(quality);
   }, []);
 
   const total = useMemo(() => totalDuration(clips), [clips]);
@@ -263,12 +278,39 @@ export default function Editor() {
     return () => window.cancelAnimationFrame(frame);
   }, [clips, handoff, playing, preroll, setPlayhead]);
 
+  // iOS WebKit grants audible playback per media element per user gesture.
+  // The spare slot only ever plays muted before a handoff unmutes it, so
+  // without its own activation iOS would pause it at the first clip boundary.
+  // Inside the first play gesture, synchronously run an unmuted play()+pause()
+  // on both slot elements at volume 0: each gains its per-element activation
+  // for the session with no audible glitch. Once per element per mount.
+  const gestureActivatedRef = useRef(false);
+  const activateSlotsInGesture = () => {
+    if (gestureActivatedRef.current) return;
+    gestureActivatedRef.current = true;
+    videoRefs.current.forEach((video) => {
+      if (!video) return;
+      const wasMuted = video.muted;
+      const wasVolume = video.volume;
+      try {
+        video.volume = 0;
+        video.muted = false;
+        const activation = video.play();
+        video.pause();
+        activation?.catch(() => { /* no source yet or aborted by the pause */ });
+      } catch { /* element not ready; normal playback still activates it */ }
+      video.muted = wasMuted;
+      video.volume = wasVolume;
+    });
+  };
+
   const togglePlay = async () => {
     if (playing) {
       prerollForRef.current = null;
       videoRefs.current.forEach((video) => video?.pause());
       setPlaying(false);
     } else {
+      activateSlotsInGesture();
       if (playhead >= total - 0.05) setPlayhead(0);
       await syncVideo(playhead >= total - 0.05 ? 0 : playhead, true);
       setPlaying(true);
@@ -328,9 +370,11 @@ export default function Editor() {
         </button>
       </div>
 
-      {/* action row */}
-      <div className="border-t border-white/10 overflow-x-auto">
-        <div className="mx-auto flex w-max items-center gap-1 px-3 py-1">
+      {/* action row — flex-wrap keeps every control on-screen and >=44px at
+          narrow widths (320px): the trim group wraps to a second row instead
+          of clipping off the right edge. */}
+      <div className="border-t border-white/10">
+        <div className="mx-auto flex w-max max-w-full flex-wrap items-center justify-center gap-1 px-2 py-1 min-[360px]:px-3">
           <Action icon={<Scissors size={17} />} label="Split" onClick={splitSelected} disabled={!selected || playing} />
           <Action icon={<Copy size={17} />} label="Duplicate" onClick={duplicateSelected} disabled={!selected} />
           <Action icon={<Trash2 size={17} />} label="Delete" onClick={deleteSelected} disabled={!selected} />
@@ -377,7 +421,7 @@ export default function Editor() {
       {exportOpen && (
         <ExportSheet
           quality={exportQuality}
-          onQualityChange={setExportQuality}
+          onQualityChange={chooseExportQuality}
           onClose={() => setExportOpen(false)}
         />
       )}
