@@ -214,6 +214,181 @@ const abortError = () => new DOMException('Export cancelled', 'AbortError');
  * options).
  */
 let bitmapResizeBroken = false;
+
+// Test-only escape hatch mirroring ?wcodec=: ?scaler=webgl skips the
+// createImageBitmap rung for that page load so the e2e suite can prove the
+// WebGL rung specifically. Per-page-load query param only; persistent state
+// is deliberately NOT honored so the override cannot linger for real users.
+function scalerOverride(): string | null {
+  try {
+    return new URLSearchParams(window.location.search).get('scaler');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * WebGL scaler state: one lazily-created OffscreenCanvas with a textured-quad
+ * program, reused across every frame of a render. Freed by
+ * releaseFrameScaler() (called from the render loop's finally). The GPU
+ * texture upload of a VideoFrame + draw replaces the 33-megapixel 2D-canvas
+ * draw + readback that made 4K exports crawl on engines without
+ * createImageBitmap resize options (iPhone Safari).
+ */
+interface GlScaler {
+  canvas: OffscreenCanvas;
+  gl: WebGLRenderingContext;
+  texBuf: WebGLBuffer;
+}
+let glScaler: GlScaler | null = null;
+// Permanent (per session) flag: any WebGL failure — context creation, shader
+// compile, texture upload, VideoFrame construction — disables the rung so the
+// export falls through to the 2D canvas path instead of failing per frame.
+let glScalerBroken = false;
+// Log once per render which scaler rung engaged (reset by releaseFrameScaler).
+let loggedScaler: string | null = null;
+function logScaler(name: 'bitmap-resize' | 'webgl' | 'canvas2d') {
+  if (loggedScaler !== name) {
+    loggedScaler = name;
+    exportLog(`scaler: ${name}`);
+  }
+}
+
+function getGlScaler(W: number, H: number): GlScaler | null {
+  if (glScalerBroken) return null;
+  if (glScaler && glScaler.canvas.width === W && glScaler.canvas.height === H) return glScaler;
+  if (glScaler) releaseFrameScaler();
+  try {
+    const canvas = new OffscreenCanvas(W, H);
+    const attrs: WebGLContextAttributes = {
+      premultipliedAlpha: false,
+      // Honored where supported; harmless elsewhere.
+      desynchronized: true,
+      antialias: false,
+      depth: false,
+      stencil: false,
+      preserveDrawingBuffer: false,
+    };
+    const gl = (canvas.getContext('webgl2', attrs) ??
+      canvas.getContext('webgl', attrs)) as WebGLRenderingContext | null;
+    if (!gl) throw new Error('webgl context unavailable');
+    const compile = (type: number, src: string) => {
+      const shader = gl.createShader(type);
+      if (!shader) throw new Error('createShader failed');
+      gl.shaderSource(shader, src);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        throw new Error(`shader compile failed: ${gl.getShaderInfoLog(shader)}`);
+      }
+      return shader;
+    };
+    const program = gl.createProgram();
+    if (!program) throw new Error('createProgram failed');
+    gl.attachShader(program, compile(gl.VERTEX_SHADER,
+      'attribute vec2 a_pos;attribute vec2 a_tex;varying vec2 v_tex;' +
+      'void main(){gl_Position=vec4(a_pos,0.,1.);v_tex=a_tex;}'));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER,
+      'precision mediump float;varying vec2 v_tex;uniform sampler2D u_tex;' +
+      'void main(){gl_FragColor=texture2D(u_tex,v_tex);}'));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(`program link failed: ${gl.getProgramInfoLog(program)}`);
+    }
+    gl.useProgram(program);
+    // Static full-viewport quad (triangle strip): BL, BR, TL, TR.
+    const posBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(program, 'a_pos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+    // Dynamic texcoord buffer: rewritten per frame with the cover-crop rect.
+    const texBuf = gl.createBuffer();
+    if (!texBuf) throw new Error('createBuffer failed');
+    gl.bindBuffer(gl.ARRAY_BUFFER, texBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(8), gl.DYNAMIC_DRAW);
+    const aTex = gl.getAttribLocation(program, 'a_tex');
+    gl.enableVertexAttribArray(aTex);
+    gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, 0, 0);
+    const tex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.uniform1i(gl.getUniformLocation(program, 'u_tex'), 0);
+    gl.viewport(0, 0, W, H);
+    glScaler = { canvas, gl, texBuf };
+    return glScaler;
+  } catch (error) {
+    glScalerBroken = true;
+    exportLog(`webgl scaler unavailable (${error instanceof Error ? error.message : error}); using canvas scaling`);
+    return null;
+  }
+}
+
+/**
+ * Free WebGL scaler resources at the end of a render. Called from the render
+ * loop's finally; also resets the per-render "scaler: ..." log latch. The
+ * broken flags persist for the session by design.
+ */
+export function releaseFrameScaler(): void {
+  loggedScaler = null;
+  if (glScaler) {
+    try {
+      glScaler.gl.getExtension('WEBGL_lose_context')?.loseContext();
+    } catch { /* context already lost */ }
+    glScaler = null;
+  }
+}
+
+/** Scale/crop via the WebGL quad; null means fall through to 2D canvas. */
+function scaleFrameGl(
+  frame: VideoFrame,
+  timestamp: number,
+  duration: number,
+  W: number,
+  H: number,
+): VideoFrame | null {
+  const s = getGlScaler(W, H);
+  if (!s) return null;
+  try {
+    const { gl } = s;
+    const vw = frame.displayWidth;
+    const vh = frame.displayHeight;
+    // Same cover-crop math as the bitmap rung, expressed as texcoords.
+    const scale = Math.max(W / vw, H / vh);
+    const sw = Math.min(vw, Math.round(W / scale));
+    const sh = Math.min(vh, Math.round(H / scale));
+    const sx = Math.floor((vw - sw) / 2);
+    const sy = Math.floor((vh - sh) / 2);
+    // No UNPACK_FLIP_Y_WEBGL: the uploaded image keeps its top row at v=0, so
+    // top-of-crop texcoords go on the TOP (y=+1) vertices — the flipped-v quad
+    // renders upright (verified programmatically by the e2e orientation check).
+    const u0 = sx / vw;
+    const u1 = (sx + sw) / vw;
+    const vTop = sy / vh;
+    const vBot = (sy + sh) / vh;
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame as unknown as TexImageSource);
+    gl.bindBuffer(gl.ARRAY_BUFFER, s.texBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      u0, vBot, u1, vBot, // bottom vertices sample bottom of crop
+      u0, vTop, u1, vTop, // top vertices sample top of crop
+    ]), gl.DYNAMIC_DRAW);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    if (gl.getError() !== gl.NO_ERROR || gl.isContextLost()) {
+      throw new Error('gl error during frame scale');
+    }
+    return new VideoFrame(s.canvas, { timestamp, duration });
+  } catch (error) {
+    glScalerBroken = true;
+    exportLog(`webgl scaler failed (${error instanceof Error ? error.message : error}); using canvas scaling`);
+    releaseFrameScaler();
+    return null;
+  }
+}
+
 async function scaleFrame(
   frame: VideoFrame,
   timestamp: number,
@@ -225,7 +400,8 @@ async function scaleFrame(
   const vh = frame.displayHeight;
   const W = canvas.width;
   const H = canvas.height;
-  if (!bitmapResizeBroken && typeof createImageBitmap === 'function') {
+  const skipBitmapForTest = scalerOverride() === 'webgl';
+  if (!skipBitmapForTest && !bitmapResizeBroken && typeof createImageBitmap === 'function') {
     try {
       // Cover semantics: crop the centered source rect whose aspect matches
       // the output, then resize — one GPU op instead of draw + readback.
@@ -241,6 +417,7 @@ async function scaleFrame(
       });
       try {
         if (bitmap.width === W && bitmap.height === H) {
+          logScaler('bitmap-resize');
           return new VideoFrame(bitmap, { timestamp, duration });
         }
         // Engine ignored the resize options — fall through to canvas.
@@ -254,6 +431,13 @@ async function scaleFrame(
       exportLog('bitmap resize failed; using canvas scaling');
     }
   }
+  // Middle rung: WebGL textured-quad scale (GPU, no 33MP 2D readback).
+  const glFrame = scaleFrameGl(frame, timestamp, duration, W, H);
+  if (glFrame) {
+    logScaler('webgl');
+    return glFrame;
+  }
+  logScaler('canvas2d');
   drawCover(ctx, frame, vw, vh, W, H);
   return new VideoFrame(canvas, { timestamp, duration });
 }
@@ -1041,6 +1225,7 @@ async function renderVideoAttempt(
     if (!state.frames) throw new Error('no frames encoded');
     muxer.finalize();
   } finally {
+    releaseFrameScaler();
     try {
       if (encoder.state !== 'closed') encoder.close();
     } catch {

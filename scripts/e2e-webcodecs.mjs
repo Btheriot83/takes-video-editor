@@ -8,7 +8,7 @@
 // Run: node scripts/e2e-webcodecs.mjs http://localhost:PORT/
 import { chromium } from 'playwright-core';
 import fs from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 
 const BASE = process.argv[2] || 'http://localhost:4173/';
 const OUT = 'scripts/e2e-out';
@@ -43,6 +43,11 @@ page.on('pageerror', (error) => errors.push(String(error)));
 
 const url = new URL(BASE);
 url.searchParams.set('wcodec', 'vp09.00.51.08');
+// SCALER=webgl proves the WebGL middle rung: ?scaler=webgl makes scaleFrame
+// skip the createImageBitmap rung for this page load (same test-only query
+// param pattern as ?wcodec).
+const forcedScaler = process.env.SCALER || '';
+if (forcedScaler) url.searchParams.set('scaler', forcedScaler);
 await page.goto(url.toString(), { waitUntil: 'load' });
 await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
 const record = page.getByRole('button', { name: 'Hold to record' });
@@ -161,8 +166,38 @@ if (!(completeness >= 0.95)) {
   throw new Error(`frame-complete capture failed: ${exportedFrames}/${sourceFrames} source frames (${(completeness * 100).toFixed(1)}%)`);
 }
 
+// --- orientation check: prove the scaler did not vertically flip frames ---
+// Extract the same-numbered frame from clip 1's source and the export, scale
+// both to a common size, then compare the export against the source upright
+// and vertically flipped. A correct scaler must match the upright source
+// better than the flipped one (the fake-camera pattern is not vertically
+// symmetric), regardless of which scaler rung produced the frames.
+const ssimAgainst = (flip) => {
+  const res = spawnSync('ffmpeg', [
+    '-v', 'info',
+    '-i', output, '-i', `${OUT}/webcodecs-src-0.webm`,
+    '-lavfi',
+    `[0:v]select=eq(n\\,10),scale=270:480,format=gray[a];` +
+    `[1:v]select=eq(n\\,10),scale=270:480,format=gray${flip ? ',vflip' : ''}[b];[a][b]ssim`,
+    '-f', 'null', '-',
+  ], { encoding: 'utf8' });
+  const match = res.stderr.match(/SSIM.*All:([\d.]+)/);
+  if (!match) throw new Error(`ssim probe failed: ${res.stderr.slice(-400)}`);
+  return Number(match[1]);
+};
+const ssimUpright = ssimAgainst(false);
+const ssimFlipped = ssimAgainst(true);
+if (!(ssimUpright > ssimFlipped)) {
+  throw new Error(`orientation check failed: export matches vflipped source better (upright=${ssimUpright} flipped=${ssimFlipped})`);
+}
+const scalerLog = exportLogs.find((l) => l.includes('scaler:')) || null;
+if (forcedScaler === 'webgl' && !exportLogs.some((l) => l.includes('scaler: webgl'))) {
+  throw new Error(`SCALER=webgl run did not engage the WebGL scaler (saw: ${scalerLog})`);
+}
+
 console.log(JSON.stringify({
   clipCount, output, bytes: fs.statSync(output).size, usedWebCodecs, fellBack, decoderClips, elementClips,
+  forcedScaler, scalerLog, ssimUpright, ssimFlipped,
   video: { width: video.width, height: video.height, duration: videoDur, frames: exportedFrames },
   audio: { codec: audio.codec_name, duration: audioDur },
   avSkew, moovAt, mdatAt, sourceFrames, completeness,
