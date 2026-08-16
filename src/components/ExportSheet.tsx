@@ -25,6 +25,7 @@ export default function ExportSheet({ onClose, quality, onQualityChange }: {
   const [handoffNotice, setHandoffNotice] = useState<string | null>(null);
   const [exportMode, setExportMode] = useState<'native' | 'remuxed' | 'transcoded' | null>(null);
   const resultRef = useRef<Blob | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const filenameRef = useRef(`take-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.mp4`);
   const filename = filenameRef.current;
@@ -32,28 +33,54 @@ export default function ExportSheet({ onClose, quality, onQualityChange }: {
   const start = useCallback(async () => {
     setPhase('working');
     setError(null);
+    setProgress(0);
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
-      const res = await exportMp4(clips, getBlob, aspectRatio, quality, (l, p) => { setLabel(l); setProgress(p); });
+      const res = await exportMp4(clips, getBlob, aspectRatio, quality,
+        (l, p) => { setLabel(l); setProgress(p); }, controller.signal);
       resultRef.current = res.blob;
       setExportMode(res.mode);
       setPhase('ready');
     } catch (error: unknown) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        // Cancelled by the user: back to the choose-quality state.
+        setPhase('idle');
+        return;
+      }
       setError(error instanceof Error ? error.message : 'Export failed');
       setPhase('error');
+    } finally {
+      abortRef.current = null;
     }
   }, [aspectRatio, clips, quality]);
 
+  const cancel = useCallback(() => {
+    abortRef.current?.abort();
+  }, []);
+
+  // Closing while an export runs cancels it first, so the sheet never traps
+  // the user behind a running export.
+  const requestClose = useCallback(() => {
+    if (abortRef.current) abortRef.current.abort();
+    onClose();
+  }, [onClose]);
+
+  // An abandoned unmount (parent closed the sheet) must not leave an export
+  // burning CPU in the background.
+  useEffect(() => () => abortRef.current?.abort(), []);
+
   const output = exportDimensions(aspectRatio, quality);
 
-  // The quality decision lives here, where the export starts; Escape closes
-  // the sheet whenever an export is not actively running.
+  // The quality decision lives here, where the export starts; Escape always
+  // closes the sheet, cancelling a running export on the way out.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && phase !== 'working') onClose();
+      if (event.key === 'Escape') requestClose();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onClose, phase]);
+  }, [requestClose]);
 
   const share = async () => {
     if (!resultRef.current) return;
@@ -75,18 +102,16 @@ export default function ExportSheet({ onClose, quality, onQualityChange }: {
 
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center">
-      <div className="absolute inset-0 bg-black/70" onClick={phase !== 'working' ? onClose : undefined} />
+      <div className="absolute inset-0 bg-black/70" onClick={requestClose} />
       <div role="dialog" aria-modal="true" aria-labelledby="export-title"
         className="relative w-full sm:max-w-sm bg-neutral-900 rounded-t-2xl sm:rounded-2xl border border-white/10 p-5 pb-[max(env(safe-area-inset-bottom),1.25rem)]">
         <div className="flex items-center justify-between mb-4">
           <h2 id="export-title" className="font-semibold">Export video</h2>
-          {phase !== 'working' && (
-            <button onClick={onClose}
-              className="-m-2 flex h-11 w-11 items-center justify-center rounded-lg active:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
-              aria-label="Close">
-              <X size={18} />
-            </button>
-          )}
+          <button onClick={requestClose}
+            className="-m-2 flex h-11 w-11 items-center justify-center rounded-lg active:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+            aria-label="Close">
+            <X size={18} />
+          </button>
         </div>
 
         <div className="text-sm text-white/60 mb-4 space-y-1">
@@ -136,6 +161,10 @@ export default function ExportSheet({ onClose, quality, onQualityChange }: {
               <span>{label}…</span><span>{Math.round(progress * 100)}%</span>
             </div>
             <p className="mt-3 text-[11px] text-white/60">Keep this tab open until the export finishes.</p>
+            <button onClick={cancel}
+              className="mt-3 w-full bg-white/10 font-medium py-3 rounded-xl active:scale-[0.98] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
+              Cancel export
+            </button>
           </div>
         )}
 

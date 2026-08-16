@@ -3,20 +3,28 @@ import { clipLen } from '../types/clip';
 import type { Clip, ExportQuality } from '../types/clip';
 
 /**
- * WebCodecs render path: decode each clip in an offscreen <video>, capture the
- * real presented frames via requestVideoFrameCallback, scale/crop them on an
- * OffscreenCanvas and hand them to a (preferably hardware) VideoEncoder. The
- * encoded chunks are muxed into a video-only MP4 with mp4-muxer; the caller
- * adds the AAC audio track afterwards.
+ * WebCodecs render path: decode each clip in an offscreen <video>, step it
+ * frame by frame (paused seeks + requestVideoFrameCallback), draw each
+ * presented frame onto an OffscreenCanvas and hand it to a (preferably
+ * hardware) VideoEncoder. The encoded chunks are muxed into a video-only MP4
+ * with mp4-muxer; the caller adds the AAC audio track afterwards.
  *
  * This exists because single-threaded wasm x264 cannot finish a 2160x3840
  * encode on real phones/laptops, and the pthread core deadlocks in Chrome.
  * Hardware encoders finish the same export in roughly real time.
  *
+ * Capture is deterministic, not realtime: earlier realtime playback capture
+ * silently dropped 28-52% of frames on slow machines because rVFC only fires
+ * for frames the compositor managed to present. Seek-stepping presents every
+ * source frame exactly once regardless of machine speed.
+ *
  * Frame timing is preserved exactly as presented (VFR): each frame keeps its
- * mediaTime relative to the clip's trim-in, offset by the accumulated length
- * of the preceding clips, so concatenation is continuous and nothing is
- * snapped onto a fixed frame grid (that grid caused the old stutter bug).
+ * mediaTime relative to the clip's FIRST CAPTURED frame, offset by the
+ * accumulated length of the preceding clips. Anchoring to the first captured
+ * frame (rather than trimIn, or a whole-track muxer offset) keeps every clip's
+ * video aligned with its ffmpeg-encoded audio, which is likewise anchored to
+ * its own start (asetpts=PTS-STARTPTS) — imports with nonzero start_time would
+ * otherwise carry a constant A/V skew.
  */
 
 export interface WebCodecsPlan {
@@ -26,10 +34,12 @@ export interface WebCodecsPlan {
 
 // Test-only escape hatch: headless Chromium builds used by the e2e suite ship
 // no H.264 encoder, so the suite can force a codec they do support (vp9) to
-// exercise this whole pipeline. Real users never have this key set.
+// exercise this whole pipeline. It must be requested explicitly per page load
+// via the ?wcodec= query parameter; persistent state (localStorage) is
+// deliberately NOT honored so the override cannot linger for real users.
 function codecOverride(): string | null {
   try {
-    return localStorage.getItem('takes:webcodecs-codec');
+    return new URLSearchParams(window.location.search).get('wcodec');
   } catch {
     return null;
   }
@@ -43,6 +53,32 @@ function muxerCodecFor(codec: string): WebCodecsPlan['muxerCodec'] | null {
   return null;
 }
 
+/**
+ * Smallest H.264 level that satisfies both the frame-size (MaxFS) and
+ * macroblock-rate (MaxMBPS) limits of the spec for this output. A hardcoded
+ * level 5.1 was previously used for 4K, which is out of spec above 30fps at
+ * 2160x3840 (32,640 MBs x 60fps far exceeds level 5.1's 983,040 MB/s) — and
+ * isConfigSupported cannot flag that unless a framerate is supplied.
+ */
+export function avcLevelFor(width: number, height: number, fps: number): number {
+  const mbs = Math.ceil(width / 16) * Math.ceil(height / 16);
+  const mbps = mbs * Math.max(1, fps);
+  // [level byte, MaxFS (MBs), MaxMBPS (MBs/s)] — H.264 Annex A, Table A-1.
+  const levels: Array<[number, number, number]> = [
+    [0x28, 8192, 245_760], // 4.0
+    [0x2a, 8704, 522_240], // 4.2
+    [0x32, 22_080, 589_824], // 5.0
+    [0x33, 36_864, 983_040], // 5.1
+    [0x34, 36_864, 2_073_600], // 5.2
+    [0x3c, 139_264, 4_177_920], // 6.0
+    [0x3d, 139_264, 8_355_840], // 6.1
+  ];
+  for (const [level, maxFs, maxMbps] of levels) {
+    if (mbs <= maxFs && mbps <= maxMbps) return level;
+  }
+  return 0x3d;
+}
+
 const hasWebCodecsPrereqs = () =>
   typeof VideoEncoder !== 'undefined' &&
   typeof VideoFrame !== 'undefined' &&
@@ -53,23 +89,30 @@ const hasWebCodecsPrereqs = () =>
 /**
  * Decide whether the fast encode path is usable for this output. Returns the
  * supported encoder configuration, or null to use the wasm pipeline.
+ * `maxSourceFps` is the highest source frame rate among the clips; it selects
+ * a spec-conformant H.264 level and is passed to the encoder as `framerate` so
+ * isConfigSupported can veto rates the hardware cannot sustain.
  */
 export async function planWebCodecsEncode(
   width: number,
   height: number,
   quality: ExportQuality,
+  maxSourceFps = 30,
 ): Promise<WebCodecsPlan | null> {
   if (!hasWebCodecsPrereqs()) return null;
   const bitrate = quality === '4K' ? 35_000_000 : 14_000_000;
-  const base: VideoEncoderConfig = { codec: '', width, height, bitrate };
+  const framerate = Math.min(240, Math.max(1, Math.round(maxSourceFps)));
+  const base: VideoEncoderConfig = { codec: '', width, height, bitrate, framerate };
 
   const override = codecOverride();
   const candidates: VideoEncoderConfig[] = [];
   if (override) {
     candidates.push({ ...base, codec: override });
   } else {
-    // High profile; level 5.1 covers 2160x3840@30, level 4.0 covers 1080x1920.
-    const codec = quality === '4K' ? 'avc1.640033' : 'avc1.640028';
+    // High profile; level derived from output size and source frame rate
+    // (e.g. 5.1 covers 2160x3840@30, 5.2 is required above 30fps at 4K).
+    const level = avcLevelFor(width, height, framerate);
+    const codec = `avc1.6400${level.toString(16).padStart(2, '0').toUpperCase()}`;
     const avc = { avc: { format: 'avc' as const } };
     // Prefer real hardware; accept the platform's native software encoder as a
     // second choice (still native code, far faster than wasm x264).
@@ -100,6 +143,8 @@ interface RenderState {
   lastActivity: number;
 }
 
+const abortError = () => new DOMException('Export cancelled', 'AbortError');
+
 function drawCover(
   ctx: OffscreenCanvasRenderingContext2D,
   video: HTMLVideoElement,
@@ -117,27 +162,45 @@ function drawCover(
   ctx.drawImage(video, (width - dw) / 2, (height - dh) / 2, dw, dh);
 }
 
-function waitForQueueDrain(encoder: VideoEncoder, state: RenderState): Promise<void> {
-  return new Promise((resolve) => {
+function waitForQueueDrain(
+  encoder: VideoEncoder,
+  state: RenderState,
+  signal?: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
     const check = () => {
       state.lastActivity = Date.now();
-      if (encoder.state !== 'configured' || encoder.encodeQueueSize <= 2) resolve();
+      if (signal?.aborted) reject(abortError());
+      else if (encoder.state !== 'configured' || encoder.encodeQueueSize <= 2) resolve();
       else setTimeout(check, 40);
     };
     check();
   });
 }
 
-function seekTo(video: HTMLVideoElement, t: number): Promise<void> {
+/**
+ * Seek the paused video to `target` and resolve with the mediaTime of the
+ * frame the seek presented, or null if no (new) frame was presented within the
+ * timeout. rVFC is registered before the seek starts so the presentation
+ * cannot be missed; a seek that lands inside the currently-presented frame
+ * re-presents it in Chrome, but the timeout covers engines that skip that.
+ */
+function seekPresent(video: HTMLVideoElement, target: number, timeoutMs: number): Promise<number | null> {
   return new Promise((resolve) => {
-    // Best effort: MediaRecorder webm sometimes seeks unreliably; a failed or
-    // ignored seek is fine because frames before trimIn are filtered out.
-    const timer = setTimeout(resolve, 1500);
-    video.onseeked = () => {
+    let done = false;
+    const handle = video.requestVideoFrameCallback((_now, meta) => {
+      if (done) return;
+      done = true;
       clearTimeout(timer);
-      resolve();
-    };
-    video.currentTime = t;
+      resolve(meta.mediaTime);
+    });
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      video.cancelVideoFrameCallback(handle);
+      resolve(null);
+    }, timeoutMs);
+    video.currentTime = target;
   });
 }
 
@@ -150,10 +213,12 @@ async function captureClip(
   encoder: VideoEncoder,
   state: RenderState,
   onSeconds: (s: number) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const url = URL.createObjectURL(blob);
   const len = clipLen(clip);
   const base = state.offsetUs;
+  const EPS = 1e-4;
   try {
     video.src = url;
     await new Promise<void>((resolve, reject) => {
@@ -167,104 +232,75 @@ async function captureClip(
         reject(new Error('clip failed to decode'));
       };
     });
-    if (clip.trimIn > 0.25) await seekTo(video, clip.trimIn);
+    video.pause();
 
+    // Frame-complete capture: with the video paused, seek from frame to frame
+    // and encode every presented frame in [trimIn, trimOut) exactly once. The
+    // step starts small and adapts to half of the smallest observed frame
+    // interval, so VFR sources cannot be under-sampled; a step that lands on
+    // the same frame simply advances further. Every source frame is therefore
+    // captured regardless of how slow drawing/encoding is on this machine.
     let captured = 0;
-    let firstPresented = -1;
-    let lastPresented = -1;
-    let lastRateAdjustSpan = 0;
-    video.playbackRate = 1;
-    await new Promise<void>((resolve, reject) => {
-      let stopped = false;
-      const finish = () => {
-        if (stopped) return;
-        stopped = true;
-        clearInterval(watchdog);
-        video.pause();
-        resolve();
-      };
-      const fail = (error: unknown) => {
-        if (stopped) return;
-        stopped = true;
-        clearInterval(watchdog);
-        video.pause();
-        reject(error instanceof Error ? error : new Error(String(error)));
-      };
-      // If decode or encode stops making progress (background throttling,
-      // stuck pipeline), bail out so the caller can fall back to wasm.
+    let firstT = -1; // clip-local anchor: mediaTime of the first captured frame
+    let lastT = -1;
+    let minDelta = Infinity;
+    const end = Math.min(clip.trimOut, Number.isFinite(video.duration) ? video.duration : clip.trimOut);
+
+    let t = await seekPresent(video, Math.max(0, clip.trimIn), 3000);
+    if (t === null) t = await seekPresent(video, Math.max(0, clip.trimIn) + 0.001, 3000);
+    if (t === null) throw new Error('could not present first frame');
+
+    for (;;) {
+      if (signal?.aborted) throw abortError();
+      if (state.error) throw state.error instanceof Error ? state.error : new Error(String(state.error));
       state.lastActivity = Date.now();
-      const watchdog = setInterval(() => {
-        if (Date.now() - state.lastActivity > 20_000) fail(new Error('webcodecs render stalled'));
-        if (state.error) fail(state.error);
-      }, 2_000);
 
-      const onFrame = (_now: number, meta: VideoFrameCallbackMetadata) => {
-        if (stopped) return;
-        state.lastActivity = Date.now();
-        if (state.error) {
-          fail(state.error);
-          return;
-        }
-        const t = meta.mediaTime;
-        if (t >= clip.trimOut - 1e-4) {
-          finish();
-          return;
-        }
-        if (t >= clip.trimIn - 1e-4) {
-          try {
-            const rel = Math.min(len, Math.max(0, t - clip.trimIn));
-            let ts = base + Math.round(rel * 1_000_000);
-            // Timestamps must be strictly increasing for the muxer.
-            if (ts <= state.lastTs) ts = state.lastTs + 1_000;
-            state.lastTs = ts;
-            drawCover(ctx, video, canvas.width, canvas.height);
-            const frame = new VideoFrame(canvas, { timestamp: ts });
-            const keyFrame = state.frames === 0 || ts - state.lastKeyTs >= 2_000_000;
-            if (keyFrame) state.lastKeyTs = ts;
-            encoder.encode(frame, { keyFrame });
-            frame.close();
-            state.frames += 1;
-            captured += 1;
-            if (firstPresented < 0) firstPresented = meta.presentedFrames;
-            lastPresented = meta.presentedFrames;
-            // If realtime playback outruns capture+encode, frames never reach
-            // rVFC. Slowing the offscreen playback widens the per-frame budget
-            // (mediaTime timestamps are unaffected, so output timing stays
-            // identical); the export just takes a little longer.
-            const span = lastPresented - firstPresented + 1;
-            if (span - lastRateAdjustSpan >= 10 && captured / span < 0.7 && video.playbackRate > 0.3) {
-              lastRateAdjustSpan = span;
-              video.playbackRate = Math.max(0.25, video.playbackRate / 2);
-            }
-            onSeconds(rel);
-            if (encoder.encodeQueueSize > 4) {
-              // Encoder is behind the realtime decode; pause until it drains.
-              video.pause();
-              void waitForQueueDrain(encoder, state).then(() => {
-                if (!stopped) void video.play().catch(fail);
-              });
-            }
-          } catch (error) {
-            fail(error);
-            return;
-          }
-        }
-        video.requestVideoFrameCallback(onFrame);
-      };
+      if (t >= clip.trimOut - EPS) break;
+      if (t > lastT + 1e-6) {
+        // capture this frame
+        if (firstT >= 0 && t - lastT > 0) minDelta = Math.min(minDelta, t - lastT);
+        if (firstT < 0) firstT = t;
+        const rel = Math.min(len, Math.max(0, t - firstT));
+        let ts = base + Math.round(rel * 1_000_000);
+        // Timestamps must be strictly increasing for the muxer.
+        if (ts <= state.lastTs) ts = state.lastTs + 1_000;
+        state.lastTs = ts;
+        drawCover(ctx, video, canvas.width, canvas.height);
+        const frame = new VideoFrame(canvas, { timestamp: ts });
+        const keyFrame = state.frames === 0 || ts - state.lastKeyTs >= 2_000_000;
+        if (keyFrame) state.lastKeyTs = ts;
+        encoder.encode(frame, { keyFrame });
+        frame.close();
+        state.frames += 1;
+        captured += 1;
+        lastT = t;
+        onSeconds(rel);
+        if (encoder.encodeQueueSize > 4) await waitForQueueDrain(encoder, state, signal);
+      }
 
-      video.onended = finish;
-      video.onerror = () => fail(new Error('clip playback failed'));
-      video.requestVideoFrameCallback(onFrame);
-      void video.play().catch(fail);
-    });
-    if (!captured) throw new Error('no frames captured from clip');
-    // rVFC only reports frames the browser actually presented; when the page
-    // cannot keep up with realtime playback some source frames are skipped.
-    // Timing stays correct (VFR), but log the loss for diagnostics.
-    const span = lastPresented - firstPresented + 1;
-    if (span > captured) {
-      console.log(`[export] webcodecs capture skipped ${span - captured}/${span} presented frames`);
+      // advance to the next distinct frame
+      const from = Math.max(lastT, t);
+      const step = Number.isFinite(minDelta) ? Math.max(1 / 240, minDelta / 2) : 1 / 120;
+      let target = from + step;
+      let next: number | null = null;
+      let attempts = 0;
+      while (attempts < 90 && target < end + step) {
+        if (signal?.aborted) throw abortError();
+        next = await seekPresent(video, target, 1000);
+        if (next !== null && next > from + 1e-6) break;
+        next = null;
+        target += step;
+        attempts += 1;
+      }
+      if (next === null) break; // no further frame before trimOut / end of media
+      t = next;
     }
+    if (!captured) throw new Error('no frames captured from clip');
+    console.log(
+      `[export] webcodecs captured ${captured} frames (${(len).toFixed(2)}s clip, min frame delta ${
+        Number.isFinite(minDelta) ? (minDelta * 1000).toFixed(1) : 'n/a'
+      }ms)`,
+    );
   } finally {
     video.onended = null;
     video.onerror = null;
@@ -279,6 +315,8 @@ async function captureClip(
 /**
  * Render all clips to a video-only MP4 (bytes) using the given encoder plan.
  * Throws on any failure; the caller is expected to fall back to wasm.
+ * Aborting the signal stops the capture loop, closes the encoder and rejects
+ * with an AbortError DOMException.
  */
 export async function renderVideoWebCodecs(
   clips: Clip[],
@@ -287,14 +325,18 @@ export async function renderVideoWebCodecs(
   height: number,
   plan: WebCodecsPlan,
   onProgress?: (p: number) => void,
+  signal?: AbortSignal,
 ): Promise<Uint8Array> {
+  if (signal?.aborted) throw abortError();
   const total = clips.reduce((s, c) => s + clipLen(c), 0) || 1;
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
     video: { codec: plan.muxerCodec, width, height },
     // The final ffmpeg "-c copy" remux applies +faststart; keep muxing cheap.
+    // Timestamps are anchored per clip (first captured frame = clip offset),
+    // so the first sample lands at exactly 0 and no muxer-level offset — which
+    // would shift video against the separately-encoded audio — is needed.
     fastStart: false,
-    firstTimestampBehavior: 'offset',
   });
 
   const state: RenderState = {
@@ -334,10 +376,10 @@ export async function renderVideoWebCodecs(
     for (let i = 0; i < clips.length; i++) {
       const done = clips.slice(0, i).reduce((s, c) => s + clipLen(c), 0);
       await captureClip(clips[i], blobs[i], video, canvas, ctx, encoder, state, (s) =>
-        onProgress?.(Math.min(0.99, (done + s) / total)),
-      );
+        onProgress?.(Math.min(0.99, (done + s) / total)), signal);
     }
     await encoder.flush();
+    if (signal?.aborted) throw abortError();
     if (state.error) throw state.error instanceof Error ? state.error : new Error(String(state.error));
     if (!state.frames) throw new Error('no frames encoded');
     muxer.finalize();
@@ -349,5 +391,6 @@ export async function renderVideoWebCodecs(
     }
   }
   onProgress?.(1);
+  console.log(`[export] webcodecs total frames encoded: ${state.frames}`);
   return new Uint8Array(muxer.target.buffer);
 }
