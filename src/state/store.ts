@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { totalDuration, clipLen, DEFAULT_ASPECT_RATIO, DEFAULT_CAPTURE_QUALITY } from '../types/clip';
 import type { AspectRatio, CaptureQuality, Clip, ClipSource, ExportQuality } from '../types/clip';
-import { History, trimClip, splitClip, moveClip, duplicateClip, uid } from '../lib/editor';
+import { clampTimelineTime, History, trimClip, splitClip, moveClip, duplicateClip, uid } from '../lib/editor';
 import {
   saveProject, loadProject, saveBlob, getBlob, deleteBlob, recRecover, recFinalize, gcBlobs, clearProject,
 } from '../lib/db';
@@ -193,7 +193,7 @@ export const useStore = create<State>((set, get) => ({
 
   select: (id) => set({ selectedId: id }),
   setScreen: (s) => set({ screen: s }),
-  setPlayhead: (t) => set({ playhead: t }),
+  setPlayhead: (t) => set({ playhead: clampTimelineTime(get().clips, t) }),
   setAspectRatio: (aspectRatio) => {
     set({ aspectRatio });
     persist(get().clips, aspectRatio, get().captureQuality);
@@ -210,11 +210,17 @@ export const useStore = create<State>((set, get) => ({
   },
 
   commit: (next, selectId) => {
-    history.push(get().clips);
+    const current = get();
+    const requestedSelection = selectId !== undefined ? selectId : current.selectedId;
+    const selectedId = next.some((clip) => clip.id === requestedSelection)
+      ? requestedSelection
+      : next[0]?.id ?? null;
+    history.push(current.clips);
     set({
       clips: next,
       total: totalDuration(next),
-      selectedId: selectId !== undefined ? selectId : get().selectedId,
+      selectedId,
+      playhead: clampTimelineTime(next, current.playhead),
       canUndo: history.canUndo,
       canRedo: history.canRedo,
     });
@@ -224,13 +230,35 @@ export const useStore = create<State>((set, get) => ({
   undo: () => {
     const prev = history.undo(get().clips);
     if (!prev) return;
-    set({ clips: prev, total: totalDuration(prev), canUndo: history.canUndo, canRedo: history.canRedo });
+    const current = get();
+    const selectedId = prev.some((clip) => clip.id === current.selectedId)
+      ? current.selectedId
+      : prev[0]?.id ?? null;
+    set({
+      clips: prev,
+      total: totalDuration(prev),
+      selectedId,
+      playhead: clampTimelineTime(prev, current.playhead),
+      canUndo: history.canUndo,
+      canRedo: history.canRedo,
+    });
     persist(prev, get().aspectRatio, get().captureQuality);
   },
   redo: () => {
     const next = history.redo(get().clips);
     if (!next) return;
-    set({ clips: next, total: totalDuration(next), canUndo: history.canUndo, canRedo: history.canRedo });
+    const current = get();
+    const selectedId = next.some((clip) => clip.id === current.selectedId)
+      ? current.selectedId
+      : next[0]?.id ?? null;
+    set({
+      clips: next,
+      total: totalDuration(next),
+      selectedId,
+      playhead: clampTimelineTime(next, current.playhead),
+      canUndo: history.canUndo,
+      canRedo: history.canRedo,
+    });
     persist(next, get().aspectRatio, get().captureQuality);
   },
 

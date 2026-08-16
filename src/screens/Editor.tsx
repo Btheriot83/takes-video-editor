@@ -7,13 +7,10 @@ import { useStore } from '../state/store';
 import { ASPECT_RATIOS, clipLen, totalDuration, fmtTime, FRAME, exportDimensions, isUltraHDCapture } from '../types/clip';
 import type { Clip, ExportQuality } from '../types/clip';
 import { getBlob } from '../lib/db';
-import { locate, clipStart } from '../lib/editor';
+import { clipStart, locate, timelineClipWidth, timelinePlayheadX } from '../lib/editor';
 import ExportSheet from '../components/ExportSheet';
 
-const PX_PER_SEC = 44;
-// How far before a clip boundary the preloaded slot starts playing muted, so
-// the swap at the boundary is a mute/visibility flip instead of a cold play().
-const PREROLL_SEC = 0.1;
+const TIMELINE_HORIZONTAL_PADDING = 12;
 type VideoSlot = 0 | 1;
 
 function waitForMedia(v: HTMLVideoElement, timeoutMs = 1800): Promise<void> {
@@ -58,13 +55,12 @@ export default function Editor() {
   const activeIndexRef = useRef(0);
   const slotIndexRef = useRef<[number | null, number | null]>([null, null]);
   const handoffRef = useRef(false);
-  // Index of the clip currently pre-rolling (playing muted in the spare slot
-  // just before its boundary), or null when no pre-roll is in flight.
-  const prerollForRef = useRef<number | null>(null);
   const lastUiUpdateRef = useRef(0);
   const [playing, setPlaying] = useState(false);
   const [activeSlot, setActiveSlot] = useState<VideoSlot>(0);
   const [handoffGapMs, setHandoffGapMs] = useState<number | null>(null);
+  const [handoffStartOffsetMs, setHandoffStartOffsetMs] = useState<number | null>(null);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   // Export quality defaults to the highest source class: 4K only when a clip
   // actually carries 4K-class frames, else 1080p so all-HD projects keep the
@@ -147,17 +143,14 @@ export default function Editor() {
       const v = videoRefs.current[slot];
       if (!v || activeSlotRef.current === slot || slotIndexRef.current[slot] !== nextIndex) return;
       // Prime the decoder: a muted play()+pause() spins up the decode pipeline
-      // now, so the boundary swap doesn't pay that cost. Skip the pause if a
-      // pre-roll grabbed this slot while the play() promise was in flight, and
-      // bail entirely if a scrub made this slot active in the meantime.
+      // now, so the boundary swap doesn't pay that cost. Bail if a handoff or
+      // scrub repurposed this slot while the play() promise was in flight.
       try {
         v.muted = true;
         await v.play();
-        if (activeSlotRef.current === slot) return;
-        if (prerollForRef.current !== nextIndex) {
-          v.pause();
-          await seekMedia(v, clips[nextIndex].trimIn);
-        }
+        if (activeSlotRef.current === slot || slotIndexRef.current[slot] !== nextIndex) return;
+        v.pause();
+        await seekMedia(v, clips[nextIndex].trimIn);
       } catch { /* autoplay refused or load interrupted; handoff still works, just colder */ }
     })();
   }, [clips, loadSlot]);
@@ -165,20 +158,22 @@ export default function Editor() {
   // Position one video while the second slot preloads the adjacent clip.
   const syncVideo = useCallback(async (t: number, autoplay = false) => {
     const loc = locate(clips, t);
-    if (!loc) return;
+    if (!loc) return false;
     const loadedSlot = slotIndexRef.current.findIndex((index) => index === loc.index);
     const slot = (loadedSlot >= 0 ? loadedSlot : activeSlotRef.current) as VideoSlot;
-    prerollForRef.current = null;
     videoRefs.current.forEach((video) => video?.pause());
-    if (!await loadSlot(slot, loc.index, loc.offset)) return;
+    if (!await loadSlot(slot, loc.index, loc.offset)) return false;
     activeSlotRef.current = slot;
     activeIndexRef.current = loc.index;
     setActiveSlot(slot);
     videoRefs.current.forEach((video, index) => { if (video) video.muted = index !== slot; });
     if (autoplay) {
-      try { await videoRefs.current[slot]?.play(); } catch { return; }
+      const video = videoRefs.current[slot];
+      if (!video) return false;
+      try { await video.play(); } catch { return false; }
     }
     preloadAfter(loc.index);
+    return true;
   }, [clips, loadSlot, preloadAfter]);
 
   // External scrubs/selections seek the media element. Native playback owns
@@ -196,7 +191,6 @@ export default function Editor() {
   // the export's own 4K decoder+encoder need on iOS.
   const parkPreviews = useCallback(() => {
     setPlaying(false);
-    prerollForRef.current = null;
     videoRefs.current.forEach((video) => {
       if (!video) return;
       video.pause();
@@ -209,23 +203,6 @@ export default function Editor() {
   const resumePreviews = useCallback(() => {
     void syncVideo(playheadRef.current);
   }, [syncVideo]);
-
-  // Start the preloaded slot playing muted shortly before the boundary so the
-  // handoff itself is just a mute/visibility flip.
-  const preroll = useCallback((nextIndex: number) => {
-    if (prerollForRef.current === nextIndex || handoffRef.current) return;
-    const slot = (activeSlotRef.current === 0 ? 1 : 0) as VideoSlot;
-    const incoming = videoRefs.current[slot];
-    if (!incoming || slotIndexRef.current[slot] !== nextIndex) return;
-    if (incoming.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return;
-    prerollForRef.current = nextIndex;
-    incoming.muted = true;
-    if (incoming.paused) {
-      incoming.play().catch(() => {
-        if (prerollForRef.current === nextIndex) prerollForRef.current = null;
-      });
-    }
-  }, []);
 
   const handoff = useCallback(async (fromIndex: number) => {
     if (handoffRef.current) return;
@@ -242,14 +219,28 @@ export default function Editor() {
       && incoming.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
     if (!warm) {
       // Cold path (preload failed or was interrupted): load and seek now.
-      await loadSlot(toSlot, nextIndex, 0);
+      const loaded = await loadSlot(toSlot, nextIndex, 0);
+      if (!loaded) {
+        videoRefs.current[fromSlot]?.pause();
+        handoffRef.current = false;
+        setPlaying(false);
+        setPlaybackError('The next clip could not be loaded. Select it in the timeline to retry.');
+        return;
+      }
       incoming = videoRefs.current[toSlot];
     }
-    if (!incoming) { handoffRef.current = false; return; }
+    if (!incoming) {
+      videoRefs.current[fromSlot]?.pause();
+      handoffRef.current = false;
+      setPlaying(false);
+      setPlaybackError('The next clip could not be loaded. Select it in the timeline to retry.');
+      return;
+    }
     const outgoing = videoRefs.current[fromSlot];
-    // Swap synchronously: unmute the (already playing, pre-rolled) incoming
-    // slot first, then silence the outgoing one — a few ms of overlap beats a
-    // few ms of gap.
+    // The spare slot is decoder-primed but parked exactly at trimIn. Swapping
+    // before play() preserves the opening frames instead of hiding the first
+    // 100ms behind a muted pre-roll.
+    setHandoffStartOffsetMs(Math.max(0, (incoming.currentTime - clips[nextIndex].trimIn) * 1000));
     incoming.muted = false;
     if (outgoing) { outgoing.muted = true; outgoing.pause(); }
     activeSlotRef.current = toSlot;
@@ -260,10 +251,11 @@ export default function Editor() {
     try {
       if (incoming.paused) await incoming.play();
       setHandoffGapMs(performance.now() - boundaryStarted);
+      setPlaybackError(null);
     } catch {
       setPlaying(false);
+      setPlaybackError('Playback stopped because the next clip could not start. Tap play to retry.');
     }
-    prerollForRef.current = null;
     handoffRef.current = false;
     preloadAfter(nextIndex);
   }, [clips, loadSlot, preloadAfter, select, setPlayhead]);
@@ -283,9 +275,6 @@ export default function Editor() {
         lastUiUpdateRef.current = now;
         setPlayhead(global);
       }
-      if (index + 1 < clips.length && v.currentTime >= clip.trimOut - PREROLL_SEC) {
-        preroll(index + 1);
-      }
       if (v.currentTime >= clip.trimOut - FRAME / 2) {
         if (index + 1 < clips.length) void handoff(index);
         else {
@@ -299,7 +288,7 @@ export default function Editor() {
     };
     frame = window.requestAnimationFrame(tick);
     return () => window.cancelAnimationFrame(frame);
-  }, [clips, handoff, playing, preroll, setPlayhead]);
+  }, [clips, handoff, playing, setPlayhead]);
 
   // iOS WebKit grants audible playback per media element per user gesture.
   // The spare slot only ever plays muted before a handoff unmutes it, so
@@ -329,20 +318,22 @@ export default function Editor() {
 
   const togglePlay = async () => {
     if (playing) {
-      prerollForRef.current = null;
       videoRefs.current.forEach((video) => video?.pause());
       setPlaying(false);
     } else {
       activateSlotsInGesture();
-      if (playhead >= total - 0.05) setPlayhead(0);
-      await syncVideo(playhead >= total - 0.05 ? 0 : playhead, true);
-      setPlaying(true);
+      const nextPlayhead = playhead >= total - 0.05 ? 0 : playhead;
+      if (nextPlayhead === 0) setPlayhead(0);
+      const started = await syncVideo(nextPlayhead, true);
+      setPlaying(started);
+      setPlaybackError(started ? null : 'This clip could not start. Select another clip or import it again.');
     }
   };
 
   return (
     <div data-editor-playhead={playhead.toFixed(3)} data-editor-active-slot={activeSlot}
       data-last-handoff-gap-ms={handoffGapMs?.toFixed(1) ?? ''}
+      data-last-handoff-start-offset-ms={handoffStartOffsetMs?.toFixed(1) ?? ''}
       className="fixed inset-0 bg-neutral-950 text-white flex flex-col select-none">
       {/* header */}
       <div className="pt-[env(safe-area-inset-top)] px-2 py-1.5 flex items-center justify-between gap-1 border-b border-white/10">
@@ -391,11 +382,16 @@ export default function Editor() {
             </span>
           )}
         </button>
+        {playbackError && (
+          <div role="alert" className="absolute inset-x-4 top-4 z-20 rounded-xl bg-neutral-900/95 px-4 py-3 text-center text-sm shadow-lg">
+            {playbackError}
+          </div>
+        )}
       </div>
 
-      {/* action row — flex-wrap keeps every control on-screen and >=44px at
-          narrow widths (320px): the trim group wraps to a second row instead
-          of clipping off the right edge. */}
+      {/* Primary edits remain stable while trim nudges get an explicit row.
+          The former unlabeled chevrons only changed trimIn, which looked like
+          previous/next navigation and left keyboard users unable to trim out. */}
       <div className="border-t border-white/10">
         <div className="mx-auto flex w-max max-w-full flex-wrap items-center justify-center gap-1 px-2 py-1 min-[360px]:px-3">
           <Action icon={<Scissors size={17} />} label="Split" onClick={splitSelected} disabled={!selected || playing} />
@@ -403,18 +399,40 @@ export default function Editor() {
           <Action icon={<Trash2 size={17} />} label="Delete" onClick={deleteSelected} disabled={!selected} />
           <Action icon={<Plus size={17} />} label="Import" onClick={() => fileRef.current?.click()} disabled={false} />
           {selected && (
-            <div className="flex items-center ml-1 border-l border-white/10 pl-1.5">
-              <button aria-label="Trim in -1 frame"
-                className="flex h-11 w-11 items-center justify-center rounded active:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
-                onClick={() => trimSelected(selected.trimIn - FRAME, selected.trimOut)}>
-                <ChevronLeft size={16} /></button>
-              <span className="text-[11px] tabular-nums text-white/60 w-12 text-center">
+            <div className="flex basis-full items-center justify-center gap-1 border-t border-white/10 pt-1" aria-label="Fine trim controls">
+              <span className="mr-0.5 text-[10px] font-semibold uppercase tracking-wide text-white/50">Start</span>
+              <TrimNudge
+                label="Move clip start earlier by one frame"
+                disabled={selected.trimIn <= 0}
+                onClick={() => trimSelected(selected.trimIn - FRAME, selected.trimOut)}
+              >
+                <ChevronLeft size={16} />
+              </TrimNudge>
+              <TrimNudge
+                label="Move clip start later by one frame"
+                disabled={selected.trimIn >= selected.trimOut - FRAME}
+                onClick={() => trimSelected(selected.trimIn + FRAME, selected.trimOut)}
+              >
+                <ChevronRight size={16} />
+              </TrimNudge>
+              <span className="w-11 text-center text-[11px] tabular-nums text-white/70" aria-label={`${clipLen(selected).toFixed(2)} seconds selected`}>
                 {clipLen(selected).toFixed(2)}s
               </span>
-              <button aria-label="Trim in +1 frame"
-                className="flex h-11 w-11 items-center justify-center rounded active:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
-                onClick={() => trimSelected(selected.trimIn + FRAME, selected.trimOut)}>
-                <ChevronRight size={16} /></button>
+              <span className="ml-0.5 text-[10px] font-semibold uppercase tracking-wide text-white/50">End</span>
+              <TrimNudge
+                label="Move clip end earlier by one frame"
+                disabled={selected.trimOut <= selected.trimIn + FRAME}
+                onClick={() => trimSelected(selected.trimIn, selected.trimOut - FRAME)}
+              >
+                <ChevronLeft size={16} />
+              </TrimNudge>
+              <TrimNudge
+                label="Move clip end later by one frame"
+                disabled={selected.trimOut >= selected.duration}
+                onClick={() => trimSelected(selected.trimIn, selected.trimOut + FRAME)}
+              >
+                <ChevronRight size={16} />
+              </TrimNudge>
             </div>
           )}
         </div>
@@ -428,6 +446,7 @@ export default function Editor() {
         onSelect={(id, offset) => {
           videoRefs.current.forEach((video) => video?.pause());
           setPlaying(false);
+          setPlaybackError(null);
           select(id);
           const nextPlayhead = clipStart(clips, clips.findIndex((c) => c.id === id)) + offset;
           setPlayhead(nextPlayhead);
@@ -464,6 +483,25 @@ function Action({ icon, label, onClick, disabled }: { icon: React.ReactNode; lab
   );
 }
 
+function TrimNudge({ label, disabled, onClick, children }: {
+  label: string;
+  disabled: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      disabled={disabled}
+      onClick={onClick}
+      className="flex h-11 w-11 items-center justify-center rounded-lg active:bg-white/10 disabled:opacity-30 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+    >
+      {children}
+    </button>
+  );
+}
+
 // ── Timeline ────────────────────────────────────────────────────────────────
 
 function Timeline({
@@ -478,102 +516,162 @@ function Timeline({
   selIdx: number;
 }) {
   const stripRef = useRef<HTMLDivElement>(null);
-  const dragState = useRef<{ idx: number; startX: number; mode: 'none' | 'maybe' | 'move'; timer: ReturnType<typeof setTimeout> } | null>(null);
+  const dragState = useRef<{
+    pointerId: number;
+    clipId: string;
+    idx: number;
+    startX: number;
+    startScrollLeft: number;
+    mode: 'maybe' | 'scroll' | 'move';
+    timer: ReturnType<typeof setTimeout>;
+  } | null>(null);
   const [dragIdx, setDragIdx] = useState<number | null>(null);
-  const trimDrag = useRef<{ side: 'in' | 'out'; startX: number; origIn: number; origOut: number } | null>(null);
+  const trimDrag = useRef<{
+    pointerId: number;
+    side: 'in' | 'out';
+    startX: number;
+    origIn: number;
+    origOut: number;
+    secondsPerPixel: number;
+  } | null>(null);
 
-  const width = (c: Clip) => Math.max(48, clipLen(c) * PX_PER_SEC);
+  useEffect(() => () => {
+    if (dragState.current) clearTimeout(dragState.current.timer);
+  }, []);
 
   const onClipPointerDown = (e: React.PointerEvent, idx: number) => {
-    if (trimDrag.current) return;
-    const startX = e.clientX;
+    if (trimDrag.current || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    const strip = stripRef.current;
+    if (!strip) return;
+    const pointerId = e.pointerId;
+    e.currentTarget.setPointerCapture?.(pointerId);
     dragState.current = {
-      idx, startX, mode: 'maybe',
+      pointerId,
+      clipId: clips[idx].id,
+      idx,
+      startX: e.clientX,
+      startScrollLeft: strip.scrollLeft,
+      mode: 'maybe',
       timer: setTimeout(() => {
-        if (dragState.current) { dragState.current.mode = 'move'; setDragIdx(idx); }
+        const current = dragState.current;
+        if (current?.pointerId === pointerId && current.mode === 'maybe') {
+          current.mode = 'move';
+          setDragIdx(current.idx);
+        }
       }, 350),
     };
+  };
 
-    const onMove = (ev: PointerEvent) => {
-      const st = dragState.current;
-      if (!st) return;
-      if (st.mode === 'maybe' && Math.abs(ev.clientX - st.startX) > 8) {
-        clearTimeout(st.timer);
-        dragState.current = null;
+  const onClipPointerMove = (e: React.PointerEvent) => {
+    const state = dragState.current;
+    if (!state || state.pointerId !== e.pointerId) return;
+    const deltaX = e.clientX - state.startX;
+    if (state.mode === 'maybe' && Math.abs(deltaX) > 8) {
+      clearTimeout(state.timer);
+      state.mode = 'scroll';
+    }
+    if (state.mode === 'scroll') {
+      if (stripRef.current) stripRef.current.scrollLeft = state.startScrollLeft - deltaX;
+      e.preventDefault();
+      return;
+    }
+    if (state.mode === 'move') {
+      e.preventDefault();
+      const strip = stripRef.current;
+      if (!strip) return;
+      const children = Array.from(strip.querySelectorAll<HTMLElement>('[data-clip]'));
+      let target = children.length - 1;
+      for (let index = 0; index < children.length; index += 1) {
+        const rect = children[index].getBoundingClientRect();
+        if (e.clientX < rect.left + rect.width / 2) { target = index; break; }
       }
-      if (st.mode === 'move') {
-        // target index by pointer x over strip
-        const strip = stripRef.current!;
-        const children = Array.from(strip.querySelectorAll<HTMLElement>('[data-clip]'));
-        let target = children.length - 1;
-        for (let i = 0; i < children.length; i++) {
-          const r = children[i].getBoundingClientRect();
-          if (ev.clientX < r.left + r.width / 2) { target = i; break; }
-        }
-        if (target !== st.idx) {
-          onReorder(st.idx, target);
-          st.idx = target;
-          setDragIdx(target);
-        }
+      if (target !== state.idx) {
+        onReorder(state.idx, target);
+        state.idx = target;
+        setDragIdx(target);
       }
-    };
-    const onUp = () => {
-      if (dragState.current) clearTimeout(dragState.current.timer);
-      if (dragState.current?.mode !== 'move') {
-        // simple tap → select & move playhead to clip start
-        onSelect(clips[idx].id, 0);
-      }
-      dragState.current = null;
-      setDragIdx(null);
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-    };
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
+    }
+  };
+
+  const finishClipGesture = (e: React.PointerEvent, cancelled = false) => {
+    const state = dragState.current;
+    if (!state || state.pointerId !== e.pointerId) return;
+    clearTimeout(state.timer);
+    if (!cancelled && state.mode === 'maybe') onSelect(state.clipId, 0);
+    dragState.current = null;
+    setDragIdx(null);
   };
 
   const onHandleDown = (e: React.PointerEvent, side: 'in' | 'out') => {
     e.stopPropagation();
     const clip = clips[selIdx];
     if (!clip) return;
-    trimDrag.current = { side, startX: e.clientX, origIn: clip.trimIn, origOut: clip.trimOut };
-    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
-
-    const onMove = (ev: PointerEvent) => {
-      const td = trimDrag.current;
-      if (!td) return;
-      const dt = (ev.clientX - td.startX) / PX_PER_SEC;
-      // snap to frame
-      const snapped = Math.round(dt / FRAME) * FRAME;
-      if (td.side === 'in') trimSelected(td.origIn + snapped, td.origOut);
-      else trimSelected(td.origIn, td.origOut + snapped);
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    trimDrag.current = {
+      pointerId: e.pointerId,
+      side,
+      startX: e.clientX,
+      origIn: clip.trimIn,
+      origOut: clip.trimOut,
+      secondsPerPixel: clipLen(clip) / Math.max(1, timelineClipWidth(clip)),
     };
-    const onUp = () => {
-      trimDrag.current = null;
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-    };
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
   };
 
-  const playheadX = playhead * PX_PER_SEC;
+  const onHandleMove = (e: React.PointerEvent) => {
+    const state = trimDrag.current;
+    if (!state || state.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    const delta = (e.clientX - state.startX) * state.secondsPerPixel;
+    const snapped = Math.round(delta / FRAME) * FRAME;
+    if (state.side === 'in') trimSelected(state.origIn + snapped, state.origOut);
+    else trimSelected(state.origIn, state.origOut + snapped);
+  };
+
+  const finishHandleGesture = (e: React.PointerEvent) => {
+    if (trimDrag.current?.pointerId === e.pointerId) trimDrag.current = null;
+  };
+
+  const onHandleKeyDown = (e: React.KeyboardEvent, side: 'in' | 'out', clip: Clip) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    const delta = e.key === 'ArrowLeft' ? -FRAME : FRAME;
+    if (side === 'in') trimSelected(clip.trimIn + delta, clip.trimOut);
+    else trimSelected(clip.trimIn, clip.trimOut + delta);
+  };
+
+  const playheadX = timelinePlayheadX(clips, playhead);
 
   return (
     <div className="border-t border-white/10 bg-neutral-900/60 pb-[max(env(safe-area-inset-bottom),0.5rem)]">
       <div className="text-[10px] text-white/60 px-3 pt-1.5 flex justify-between">
-        <span>Tap to select · drag edges to trim · hold &amp; drag to reorder</span>
+        <span>Tap to select · swipe to scroll · hold to reorder · drag edges to trim</span>
       </div>
-      <div ref={stripRef} className="relative overflow-x-auto overflow-y-hidden px-3 py-2 flex items-center gap-1 min-h-[76px]">
+      <div ref={stripRef} role="list" aria-label="Video clips"
+        className="relative overflow-x-auto overflow-y-hidden px-3 py-2 flex items-center gap-1 min-h-[76px]">
         {clips.map((c, i) => {
-          const w = width(c);
+          const w = timelineClipWidth(c);
           const selected = c.id === selectedId;
           return (
             <div
               key={c.id}
               data-clip
+              data-clip-duration={clipLen(c).toFixed(3)}
+              role="listitem"
+              tabIndex={0}
+              aria-current={selected ? 'true' : undefined}
+              aria-label={`Clip ${i + 1}, ${clipLen(c).toFixed(1)} seconds${selected ? ', selected' : ''}. Press Enter to select.`}
               onPointerDown={(e) => onClipPointerDown(e, i)}
-              className={`relative shrink-0 h-14 rounded-lg overflow-hidden border-2 transition-colors touch-none
+              onPointerMove={onClipPointerMove}
+              onPointerUp={(e) => finishClipGesture(e)}
+              onPointerCancel={(e) => finishClipGesture(e, true)}
+              onLostPointerCapture={(e) => finishClipGesture(e, true)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onSelect(c.id, 0);
+                }
+              }}
+              className={`relative shrink-0 h-14 rounded-lg overflow-hidden border-2 transition-colors touch-pan-y focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white
                 ${selected ? 'border-amber-400' : 'border-white/15'}
                 ${dragIdx === i ? 'opacity-60 scale-95' : ''}`}
               style={{ width: w }}
@@ -588,18 +686,52 @@ function Timeline({
                   <div className="w-full h-full bg-neutral-800" />
                 )}
               </div>
-              <span className="absolute bottom-0.5 right-1 text-[9px] tabular-nums bg-black/60 rounded px-1">
+              <span className={`absolute bottom-0.5 text-[9px] tabular-nums bg-black/60 rounded px-1 pointer-events-none ${selected ? 'left-1/2 -translate-x-1/2' : 'right-1'}`}>
                 {clipLen(c).toFixed(1)}s
               </span>
               {selected && (
                 <>
-                  <div onPointerDown={(e) => onHandleDown(e, 'in')}
-                    className="absolute left-0 top-0 bottom-0 w-4 bg-amber-400 flex items-center justify-center cursor-ew-resize">
-                    <div className="w-0.5 h-5 bg-black/70 rounded" />
+                  <div
+                    role="slider"
+                    tabIndex={0}
+                    aria-label={`Trim start of clip ${i + 1}`}
+                    aria-orientation="horizontal"
+                    aria-valuemin={0}
+                    aria-valuemax={Math.max(0, c.trimOut - FRAME)}
+                    aria-valuenow={c.trimIn}
+                    aria-valuetext={`${c.trimIn.toFixed(2)} seconds`}
+                    onPointerDown={(e) => onHandleDown(e, 'in')}
+                    onPointerMove={onHandleMove}
+                    onPointerUp={finishHandleGesture}
+                    onPointerCancel={finishHandleGesture}
+                    onLostPointerCapture={finishHandleGesture}
+                    onKeyDown={(e) => onHandleKeyDown(e, 'in', c)}
+                    className="absolute inset-y-0 left-0 flex w-11 touch-none cursor-ew-resize items-center justify-start focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-white"
+                  >
+                    <span className="flex h-full w-4 items-center justify-center bg-amber-400">
+                      <span className="h-5 w-0.5 rounded bg-black/70" />
+                    </span>
                   </div>
-                  <div onPointerDown={(e) => onHandleDown(e, 'out')}
-                    className="absolute right-0 top-0 bottom-0 w-4 bg-amber-400 flex items-center justify-center cursor-ew-resize">
-                    <div className="w-0.5 h-5 bg-black/70 rounded" />
+                  <div
+                    role="slider"
+                    tabIndex={0}
+                    aria-label={`Trim end of clip ${i + 1}`}
+                    aria-orientation="horizontal"
+                    aria-valuemin={Math.min(c.duration, c.trimIn + FRAME)}
+                    aria-valuemax={c.duration}
+                    aria-valuenow={c.trimOut}
+                    aria-valuetext={`${c.trimOut.toFixed(2)} seconds`}
+                    onPointerDown={(e) => onHandleDown(e, 'out')}
+                    onPointerMove={onHandleMove}
+                    onPointerUp={finishHandleGesture}
+                    onPointerCancel={finishHandleGesture}
+                    onLostPointerCapture={finishHandleGesture}
+                    onKeyDown={(e) => onHandleKeyDown(e, 'out', c)}
+                    className="absolute inset-y-0 right-0 flex w-11 touch-none cursor-ew-resize items-center justify-end focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-white"
+                  >
+                    <span className="flex h-full w-4 items-center justify-center bg-amber-400">
+                      <span className="h-5 w-0.5 rounded bg-black/70" />
+                    </span>
                   </div>
                 </>
               )}
@@ -607,8 +739,8 @@ function Timeline({
           );
         })}
         {/* playhead */}
-        <div className="absolute top-1 bottom-1 w-0.5 bg-white pointer-events-none"
-          style={{ left: 12 + playheadX }} />
+        <div data-timeline-playhead className="absolute top-1 bottom-1 w-0.5 bg-white pointer-events-none"
+          style={{ left: TIMELINE_HORIZONTAL_PADDING + playheadX }} />
       </div>
     </div>
   );

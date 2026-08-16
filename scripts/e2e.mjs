@@ -173,8 +173,19 @@ const fallbackVisible = await page.getByText('Pinch zoom is unavailable on this 
 if (!fallbackVisible && !/([2-9]|1\.[1-9])×/.test(zoomText)) throw new Error('pinch zoom produced neither zoom nor fallback state');
 log(fallbackVisible ? 'pinch zoom fallback verified' : 'pinch zoom verified');
 
-// record 3 clips of ~2s each: clips 1-2 via the classic hold gesture
-// (touchEnd / touchCancel releases), clip 3 via the tap-toggle path.
+// Assistive technologies activate a button through its click contract rather
+// than pointerdown/up. That path must start and stop a real saved recording.
+await page.getByRole('button', { name: 'Tap to record' }).evaluate((button) => button.click());
+await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
+await page.waitForTimeout(2100);
+await page.getByRole('button', { name: 'Stop recording' }).evaluate((button) => button.click());
+await page.waitForSelector('[data-saved-notice]', { timeout: 5000 });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 5000 });
+if (mediaRecorderStarts !== 1) throw new Error(`assistive click started ${mediaRecorderStarts} recorders`);
+log('assistive click record/stop path verified');
+
+// Record 3 additional clips of ~2s each: clips 2-3 via the classic hold
+// gesture (touchEnd / touchCancel releases), clip 4 via the tap-toggle path.
 for (let i = 0; i < 3; i++) {
   const record = page.getByRole('button', { name: 'Tap to record' });
   const recordBox = await record.boundingBox();
@@ -205,10 +216,10 @@ for (let i = 0; i < 3; i++) {
     // The tap-recorded clip must be SAVED like any other.
     await page.waitForSelector('[data-saved-notice]', { timeout: 5000 });
     const savedText = await page.locator('[data-saved-notice]').textContent();
-    if (!savedText.includes('3 clips')) throw new Error(`tap-toggle clip not saved: toast "${savedText}"`);
+    if (!savedText.includes('4 clips')) throw new Error(`tap-toggle clip not saved: toast "${savedText}"`);
     await page.waitForTimeout(600);
-    if (mediaRecorderStarts !== 3) throw new Error(`expected 3 recorder starts, got ${mediaRecorderStarts}`);
-    log(`clip 3 recorded via tap-toggle (continued after lift; tap-stop in ${tapStopLatency}ms; saved toast "${savedText}")`);
+    if (mediaRecorderStarts !== 4) throw new Error(`expected 4 recorder starts, got ${mediaRecorderStarts}`);
+    log(`clip 4 recorded via tap-toggle (continued after lift; tap-stop in ${tapStopLatency}ms; saved toast "${savedText}")`);
     continue;
   }
 
@@ -226,7 +237,7 @@ for (let i = 0; i < 3; i++) {
     if (!(await page.getByRole('button', { name: 'Stop recording' }).isVisible())) {
       throw new Error('recording did not continue while the touch was held');
     }
-    if (mediaRecorderStarts !== 1) throw new Error(`duplicate hold started ${mediaRecorderStarts} recorders`);
+    if (mediaRecorderStarts !== 2) throw new Error(`duplicate hold started ${mediaRecorderStarts} recorders`);
     // Ratio and quality selectors must lock while a recording is running.
     for (const control of ['16:9', 'HD', '4K']) {
       if (!(await page.getByRole('button', { name: control, exact: true }).isDisabled())) {
@@ -243,15 +254,15 @@ for (let i = 0; i < 3; i++) {
   const releaseLatency = Date.now() - releaseStarted;
   await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 1500 * SLACK });
   await page.waitForTimeout(600);
-  if (mediaRecorderStarts !== i + 1) throw new Error(`expected ${i + 1} recorder starts, got ${mediaRecorderStarts}`);
-  log(`clip ${i + 1} recorded; ${releaseType} stopped in ${releaseLatency}ms`);
+  if (mediaRecorderStarts !== i + 2) throw new Error(`expected ${i + 2} recorder starts, got ${mediaRecorderStarts}`);
+  log(`clip ${i + 2} recorded; ${releaseType} stopped in ${releaseLatency}ms`);
 }
 await page.screenshot({ path: `${OUT}/2-recorded.png` });
 
 // A reload must recover the durable session with every completed clip.
 await page.reload();
 await page.waitForSelector('[data-editor-frame]', { timeout: 10000 });
-if (await page.locator('[data-clip]').count() !== 3) throw new Error('reload did not preserve all 3 clips');
+if (await page.locator('[data-clip]').count() !== 4) throw new Error('reload did not preserve all 4 clips');
 log('reload preserved all completed clips');
 
 // go to editor
@@ -272,14 +283,18 @@ log('editor portrait frame and source-matched 1080p default export verified');
 
 const clipCount = await page.locator('[data-clip]').count();
 log(`timeline clips: ${clipCount}`);
-if (clipCount !== 3) throw new Error(`expected 3 clips, got ${clipCount}`);
+if (clipCount !== 4) throw new Error(`expected 4 clips, got ${clipCount}`);
 
 // select clip 2, trim right edge left by ~1s via drag
 const clips = page.locator('[data-clip]');
 await clips.nth(1).click();
 await page.waitForTimeout(300);
-const before = await page.locator('[data-clip]').nth(1).boundingBox();
-const handle = await page.locator('[data-clip]').nth(1).locator('div').last().boundingBox();
+const selectedClipBox = await clips.nth(1).boundingBox();
+const playheadBox = await page.locator('[data-timeline-playhead]').boundingBox();
+if (!selectedClipBox || !playheadBox || Math.abs(selectedClipBox.x - playheadBox.x) > 1.5) {
+  throw new Error(`timeline playhead drifted from clip 2 start (${selectedClipBox?.x} vs ${playheadBox?.x})`);
+}
+const beforeDuration = Number(await clips.nth(1).getAttribute('data-clip-duration'));
 // right trim handle: amber bar at right edge of selected clip
 const sel = await clips.nth(1).boundingBox();
 await page.mouse.move(sel.x + sel.width - 8, sel.y + sel.height / 2);
@@ -287,10 +302,28 @@ await page.mouse.down();
 await page.mouse.move(sel.x + sel.width - 8 - 44, sel.y + sel.height / 2, { steps: 10 }); // ~1s at 44px/s
 await page.mouse.up();
 await page.waitForTimeout(300);
-const after = await page.locator('[data-clip]').nth(1).boundingBox();
-log(`trim: width ${before.width.toFixed(0)} → ${after.width.toFixed(0)}`);
-if (!(after.width < before.width)) throw new Error('trim drag did not shrink clip');
+const afterDuration = Number(await clips.nth(1).getAttribute('data-clip-duration'));
+log(`trim: ${beforeDuration.toFixed(2)}s → ${afterDuration.toFixed(2)}s`);
+if (!(afterDuration < beforeDuration)) throw new Error('trim drag did not shorten clip');
 await page.screenshot({ path: `${OUT}/4-trimmed.png` });
+
+// Swiping a clip scrolls the strip without selecting it. Keyboard users can
+// still select a clip explicitly with Enter.
+await clips.first().click();
+await page.setViewportSize({ width: 320, height: 568 });
+const scrollTarget = await clips.nth(2).boundingBox();
+await page.mouse.move(scrollTarget.x + scrollTarget.width / 2, scrollTarget.y + scrollTarget.height / 2);
+await page.mouse.down();
+await page.mouse.move(scrollTarget.x - 70, scrollTarget.y + scrollTarget.height / 2, { steps: 6 });
+await page.mouse.up();
+const timelineScrollLeft = await page.getByRole('list', { name: 'Video clips' }).evaluate((strip) => strip.scrollLeft);
+if (timelineScrollLeft <= 0) throw new Error('timeline swipe did not scroll');
+if (await clips.first().getAttribute('aria-current') !== 'true') throw new Error('timeline swipe changed the selected clip');
+await clips.nth(1).focus();
+await page.keyboard.press('Enter');
+if (await clips.nth(1).getAttribute('aria-current') !== 'true') throw new Error('keyboard clip selection failed');
+await page.setViewportSize({ width: 390, height: 844 });
+log('timeline scroll, selection, keyboard access, and playhead alignment verified');
 
 // delete clip 3
 await clips.nth(2).click();
@@ -298,19 +331,20 @@ await page.click('text=Delete');
 await page.waitForTimeout(300);
 const afterDelete = await page.locator('[data-clip]').count();
 log(`after delete: ${afterDelete} clips`);
-if (afterDelete !== 2) throw new Error('delete failed');
+if (afterDelete !== 3) throw new Error('delete failed');
 
 // undo the delete, then redo-less state check
 await page.click('button[aria-label="Undo"]');
 await page.waitForTimeout(300);
 const afterUndo = await page.locator('[data-clip]').count();
 log(`after undo: ${afterUndo} clips`);
-if (afterUndo !== 3) throw new Error('undo failed');
+if (afterUndo !== 4) throw new Error('undo failed');
 
 // split clip 1 after playing into it
 await page.locator('[data-clip]').nth(0).click();
 await page.waitForTimeout(200);
 await page.click('button[aria-label="Play"]');
+await page.waitForSelector('button[aria-label="Pause"]', { timeout: 5000 });
 const playbackSlot = await page.locator('[data-editor-playhead]').getAttribute('data-editor-active-slot');
 const playbackVideo = page.locator(`[data-editor-video-slot="${playbackSlot}"]`);
 const playbackStart = await playbackVideo.evaluate((video) => ({
@@ -333,17 +367,28 @@ if (crossClipRate < 0.8 || crossClipRate > 1.2) throw new Error(`cross-clip play
 if (!(await page.getByRole('button', { name: 'Pause' }).isVisible())) throw new Error('playback stopped while switching clips');
 const handoffGap = Number(await page.locator('[data-editor-playhead]').getAttribute('data-last-handoff-gap-ms'));
 if (!Number.isFinite(handoffGap) || handoffGap > 120) throw new Error(`clip handoff gap was ${handoffGap}ms`);
-log(`cross-clip playback verified at ${crossClipRate.toFixed(2)}x; handoff ${handoffGap.toFixed(1)}ms`);
+const handoffStartOffset = Number(await page.locator('[data-editor-playhead]').getAttribute('data-last-handoff-start-offset-ms'));
+if (!Number.isFinite(handoffStartOffset) || handoffStartOffset > 50) {
+  throw new Error(`clip handoff skipped ${handoffStartOffset}ms of the incoming clip`);
+}
+log(`cross-clip playback verified at ${crossClipRate.toFixed(2)}x; handoff ${handoffGap.toFixed(1)}ms; opening offset ${handoffStartOffset.toFixed(1)}ms`);
 await page.click('button[aria-label="Pause"]');
 await page.click('text=Split');
 await page.waitForTimeout(300);
 const afterSplit = await page.locator('[data-clip]').count();
 log(`after split: ${afterSplit} clips`);
-if (afterSplit !== 4) throw new Error(`split failed: expected 4 clips, got ${afterSplit}`);
+if (afterSplit !== 5) throw new Error(`split failed: expected 5 clips, got ${afterSplit}`);
 await page.screenshot({ path: `${OUT}/5-split.png` });
 
 await page.click('text=Export video');
 const exportDialog = page.getByRole('dialog', { name: 'Export video' });
+await exportDialog.waitFor();
+for (let index = 0; index < 8; index += 1) {
+  await page.keyboard.press('Tab');
+  const focusInside = await exportDialog.evaluate((dialog) => dialog.contains(document.activeElement));
+  if (!focusInside) throw new Error('export dialog let focus escape to the obscured editor');
+}
+log('export dialog focus trap verified');
 await exportDialog.getByText('9:16 portrait', { exact: true }).waitFor();
 // HD-only sources open the sheet on 1080p; switching to 4K and back must
 // update the live export metadata. Controls stay finger-sized.
@@ -387,6 +432,37 @@ const path = `${OUT}/exported.mp4`;
 await download.saveAs(path);
 const size = fs.statSync(path).size;
 log(`downloaded ${(size / 1024 / 1024).toFixed(2)} MB → ${path}`);
+
+// A denied initial camera request must leave a visible recovery path. Fail the
+// constrained request and its fallback once, then let the retry use the real
+// fake-device stream.
+const recoveryContext = await browser.newContext({
+  viewport: { width: 390, height: 844 },
+  permissions: ['camera', 'microphone'],
+  hasTouch: true,
+  isMobile: true,
+});
+await recoveryContext.addInitScript(() => {
+  const mediaDevices = navigator.mediaDevices;
+  const original = mediaDevices.getUserMedia.bind(mediaDevices);
+  let attempts = 0;
+  Object.defineProperty(mediaDevices, 'getUserMedia', {
+    configurable: true,
+    value: (constraints) => {
+      attempts += 1;
+      if (attempts <= 2) return Promise.reject(new DOMException('Synthetic permission denial', 'NotAllowedError'));
+      return original(constraints);
+    },
+  });
+});
+const recoveryPage = await recoveryContext.newPage();
+await recoveryPage.goto(BASE, { waitUntil: 'load' });
+await recoveryPage.getByText('Camera access was denied. Allow camera and microphone permission, then try again.').waitFor();
+await recoveryPage.getByRole('button', { name: 'Import video', exact: true }).waitFor();
+await recoveryPage.getByRole('button', { name: 'Try camera again' }).click();
+await recoveryPage.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
+await recoveryContext.close();
+log('camera permission recovery actions verified');
 
 console.log('\nBROWSER ERRORS:', errors.length ? errors : 'none');
 await browser.close();

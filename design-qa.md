@@ -2,6 +2,23 @@
 
 Final result: passed
 
+## 2026-08-16 interaction and mobile pass
+
+- Rechecked the camera, recording, clips, editor, and export states at 390 ×
+  844 and 320 × 568. Controls remain readable and unclipped at both sizes.
+- Removed the duplicate camera-footer Timeline action, clarified local-storage
+  status, and added visible camera retry/import recovery actions.
+- Replaced ambiguous trim arrows with labeled Start/End frame nudges and
+  enlarged timeline clip/trim targets for touch and keyboard use.
+- Verified timeline swipe does not change selection, keyboard clip selection
+  works, and the playhead follows rendered clip widths and gaps.
+- Verified the export modal keeps keyboard focus inside until closed and
+  remains usable on the shorter viewport.
+- Cross-clip playback handoff measured under 6 ms in the browser run, with the
+  incoming clip starting within 0.1 ms of its trim-in point.
+- Browser console/page errors: none. Screenshots are in
+  `scripts/e2e-out/qa/` after the latest smoke run.
+
 ## Visual truth
 
 - Camera source: `/Users/brandontheriot/Downloads/Screenshot 2026-08-15 at 2.35.26 PM.png`

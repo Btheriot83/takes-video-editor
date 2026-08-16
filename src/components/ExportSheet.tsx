@@ -31,6 +31,8 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
   const [exportMode, setExportMode] = useState<'native' | 'remuxed' | 'transcoded' | null>(null);
   const resultRef = useRef<Blob | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
 
   const filenameRef = useRef(`take-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.mp4`);
   const filename = filenameRef.current;
@@ -70,6 +72,7 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
   // the user behind a running export.
   const requestClose = useCallback(() => {
     if (abortRef.current) abortRef.current.abort();
+    if (dialogRef.current?.open) dialogRef.current.close();
     onClose();
   }, [onClose]);
 
@@ -77,17 +80,41 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
   // burning CPU in the background.
   useEffect(() => () => abortRef.current?.abort(), []);
 
-  const output = exportDimensions(aspectRatio, quality);
-
-  // The quality decision lives here, where the export starts; Escape always
-  // closes the sheet, cancelling a running export on the way out.
+  // Native modal semantics provide focus trapping, background inertness, and
+  // focus restoration without adding another client-side dialog runtime.
   useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') requestClose();
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) {
+      dialog.showModal();
+      closeButtonRef.current?.focus();
+    }
+    return () => {
+      if (dialog?.open) dialog.close();
     };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [requestClose]);
+  }, []);
+
+  const keepFocusInDialog = (event: React.KeyboardEvent<HTMLDialogElement>) => {
+    if (event.key !== 'Tab') return;
+    const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])',
+    )).filter((element) => !element.hasAttribute('hidden'));
+    if (!focusable.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !event.currentTarget.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || !event.currentTarget.contains(active))) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
+  const output = exportDimensions(aspectRatio, quality);
 
   const share = async () => {
     if (!resultRef.current) return;
@@ -108,17 +135,37 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center">
-      {/* While an export runs, a stray backdrop tap must not silently discard
-          minutes of encoding — cancelling stays an explicit act (Cancel/X). */}
-      <div className="absolute inset-0 bg-black/70" onClick={phase === 'working' ? undefined : requestClose} />
-      <div role="dialog" aria-modal="true" aria-labelledby="export-title"
-        className="relative w-full sm:max-w-sm bg-neutral-900 rounded-t-2xl sm:rounded-2xl border border-white/10 p-5 pb-[max(env(safe-area-inset-bottom),1.25rem)]">
+    <dialog
+      ref={dialogRef}
+      role="dialog"
+      aria-labelledby="export-title"
+      aria-describedby="export-description"
+      onCancel={(event) => {
+        event.preventDefault();
+        requestClose();
+      }}
+      onClick={(event) => {
+        // A stray backdrop tap must not discard minutes of encoding;
+        // Cancel and Close remain explicit, accessible ways out.
+        if (event.target === event.currentTarget && phase !== 'working') requestClose();
+      }}
+      onKeyDown={keepFocusInDialog}
+      className="fixed inset-0 z-50 m-0 h-dvh max-h-none w-screen max-w-none bg-transparent p-0 text-white outline-none backdrop:bg-black/70"
+    >
+      <div className="absolute inset-x-0 bottom-0 max-h-[calc(100dvh-1rem)] w-full overflow-y-auto rounded-t-2xl border border-white/10 bg-neutral-900 p-5 pb-[max(env(safe-area-inset-bottom),1.25rem)] sm:bottom-auto sm:left-1/2 sm:top-1/2 sm:max-w-sm sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-2xl">
+        <p id="export-description" className="sr-only">
+          Choose an output quality, export the current edit, then share or download the finished MP4.
+        </p>
         <div className="flex items-center justify-between mb-4">
           <h2 id="export-title" className="font-semibold">Export video</h2>
-          <button onClick={requestClose}
+          <button
+            ref={closeButtonRef}
+            type="button"
+            autoFocus
+            onClick={requestClose}
             className="-m-2 flex h-11 w-11 items-center justify-center rounded-lg active:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
-            aria-label="Close">
+            aria-label="Close"
+          >
             <X size={18} />
           </button>
         </div>
@@ -243,6 +290,6 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
           </div>
         )}
       </div>
-    </div>
+    </dialog>
   );
 }

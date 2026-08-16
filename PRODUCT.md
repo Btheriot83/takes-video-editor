@@ -25,7 +25,7 @@ Familiar, focused, and calm. The interface should feel native enough to trust wh
 ## Design Principles
 
 - Put the live camera and the subject first.
-- Make capture physical and immediate: hold to record, release to stop.
+- Make capture physical and immediate: tap to toggle, or press and hold then release.
 - Keep every camera capability honest by showing unavailable states and fallbacks.
 - Preserve a short path from capture to timeline to export.
 - Keep source media local to the device unless the user explicitly exports or shares it.
@@ -33,4 +33,3 @@ Familiar, focused, and calm. The interface should feel native enough to trust wh
 ## Accessibility & Inclusion
 
 Use conventional icons with accessible names, minimum 44px touch targets, visible focus and disabled states, reduced-motion support, and text/controls that meet WCAG AA contrast where they overlay live video.
-

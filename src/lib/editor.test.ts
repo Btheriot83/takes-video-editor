@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { trimClip, splitClip, moveClip, History, locate, clipStart } from './editor';
+import {
+  trimClip, splitClip, moveClip, History, locate, clipStart,
+  clampTimelineTime, timelineClipWidth, timelinePlayheadX,
+} from './editor';
 import { ASPECT_RATIOS, clipLen, totalDuration, FRAME, exportDimensions } from '../types/clip';
 import type { Clip } from '../types/clip';
 
@@ -101,6 +104,30 @@ describe('locate / clipStart', () => {
     expect(clipStart(cs, 1)).toBe(4);
     expect(clipStart(cs, 2)).toBe(7);
     expect(totalDuration(cs)).toBe(9);
+  });
+});
+
+describe('timeline geometry', () => {
+  it('keeps the playhead aligned across minimum-width clips and gaps', () => {
+    const clips = [mk('a', 1), mk('b', 1), mk('c', 1)];
+    expect(timelineClipWidth(clips[0])).toBe(88);
+    expect(timelinePlayheadX(clips, 0)).toBe(0);
+    expect(timelinePlayheadX(clips, 0.5)).toBe(44);
+    expect(timelinePlayheadX(clips, 1)).toBe(92);
+    expect(timelinePlayheadX(clips, 1.5)).toBe(136);
+    expect(timelinePlayheadX(clips, 2)).toBe(184);
+    expect(timelinePlayheadX(clips, 3)).toBe(272);
+  });
+
+  it('uses proportional width for longer clips and clamps out-of-range time', () => {
+    const clips = [mk('a', 4), mk('b', 1)];
+    expect(timelineClipWidth(clips[0])).toBe(176);
+    expect(clampTimelineTime(clips, Number.NaN)).toBe(0);
+    expect(clampTimelineTime(clips, -1)).toBe(0);
+    expect(clampTimelineTime(clips, 99)).toBe(5);
+    expect(timelinePlayheadX(clips, -1)).toBe(0);
+    expect(timelinePlayheadX(clips, 2)).toBe(88);
+    expect(timelinePlayheadX(clips, 99)).toBe(268);
   });
 });
 

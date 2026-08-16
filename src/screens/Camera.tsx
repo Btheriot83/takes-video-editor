@@ -85,6 +85,7 @@ export default function Camera() {
   const openCamera = useCallback(async (nextFacing: 'user' | 'environment', quality: CaptureQuality) => {
     setStreamReady(false);
     setTorchOn(false);
+    setError(null);
     try {
       streamRef.current?.getTracks().forEach((track) => track.stop());
       const stream = await getCameraStream(nextFacing, quality);
@@ -351,6 +352,9 @@ export default function Camera() {
   };
 
   const onPreviewPointerDown = (event: React.PointerEvent) => {
+    // Recovery/import controls can appear over the preview. Do not let the
+    // pinch-zoom surface capture their pointer before the button can click.
+    if (event.target instanceof Element && event.target.closest('button')) return;
     pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
     event.currentTarget.setPointerCapture?.(event.pointerId);
     updatePinchStart();
@@ -379,6 +383,22 @@ export default function Camera() {
   const switchCamera = () => {
     if (recording || starting) return;
     setFacing((current) => (current === 'user' ? 'environment' : 'user'));
+  };
+
+  // Pointer/touch gestures own physical tap-vs-hold recording. Keyboard and
+  // assistive technologies activate buttons with a synthetic click (detail 0),
+  // so handle that click as a simple record/stop toggle. Pointer-generated
+  // clicks are ignored because their down/up events already did the work.
+  const onAccessibleRecordClick = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    if (event.detail !== 0 || activeHoldRef.current) return;
+    const source: ActiveHold = { kind: 'keyboard', id: 'keyboard' };
+    if (latchedRef.current) {
+      handlePressStart(source);
+      return;
+    }
+    handlePressStart(source);
+    releaseActiveHold();
   };
 
   const hasClips = clips.length > 0;
@@ -501,7 +521,23 @@ export default function Camera() {
 
         {error && (
           <div role="alert" className="absolute inset-x-4 top-4 z-20 rounded-xl bg-neutral-900 p-4 text-center text-sm shadow-lg">
-            {error}
+            <p>{error}</p>
+            <div className="mt-3 flex items-center justify-center gap-2">
+              <button
+                type="button"
+                onClick={() => void openCamera(facing, captureQuality)}
+                className="min-h-11 rounded-full bg-white px-4 text-xs font-semibold text-black active:bg-white/85 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+              >
+                Try camera again
+              </button>
+              <button
+                type="button"
+                onClick={() => fileRef.current?.click()}
+                className="min-h-11 rounded-full bg-white/10 px-4 text-xs font-semibold text-white active:bg-white/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+              >
+                Import video
+              </button>
+            </div>
           </div>
         )}
 
@@ -570,7 +606,7 @@ export default function Camera() {
               aria-describedby="record-hint"
               data-record-state={recording ? 'recording' : starting ? 'starting' : stopping ? 'stopping' : 'idle'}
               onContextMenu={(event) => event.preventDefault()}
-              onClick={(event) => event.preventDefault()}
+              onClick={onAccessibleRecordClick}
               onPointerDown={(event) => {
                 if (event.button !== 0 || !event.isPrimary) return;
                 event.preventDefault();
@@ -595,22 +631,6 @@ export default function Camera() {
               onTouchCancel={() => {
                 if (activeHoldRef.current?.kind !== 'keyboard') releaseActiveHold(true);
               }}
-              onKeyDown={(event) => {
-                if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) {
-                  event.preventDefault();
-                  // Keyboard is a natural toggle: a normal key press is under
-                  // TAP_TOGGLE_MS, so press starts (and latches) and the next
-                  // press stops. Holding the key long keeps hold semantics.
-                  handlePressStart({ kind: 'keyboard', id: 'keyboard' });
-                }
-              }}
-              onKeyUp={(event) => {
-                if (event.key === ' ' || event.key === 'Enter') {
-                  event.preventDefault();
-                  endMatchingHold('keyboard', 'keyboard');
-                }
-              }}
-              onBlur={() => endMatchingHold('keyboard', 'keyboard', true)}
               className={`relative flex h-[78px] w-[78px] touch-none items-center justify-center rounded-full border-[5px] transition-transform duration-150 active:scale-95 disabled:opacity-35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white ${recording ? 'scale-110 border-red-500' : 'border-white'}`}
             >
               {recording && (
@@ -644,31 +664,23 @@ export default function Camera() {
           </button>
         </div>
 
-        <div className="mt-1 flex items-center justify-between">
+        <div className="mt-1 grid grid-cols-[5rem_1fr_5rem] items-center">
           <button
             type="button"
             disabled={controlsDisabled}
             onClick={() => fileRef.current?.click()}
-            className="flex min-h-11 items-center gap-2 rounded-full px-3 text-xs font-semibold text-white/75 active:bg-white/10 disabled:opacity-35"
+            className="flex min-h-11 items-center justify-self-start gap-2 rounded-full px-3 text-xs font-semibold text-white/75 active:bg-white/10 disabled:opacity-35"
             aria-label="Import videos"
           >
             <Images size={18} /> Import
           </button>
-          <div className="flex items-center gap-1 text-[11px] text-white/60">
-            <Film size={13} aria-hidden="true" /> Local to this device
+          <div className="flex items-center justify-self-center gap-1 whitespace-nowrap text-[11px] text-white/60">
+            <Film size={13} aria-hidden="true" /> Stored locally
           </div>
-          {hasClips ? (
-            <button
-              type="button"
-              disabled={controlsDisabled}
-              onClick={() => setScreen('editor')}
-              className="min-h-11 rounded-full px-3 text-xs font-semibold text-white/75 active:bg-white/10 disabled:opacity-35"
-            >
-              Timeline
-            </button>
-          ) : (
-            <span className="w-[72px]" />
-          )}
+          {/* The clip pill directly above is the single timeline entry point;
+              keeping another “Timeline” button here crowded the trust copy at
+              320px and created two equally loud routes to the same screen. */}
+          <span aria-hidden="true" />
         </div>
 
         <input
