@@ -134,9 +134,14 @@ async function probeInputs(ffmpeg: FFmpegLike, names: string[]): Promise<InputPr
     let fps: number | null = null;
     for (const line of lines) {
       if (!/Stream #\d+:\d+.*: Video/.test(line)) continue;
-      const m = line.match(/(\d+(?:\.\d+)?) fps/) ?? line.match(/(\d+(?:\.\d+)?) tbr/);
-      const value = m ? Number(m[1]) : NaN;
-      // tbn/tbc artifacts (e.g. "1k tbr") are not real frame rates.
+      // Prefer the real "fps" figure. "tbr" is a timebase-derived guess that
+      // VFR MediaRecorder files can inflate absurdly (e.g. 600); an inflated
+      // value would push the 4K encoder config to a level real hardware
+      // rejects at configure() even though isConfigSupported accepted it.
+      const fpsMatch = line.match(/(\d+(?:\.\d+)?) fps/);
+      const tbrMatch = line.match(/(\d+(?:\.\d+)?) tbr/);
+      const value = fpsMatch ? Number(fpsMatch[1])
+        : tbrMatch && Number(tbrMatch[1]) <= 120 ? Number(tbrMatch[1]) : NaN;
       if (Number.isFinite(value) && value >= 1 && value <= 240) fps = value;
     }
     probes.push({ hasAudio, fps });
@@ -164,6 +169,15 @@ function audioChain(index: number, len: number, hasAudio: boolean): string {
 }
 
 const abortError = () => new DOMException('Export cancelled', 'AbortError');
+
+/**
+ * Phone/tablet-class device detection, used only to avoid committing such
+ * devices to a wasm 4K encode that cannot realistically finish. iPadOS 13+
+ * masquerades as macOS but reports multiple touch points.
+ */
+const isMobileClass = () =>
+  /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+  (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.userAgent));
 
 /**
  * Export clips to MP4 at the selected output profile. A compatible source is
@@ -256,15 +270,28 @@ async function runExport(
   throwIfAborted();
   onProgress?.('Preparing media', 0.02);
   const ext = (m: string) => (m.includes('mp4') ? 'mp4' : 'webm');
-  const inputs: string[] = [];
-  for (let i = 0; i < clips.length; i++) {
-    const name = `in${i}.${ext(clips[i].mimeType || blobs[i].type)}`;
-    await ffmpeg.writeFile(name, new Uint8Array(await blobs[i].arrayBuffer()));
-    inputs.push(name);
-  }
+  const inputs: string[] = clips.map((clip, i) => `in${i}.${ext(clip.mimeType || blobs[i].type)}`);
+  // Emscripten's linear memory never shrinks, so every byte simultaneously
+  // resident in MEMFS grows the wasm heap for the tab's remaining lifetime.
+  // Inputs are therefore written one at a time wherever possible (peak =
+  // largest clip, not the sum of all clips) — clip-count-scaled heap growth
+  // is what pushed multi-clip 4K exports over iPhone Safari's memory ceiling.
+  let memfsHasInputs = false;
+  const writeAllInputs = async () => {
+    if (memfsHasInputs) return;
+    for (let i = 0; i < clips.length; i++) {
+      await ffmpeg.writeFile(inputs[i], new Uint8Array(await blobs[i].arrayBuffer()));
+    }
+    memfsHasInputs = true;
+  };
+  const dropAllInputs = async () => {
+    for (const name of inputs) await ffmpeg.deleteFile(name).catch(() => {});
+    memfsHasInputs = false;
+  };
 
   if (clips.length > 1 && allMp4 && allUntrimmed && sourcesMatchOutput && sameCameraCodec) {
     throwIfAborted();
+    await writeAllInputs();
     const concatFile = 'concat.txt';
     const concatBody = inputs.map((name) => `file '${name}'`).join('\n');
     await ffmpeg.writeFile(concatFile, new TextEncoder().encode(concatBody));
@@ -285,11 +312,53 @@ async function runExport(
     exportLog('lossless join was incompatible; rendering instead');
     await ffmpeg.deleteFile(concatFile).catch(() => {});
     await ffmpeg.deleteFile('out.mp4').catch(() => {});
+    await dropAllInputs();
   }
 
+  // Per-clip probe + audio encode: each clip is written to MEMFS alone,
+  // probed, its audio encoded to a small AAC segment, and removed again.
   throwIfAborted();
-  const probes = await probeInputs(ffmpeg, inputs);
-  const maxSourceFps = probes.reduce((max, probe) => Math.max(max, probe.fps ?? 30), 30);
+  onProgress?.('Encoding audio', 0.03);
+  const probes: InputProbe[] = [];
+  const audioSegments: string[] = [];
+  for (let i = 0; i < clips.length; i++) {
+    throwIfAborted();
+    await ffmpeg.writeFile(inputs[i], new Uint8Array(await blobs[i].arrayBuffer()));
+    const [probe] = await probeInputs(ffmpeg, [inputs[i]]);
+    probes.push(probe);
+    const len = clipLen(clips[i]);
+    const segment = `a${i}.m4a`;
+    const segCode = await ffmpeg.exec([
+      '-fflags', '+genpts',
+      '-ss', String(clips[i].trimIn), '-t', String(len), '-i', inputs[i],
+      '-filter_complex', audioChain(0, len, probe.hasAudio).replace('[a0]', '[aseg]'),
+      '-map', '[aseg]', '-c:a', 'aac', '-b:a', '128k', '-vn', segment,
+    ]);
+    await ffmpeg.deleteFile(inputs[i]).catch(() => {});
+    if (segCode !== 0) throw new Error(`audio encode failed (clip ${i + 1})`);
+    audioSegments.push(segment);
+    onProgress?.('Encoding audio', 0.03 + 0.05 * ((i + 1) / clips.length));
+  }
+  // Join the AAC segments with the concat FILTER (decode + re-encode): the
+  // concat demuxer's "-c copy" would reintroduce the AAC priming-gap clicks
+  // at clip joins that the gapless work removed.
+  {
+    const joinArgs: string[] = [];
+    for (const segment of audioSegments) joinArgs.push('-i', segment);
+    joinArgs.push(
+      '-filter_complex',
+      `${audioSegments.map((_, i) => `[${i}:a]`).join('')}concat=n=${audioSegments.length}:v=0:a=1[aout]`,
+      '-map', '[aout]', '-c:a', 'aac', '-b:a', '128k', '-vn', 'audio.m4a',
+    );
+    const joinCode = await ffmpeg.exec(joinArgs);
+    for (const segment of audioSegments) await ffmpeg.deleteFile(segment).catch(() => {});
+    if (joinCode !== 0) throw new Error('audio join failed');
+    exportLog('audio track encoded (per-clip segments)');
+  }
+  // Cap at 60 for encoder planning: phone/browser capture never exceeds 60fps
+  // and anything above it here is a probe artifact that would produce an
+  // encoder envelope real hardware rejects.
+  const maxSourceFps = Math.min(60, probes.reduce((max, probe) => Math.max(max, probe.fps ?? 30), 30));
   throwIfAborted();
 
   // Fast path: hardware (or native software) H.264 via WebCodecs. wasm x264
@@ -298,40 +367,15 @@ async function runExport(
   // ffmpeg.wasm (audio-only AAC encode is fast) and the two are remuxed with
   // "-c copy", so the result stays a normal faststart MP4.
   const plan = await planWebCodecsEncode(output.width, output.height, quality, maxSourceFps);
+  if (!plan && quality === '4K' && isMobileClass()) {
+    // wasm x264 cannot realistically finish 2160x3840 on a phone; running it
+    // presents as an export that never completes. Be honest instead.
+    await ffmpeg.deleteFile('audio.m4a').catch(() => {});
+    throw new Error('This device cannot encode 4K video in the browser. Export at 1080p instead.');
+  }
   if (plan) {
     try {
       exportLog(`using webcodecs encoder: ${plan.config.codec} ${plan.config.hardwareAcceleration ?? 'default'}`);
-
-      // Audio FIRST: it is fast (audio-only wasm encode) and lets the source
-      // clips be freed from MEMFS before the multi-hundred-MB 4K video buffer
-      // starts growing — peak memory is what kills iPhone Safari tabs on
-      // longer multi-clip exports.
-      onProgress?.('Encoding audio', 0.03);
-      const audioParts: string[] = [];
-      for (let i = 0; i < clips.length; i++) {
-        audioParts.push(audioChain(i, clipLen(clips[i]), probes[i].hasAudio));
-      }
-      audioParts.push(`${clips.map((_, i) => `[a${i}]`).join('')}concat=n=${clips.length}:v=0:a=1[aout]`);
-      const audioArgs: string[] = ['-fflags', '+genpts'];
-      for (let i = 0; i < clips.length; i++) {
-        audioArgs.push('-ss', String(clips[i].trimIn), '-t', String(clipLen(clips[i])), '-i', inputs[i]);
-      }
-      audioArgs.push(
-        '-filter_complex', audioParts.join(';'), '-map', '[aout]',
-        '-c:a', 'aac', '-b:a', '128k', '-vn', 'audio.m4a',
-      );
-      const audioProgress = ({ time }: { time: number }) => {
-        onProgress?.('Encoding audio', 0.03 + Math.min(0.05, (time / 1_000_000 / total) * 0.05));
-      };
-      ffmpeg.on('progress', audioProgress);
-      const audioCode = await ffmpeg.exec(audioArgs);
-      ffmpeg.off('progress', audioProgress);
-      if (audioCode !== 0) throw new Error('audio encode failed');
-      exportLog('audio track encoded');
-
-      // Sources are no longer needed in MEMFS (the render reads the blobs).
-      for (const name of inputs) await ffmpeg.deleteFile(name).catch(() => {});
-
       onProgress?.('Rendering video', 0.09);
       let videoBytes: Uint8Array | null = await renderVideoWebCodecs(
         clips, blobs, output.width, output.height, plan,
@@ -364,15 +408,17 @@ async function runExport(
       exportLog(`webcodecs path failed (${webcodecsFailure}); falling back to wasm encoder`);
       console.warn('[export] webcodecs path failed; falling back to wasm encoder', error);
       for (const n of ['wcvideo.mp4', 'audio.m4a', 'out.mp4']) ffmpeg.deleteFile(n).catch(() => {});
-      // The inputs may already have been freed for peak-memory reasons;
-      // restore them from the still-held blobs so the wasm path can run.
-      for (let i = 0; i < clips.length; i++) {
-        await ffmpeg.writeFile(inputs[i], new Uint8Array(await blobs[i].arrayBuffer()));
+      if (quality === '4K' && isMobileClass()) {
+        // See above: a phone-class wasm 4K encode never finishes in practice.
+        throw new Error(`Export failed: ${webcodecsFailure}. Try again, or export at 1080p.`);
       }
     }
   }
 
   throwIfAborted();
+  await ffmpeg.deleteFile('audio.m4a').catch(() => {});
+  // The combined wasm encode needs every input present at once.
+  await writeAllInputs();
   const args: string[] = [];
   args.push('-fflags', '+genpts');
   for (let i = 0; i < clips.length; i++) {

@@ -187,6 +187,25 @@ export default function Editor() {
   const playheadRef = useRef(playhead);
   playheadRef.current = playhead;
 
+  // During an export the preview players are parked (sources unloaded): two
+  // AVPlayer-backed elements with loaded data pin decoder/GPU resources that
+  // the export's own 4K decoder+encoder need on iOS.
+  const parkPreviews = useCallback(() => {
+    setPlaying(false);
+    prerollForRef.current = null;
+    videoRefs.current.forEach((video) => {
+      if (!video) return;
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    });
+    slotIndexRef.current = [null, null];
+  }, []);
+
+  const resumePreviews = useCallback(() => {
+    void syncVideo(playheadRef.current);
+  }, [syncVideo]);
+
   // Start the preloaded slot playing muted shortly before the boundary so the
   // handoff itself is just a mute/visibility flip.
   const preroll = useCallback((nextIndex: number) => {
@@ -423,6 +442,8 @@ export default function Editor() {
           quality={exportQuality}
           onQualityChange={chooseExportQuality}
           onClose={() => setExportOpen(false)}
+          onExportStart={parkPreviews}
+          onExportEnd={resumePreviews}
         />
       )}
     </div>

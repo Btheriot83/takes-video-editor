@@ -102,7 +102,9 @@ export async function planWebCodecsEncode(
 ): Promise<WebCodecsPlan | null> {
   if (!hasWebCodecsPrereqs()) return null;
   const bitrate = quality === '4K' ? 35_000_000 : 14_000_000;
-  const framerate = Math.min(240, Math.max(1, Math.round(maxSourceFps)));
+  // 60fps ceiling: capture never exceeds it and higher figures are probe
+  // artifacts that inflate the H.264 level past what hardware accepts.
+  const framerate = Math.min(60, Math.max(1, Math.round(maxSourceFps)));
   const base: VideoEncoderConfig = { codec: '', width, height, bitrate, framerate };
 
   const override = codecOverride();
@@ -112,13 +114,18 @@ export async function planWebCodecsEncode(
   } else {
     // High profile; level derived from output size and source frame rate
     // (e.g. 5.1 covers 2160x3840@30, 5.2 is required above 30fps at 4K).
-    const level = avcLevelFor(width, height, framerate);
-    const codec = `avc1.6400${level.toString(16).padStart(2, '0').toUpperCase()}`;
+    const codecFor = (fps: number) =>
+      `avc1.6400${avcLevelFor(width, height, fps).toString(16).padStart(2, '0').toUpperCase()}`;
     const avc = { avc: { format: 'avc' as const } };
     // Prefer real hardware; accept the platform's native software encoder as a
-    // second choice (still native code, far faster than wasm x264).
-    candidates.push({ ...base, codec, hardwareAcceleration: 'prefer-hardware', ...avc });
-    candidates.push({ ...base, codec, hardwareAcceleration: 'no-preference', ...avc });
+    // second choice (still native code, far faster than wasm x264). A final
+    // conservative rung (30fps envelope, level for 30) covers hardware that
+    // rejects the higher level despite claiming support.
+    candidates.push({ ...base, codec: codecFor(framerate), hardwareAcceleration: 'prefer-hardware', ...avc });
+    candidates.push({ ...base, codec: codecFor(framerate), hardwareAcceleration: 'no-preference', ...avc });
+    if (framerate > 30) {
+      candidates.push({ ...base, framerate: 30, codec: codecFor(30), hardwareAcceleration: 'prefer-hardware', ...avc });
+    }
   }
 
   for (const config of candidates) {
@@ -126,12 +133,56 @@ export async function planWebCodecsEncode(
     if (!muxerCodec) continue;
     try {
       const support = await VideoEncoder.isConfigSupported(config);
-      if (support.supported) return { config, muxerCodec };
+      if (!support.supported) {
+        exportLog(`encoder rejected by isConfigSupported: ${config.codec} ${config.hardwareAcceleration ?? 'default'}`);
+        continue;
+      }
+      // isConfigSupported is optimistic on some platforms (notably Safari):
+      // configs it accepts can still fail at configure()/first encode. Prove
+      // the config with a real one-frame encode before committing the export.
+      if (await preflightEncode(config)) {
+        exportLog(`encoder preflight OK: ${config.codec} ${config.hardwareAcceleration ?? 'default'} @${config.framerate}fps`);
+        return { config, muxerCodec };
+      }
+      exportLog(`encoder preflight failed: ${config.codec} ${config.hardwareAcceleration ?? 'default'}`);
     } catch {
       // An unknown codec string or option throws; just try the next candidate.
     }
   }
   return null;
+}
+
+/**
+ * Prove an encoder config with a real one-frame encode. Catches platforms
+ * whose isConfigSupported accepts configs their hardware then rejects at
+ * configure() or on the first frame — committing a full export to such a
+ * config fails at "Rendering video 5%".
+ */
+async function preflightEncode(config: VideoEncoderConfig): Promise<boolean> {
+  let encoder: VideoEncoder | null = null;
+  try {
+    let failed = false;
+    encoder = new VideoEncoder({
+      output: () => {},
+      error: () => { failed = true; },
+    });
+    encoder.configure(config);
+    const canvas = new OffscreenCanvas(config.width, config.height);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return false;
+    ctx.fillRect(0, 0, 4, 4);
+    const frame = new VideoFrame(canvas, { timestamp: 0 });
+    encoder.encode(frame, { keyFrame: true });
+    frame.close();
+    await encoder.flush();
+    return !failed;
+  } catch {
+    return false;
+  } finally {
+    try {
+      if (encoder && encoder.state !== 'closed') encoder.close();
+    } catch { /* already closed */ }
+  }
 }
 
 interface RenderState {
@@ -305,10 +356,13 @@ async function captureClip(
   } finally {
     video.onended = null;
     video.onerror = null;
+    video.onloadeddata = null;
     // Release the decoder promptly (matters on mobile).
     video.removeAttribute('src');
     video.load();
     URL.revokeObjectURL(url);
+    // Let the release actually start before anything else runs.
+    await new Promise((resolve) => setTimeout(resolve, 0));
   }
   state.offsetUs = base + Math.round(len * 1_000_000);
 }
@@ -399,6 +453,9 @@ export async function renderVideoWebCodecs(
         await new Promise((r) => setTimeout(r, 400));
         await captureClip(clips[i], blobs[i], makeVideo(), canvas, ctx, encoder, state, progress, signal);
       }
+      // Give iOS's lazy AVPlayer teardown a beat before opening the next
+      // decoder session; without it, back-to-back sessions starve on phones.
+      if (i + 1 < clips.length) await new Promise((r) => setTimeout(r, 150));
     }
     await encoder.flush();
     if (signal?.aborted) throw abortError();

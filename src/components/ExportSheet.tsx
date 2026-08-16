@@ -12,10 +12,14 @@ type Phase = 'idle' | 'working' | 'ready' | 'shared' | 'error';
 
 const QUALITIES: ExportQuality[] = ['1080p', '4K'];
 
-export default function ExportSheet({ onClose, quality, onQualityChange }: {
+export default function ExportSheet({ onClose, quality, onQualityChange, onExportStart, onExportEnd }: {
   onClose: () => void;
   quality: ExportQuality;
   onQualityChange: (quality: ExportQuality) => void;
+  /** Called before an export starts — the editor parks its preview players. */
+  onExportStart?: () => void;
+  /** Called when the export settles (success, error, or cancel). */
+  onExportEnd?: () => void;
 }) {
   const clips = useStore((s) => s.clips);
   const aspectRatio = useStore((s) => s.aspectRatio);
@@ -37,6 +41,7 @@ export default function ExportSheet({ onClose, quality, onQualityChange }: {
     setProgress(0);
     const controller = new AbortController();
     abortRef.current = controller;
+    onExportStart?.();
     try {
       const res = await exportMp4(clips, getBlob, aspectRatio, quality,
         (l, p) => { setLabel(l); setProgress(p); }, controller.signal);
@@ -53,8 +58,9 @@ export default function ExportSheet({ onClose, quality, onQualityChange }: {
       setPhase('error');
     } finally {
       abortRef.current = null;
+      onExportEnd?.();
     }
-  }, [aspectRatio, clips, quality]);
+  }, [aspectRatio, clips, quality, onExportStart, onExportEnd]);
 
   const cancel = useCallback(() => {
     abortRef.current?.abort();
