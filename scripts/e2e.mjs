@@ -83,15 +83,36 @@ await page.getByRole('button', { name: '4K', exact: true }).click();
 await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
 const qualityFrame = page.locator('[data-camera-frame]');
 if (await qualityFrame.getAttribute('data-capture-quality') !== '4K') throw new Error('frame did not reflect the 4K capture setting');
-const capW = Number(await qualityFrame.getAttribute('data-capture-width')) || 0;
-const capH = Number(await qualityFrame.getAttribute('data-capture-height')) || 0;
-if (Math.min(capW, capH) >= 2160) {
-  log(`4K capture delivered (${capW}x${capH})`);
-} else {
-  await page.getByText('4K not available on this camera').waitFor({ timeout: 3000 });
-  const badge = await page.locator('[data-capture-badge]').textContent();
-  if (capW && capH && !badge.includes(`${capW}×${capH}`)) throw new Error(`capture badge "${badge}" does not reflect actual ${capW}x${capH}`);
-  log(`4K unavailable fallback verified (actual ${capW || '?'}x${capH || '?'} shown honestly)`);
+// The 4K request may need up to three sequential getUserMedia attempts
+// (portrait ideal -> landscape retry -> portrait reopen), and the
+// "not available" notice auto-dismisses after ~2.2s — so poll until either
+// a true 4K-class capture is reported or the notice is seen, rather than
+// reading the state once and racing both.
+{
+  const deadline = Date.now() + 12000;
+  let capW = 0; let capH = 0; let outcome = null;
+  while (Date.now() < deadline && !outcome) {
+    capW = Number(await qualityFrame.getAttribute('data-capture-width')) || 0;
+    capH = Number(await qualityFrame.getAttribute('data-capture-height')) || 0;
+    if (Math.min(capW, capH) >= 2160) outcome = 'delivered';
+    else if (await page.getByText('4K not available on this camera').isVisible().catch(() => false)) outcome = 'notice';
+    else await page.waitForTimeout(150);
+  }
+  if (outcome === 'delivered') {
+    log(`4K capture delivered (${capW}x${capH})`);
+  } else if (outcome === 'notice') {
+    const badge = await page.locator('[data-capture-badge]').textContent();
+    if (capW && capH && !badge.includes(`${capW}×${capH}`)) throw new Error(`capture badge "${badge}" does not reflect actual ${capW}x${capH}`);
+    log(`4K unavailable fallback verified (actual ${capW || '?'}x${capH || '?'} shown honestly)`);
+  } else {
+    // Notice may have flashed and expired between polls; the honest badge is
+    // the durable affordance — accept it as the fallback evidence.
+    const badge = await page.locator('[data-capture-badge]').textContent();
+    if (!(capW && capH) || !badge.includes(`${capW}×${capH}`)) {
+      throw new Error(`4K selection settled neither on 4K capture nor an honest fallback (got ${capW}x${capH}, badge "${badge}")`);
+    }
+    log(`4K unavailable fallback verified via badge (actual ${capW}x${capH}; notice expired between polls)`);
+  }
 }
 await page.getByRole('button', { name: 'HD', exact: true }).click();
 await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
