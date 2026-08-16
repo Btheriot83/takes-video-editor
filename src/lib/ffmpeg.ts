@@ -1,7 +1,8 @@
 import { clipLen, exportDimensions } from '../types/clip';
 import type { AspectRatio, Clip, ExportQuality } from '../types/clip';
 import type { FFmpeg } from '@ffmpeg/ffmpeg';
-import { planWebCodecsEncode, renderVideoWebCodecs } from './webcodecs-export';
+import { planWebCodecsEncode } from './webcodecs-export';
+import { renderVideoWorkerFirst } from './render-worker-client';
 import { clearExportLog, exportLog } from './export-log';
 
 // We load @ffmpeg/ffmpeg's ESM build from same-origin static files
@@ -315,45 +316,20 @@ async function runExport(
     await dropAllInputs();
   }
 
-  // Per-clip probe + audio encode: each clip is written to MEMFS alone,
-  // probed, its audio encoded to a small AAC segment, and removed again.
+  // Light per-clip probe pass: header parse only (`-i` with no output), one
+  // clip resident in MEMFS at a time. Kept separate from the audio encode so
+  // encoder planning (which needs the max source fps) can happen immediately
+  // and the heavy audio work can overlap the video render below.
   throwIfAborted();
-  onProgress?.('Encoding audio', 0.03);
+  onProgress?.('Preparing media', 0.03);
   const probes: InputProbe[] = [];
-  const audioSegments: string[] = [];
   for (let i = 0; i < clips.length; i++) {
     throwIfAborted();
     await ffmpeg.writeFile(inputs[i], new Uint8Array(await blobs[i].arrayBuffer()));
     const [probe] = await probeInputs(ffmpeg, [inputs[i]]);
-    probes.push(probe);
-    const len = clipLen(clips[i]);
-    const segment = `a${i}.m4a`;
-    const segCode = await ffmpeg.exec([
-      '-fflags', '+genpts',
-      '-ss', String(clips[i].trimIn), '-t', String(len), '-i', inputs[i],
-      '-filter_complex', audioChain(0, len, probe.hasAudio).replace('[a0]', '[aseg]'),
-      '-map', '[aseg]', '-c:a', 'aac', '-b:a', '128k', '-vn', segment,
-    ]);
     await ffmpeg.deleteFile(inputs[i]).catch(() => {});
-    if (segCode !== 0) throw new Error(`audio encode failed (clip ${i + 1})`);
-    audioSegments.push(segment);
-    onProgress?.('Encoding audio', 0.03 + 0.05 * ((i + 1) / clips.length));
-  }
-  // Join the AAC segments with the concat FILTER (decode + re-encode): the
-  // concat demuxer's "-c copy" would reintroduce the AAC priming-gap clicks
-  // at clip joins that the gapless work removed.
-  {
-    const joinArgs: string[] = [];
-    for (const segment of audioSegments) joinArgs.push('-i', segment);
-    joinArgs.push(
-      '-filter_complex',
-      `${audioSegments.map((_, i) => `[${i}:a]`).join('')}concat=n=${audioSegments.length}:v=0:a=1[aout]`,
-      '-map', '[aout]', '-c:a', 'aac', '-b:a', '128k', '-vn', 'audio.m4a',
-    );
-    const joinCode = await ffmpeg.exec(joinArgs);
-    for (const segment of audioSegments) await ffmpeg.deleteFile(segment).catch(() => {});
-    if (joinCode !== 0) throw new Error('audio join failed');
-    exportLog('audio track encoded (per-clip segments)');
+    probes.push(probe);
+    onProgress?.('Preparing media', 0.03 + 0.03 * ((i + 1) / clips.length));
   }
   // Cap at 60 for encoder planning: phone/browser capture never exceeds 60fps
   // and anything above it here is a probe artifact that would produce an
@@ -361,53 +337,122 @@ async function runExport(
   const maxSourceFps = Math.min(60, probes.reduce((max, probe) => Math.max(max, probe.fps ?? 30), 30));
   throwIfAborted();
 
+  /**
+   * Audio pipeline (per-clip AAC segments + gapless join, emitted as raw ADTS
+   * and parsed into frames the mp4-muxer adds directly next to the video).
+   * Runs entirely inside the ffmpeg worker, so it executes CONCURRENTLY with
+   * the WebCodecs video render (which never touches ffmpeg): the audio wall
+   * time disappears from the export's critical path instead of preceding the
+   * render serially. exec calls stay strictly sequential WITHIN this task —
+   * the single ffmpeg worker is not reentrant — and the caller always settles
+   * this promise before running any other exec.
+   *
+   * Memory note (iOS tab-kill ceiling, see 5b6c1b9): inputs are still written
+   * one at a time and deleted immediately, so MEMFS peak stays at one clip.
+   * The wasm heap never shrinks, so its high-water mark is identical to the
+   * old audio-first ordering — overlap only moves WHEN the same growth
+   * happens, it does not add to it.
+   */
+  const encodeAudioTrack = async (): Promise<Uint8Array> => {
+    const audioSegments: string[] = [];
+    try {
+      for (let i = 0; i < clips.length; i++) {
+        if (signal?.aborted) throw abortError();
+        await ffmpeg.writeFile(inputs[i], new Uint8Array(await blobs[i].arrayBuffer()));
+        const len = clipLen(clips[i]);
+        const segment = `a${i}.m4a`;
+        const segCode = await ffmpeg.exec([
+          '-fflags', '+genpts',
+          '-ss', String(clips[i].trimIn), '-t', String(len), '-i', inputs[i],
+          '-filter_complex', audioChain(0, len, probes[i].hasAudio).replace('[a0]', '[aseg]'),
+          '-map', '[aseg]', '-c:a', 'aac', '-b:a', '128k', '-vn', segment,
+        ]);
+        await ffmpeg.deleteFile(inputs[i]).catch(() => {});
+        if (segCode !== 0) throw new Error(`audio encode failed (clip ${i + 1})`);
+        audioSegments.push(segment);
+      }
+      // Join the AAC segments with the concat FILTER (decode + re-encode): the
+      // concat demuxer's "-c copy" would reintroduce the AAC priming-gap
+      // clicks at clip joins that the gapless work removed.
+      const joinArgs: string[] = [];
+      for (const segment of audioSegments) joinArgs.push('-i', segment);
+      // Raw ADTS output (not .m4a): the frames are parsed in JS and handed to
+      // mp4-muxer directly, so the final MP4 needs no ffmpeg "-c copy" remux.
+      joinArgs.push(
+        '-filter_complex',
+        `${audioSegments.map((_, i) => `[${i}:a]`).join('')}concat=n=${audioSegments.length}:v=0:a=1[aout]`,
+        '-map', '[aout]', '-c:a', 'aac', '-b:a', '128k', '-vn', '-f', 'adts', 'audio.aac',
+      );
+      const joinCode = await ffmpeg.exec(joinArgs);
+      if (joinCode !== 0) throw new Error('audio join failed');
+      const adts = await ffmpeg.readFile('audio.aac');
+      await ffmpeg.deleteFile('audio.aac').catch(() => {});
+      exportLog(
+        `audio track encoded (per-clip segments, concurrent with render): ` +
+        `${(adts as Uint8Array).byteLength} bytes ADTS`,
+      );
+      return adts as Uint8Array;
+    } finally {
+      for (const segment of audioSegments) await ffmpeg.deleteFile(segment).catch(() => {});
+      for (const name of inputs) await ffmpeg.deleteFile(name).catch(() => {});
+    }
+  };
+
   // Fast path: hardware (or native software) H.264 via WebCodecs. wasm x264
   // cannot finish 2160x3840 on real devices, so 4K depends on this path; it is
   // also used for 1080p renders when available. Audio is still produced by
-  // ffmpeg.wasm (audio-only AAC encode is fast) and the two are remuxed with
-  // "-c copy", so the result stays a normal faststart MP4.
+  // ffmpeg.wasm (audio-only AAC encode is fast, emitted as raw ADTS) and its
+  // frames are muxed directly into the mp4-muxer output alongside the video,
+  // so the result is a normal faststart MP4 with no final ffmpeg remux.
   const plan = await planWebCodecsEncode(output.width, output.height, quality, maxSourceFps);
   if (!plan && quality === '4K' && isMobileClass()) {
     // wasm x264 cannot realistically finish 2160x3840 on a phone; running it
     // presents as an export that never completes. Be honest instead.
-    await ffmpeg.deleteFile('audio.m4a').catch(() => {});
     throw new Error('This device cannot encode 4K video in the browser. Export at 1080p instead.');
   }
   if (plan) {
+    // Kick off the audio pipeline now and let it run in the ffmpeg worker
+    // while the WebCodecs render proceeds; capture its outcome instead of
+    // rejecting so an early render failure can still await settlement (the
+    // worker must be idle before any fallback exec).
+    const audioTask: Promise<{ adts: Uint8Array } | { failure: unknown }> = encodeAudioTrack().then(
+      (adts) => ({ adts }),
+      (error: unknown) => ({ failure: error ?? new Error('audio encode failed') }),
+    );
+    // Raw ADTS bytes, not parsed frames: a single Uint8Array crosses the
+    // render-worker boundary as one structured-clone (the worker parses it);
+    // the main-thread copy stays alive for the in-page fallback render.
+    const getAdts = async () => {
+      const settled = await audioTask;
+      if ('failure' in settled) throw settled.failure;
+      return settled.adts;
+    };
     try {
       exportLog(`using webcodecs encoder: ${plan.config.codec} ${plan.config.hardwareAcceleration ?? 'default'}`);
       onProgress?.('Rendering video', 0.09);
-      let videoBytes: Uint8Array | null = await renderVideoWebCodecs(
-        clips, blobs, output.width, output.height, plan,
-        (p) => onProgress?.('Rendering video', 0.09 + p * 0.83), signal);
+      // The render (worker-first, main-thread fallback) muxes the AAC frames
+      // directly next to the video and finalizes a faststart MP4 — the
+      // returned bytes ARE the deliverable. No MEMFS video copy, no "-c copy"
+      // exec, no out.mp4 readback.
+      const finalBytes = await renderVideoWorkerFirst(
+        clips, blobs, output.width, output.height, plan, getAdts,
+        (p) => onProgress?.('Rendering video', 0.09 + p * 0.85), signal);
 
       throwIfAborted();
-      onProgress?.('Finalizing', 0.94);
-      await ffmpeg.writeFile('wcvideo.mp4', videoBytes);
-      videoBytes = null; // MEMFS holds the only copy now; release ours
-      const muxCode = await ffmpeg.exec([
-        '-i', 'wcvideo.mp4', '-i', 'audio.m4a',
-        '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy',
-        '-movflags', '+faststart', '-map_metadata', '-1', '-metadata', 'encoder=',
-        'out.mp4',
-      ]);
-      // Intermediates are dead weight whether or not the mux worked.
-      for (const n of ['wcvideo.mp4', 'audio.m4a']) await ffmpeg.deleteFile(n).catch(() => {});
-      if (muxCode !== 0) throw new Error('final mux failed');
-      exportLog('video+audio muxed');
-
-      const muxed = await ffmpeg.readFile('out.mp4');
-      const bytes = (muxed as Uint8Array).byteLength;
-      const blob = new Blob([new Uint8Array(muxed as Uint8Array).buffer as ArrayBuffer], { type: 'video/mp4' });
-      ffmpeg.deleteFile('out.mp4').catch(() => {});
+      exportLog('video+audio muxed (direct, no remux)');
+      const bytes = finalBytes.byteLength;
+      const blob = new Blob([finalBytes.buffer as ArrayBuffer], { type: 'video/mp4' });
       onProgress?.('Done', 1);
       return { blob, bytes, seconds: (performance.now() - started) / 1000, mode: 'transcoded' };
     } catch (error) {
+      // The audio task may still be mid-exec in the worker; let it settle
+      // (it never rejects) before any cleanup or fallback exec touches ffmpeg.
+      await audioTask;
       if (signal?.aborted) throw abortError();
       webcodecsFailure = error instanceof Error ? error.message : String(error);
       exportLog(`webcodecs path failed (${webcodecsFailure}); falling back to wasm encoder`);
       console.warn('[export] webcodecs path failed; falling back to wasm encoder', error);
-      for (const n of ['wcvideo.mp4', 'audio.m4a', 'out.mp4']) ffmpeg.deleteFile(n).catch(() => {});
+      for (const n of ['audio.aac', 'out.mp4']) ffmpeg.deleteFile(n).catch(() => {});
       if (quality === '4K' && isMobileClass()) {
         // See above: a phone-class wasm 4K encode never finishes in practice.
         throw new Error(`Export failed: ${webcodecsFailure}. Try again, or export at 1080p.`);
@@ -416,7 +461,7 @@ async function runExport(
   }
 
   throwIfAborted();
-  await ffmpeg.deleteFile('audio.m4a').catch(() => {});
+  await ffmpeg.deleteFile('audio.aac').catch(() => {});
   // The combined wasm encode needs every input present at once.
   await writeAllInputs();
   const args: string[] = [];

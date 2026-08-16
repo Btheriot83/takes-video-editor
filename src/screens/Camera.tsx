@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Film, Images, SwitchCamera, Zap, ZapOff } from 'lucide-react';
 import { getCameraStream, startRecording } from '../lib/recorder';
 import type { ActiveRecording } from '../lib/recorder';
+import { storageMode } from '../lib/db';
 import { useStore } from '../state/store';
 import { ASPECT_RATIOS, fmtTime, clipLen, isUltraHDCapture } from '../types/clip';
 import type { AspectRatio, CaptureQuality } from '../types/clip';
@@ -32,6 +33,7 @@ export default function Camera() {
   const zoomFrameRef = useRef<number | null>(null);
   const pendingZoomRef = useRef<number | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
+  const memoryNoticeShownRef = useRef(false);
 
   const [facing, setFacing] = useState<'user' | 'environment'>('environment');
   const [recording, setRecording] = useState(false);
@@ -52,10 +54,10 @@ export default function Camera() {
     aspectRatio, setAspectRatio, captureQuality, setCaptureQuality,
   } = useStore();
 
-  const showCapabilityNotice = useCallback((message: string) => {
+  const showCapabilityNotice = useCallback((message: string, durationMs = 2200) => {
     setCapabilityNotice(message);
     if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
-    noticeTimerRef.current = window.setTimeout(() => setCapabilityNotice(null), 2200);
+    noticeTimerRef.current = window.setTimeout(() => setCapabilityNotice(null), durationMs);
   }, []);
 
   const openCamera = useCallback(async (nextFacing: 'user' | 'environment', quality: CaptureQuality) => {
@@ -139,19 +141,30 @@ export default function Camera() {
         // Clear crash-recovery chunks only after the media and project entry
         // are both safely stored.
         await active.finalize();
+        // Private browsing / broken IndexedDB: the clip was kept in memory
+        // instead. Say so once, without blocking further recording.
+        if (storageMode() === 'memory' && !memoryNoticeShownRef.current) {
+          memoryNoticeShownRef.current = true;
+          showCapabilityNotice("Private browsing: clips won't survive closing this tab", 6000);
+        }
       } else {
         await active.finalize();
         throw new Error('The browser returned an empty recording');
       }
     } catch (recordingError) {
       console.error('[cam] stop recording failed', recordingError);
-      setError('The recording could not be saved. Please try again.');
+      // Keep the underlying reason visible: a field screenshot of this alert
+      // must be enough to diagnose what actually failed.
+      const detail = recordingError instanceof Error && recordingError.message
+        ? ` (${recordingError.message})`
+        : '';
+      setError(`The recording could not be saved. Please try again.${detail}`);
     } finally {
       setElapsed(0);
       stoppingRef.current = false;
       setStopping(false);
     }
-  }, [addClipFromBlob]);
+  }, [addClipFromBlob, showCapabilityNotice]);
 
   const startHold = useCallback((source: ActiveHold) => {
     if (
@@ -411,7 +424,7 @@ export default function Camera() {
         )}
 
         {capabilityNotice && (
-          <div className="absolute left-1/2 top-4 z-20 -translate-x-1/2 whitespace-nowrap rounded-full bg-neutral-900 px-3 py-2 text-xs shadow-lg" aria-live="polite">
+          <div className="absolute left-1/2 top-4 z-20 w-max max-w-[calc(100%-2rem)] -translate-x-1/2 rounded-2xl bg-neutral-900 px-3 py-2 text-center text-xs shadow-lg" aria-live="polite">
             {capabilityNotice}
           </div>
         )}

@@ -1,6 +1,9 @@
 // Repro/verify: import a VIDEO-ONLY webm via the app's Import control, export,
 // and report whether the export succeeds and what streams the MP4 contains.
 // Run: CHROME_PATH=... node scripts/probe-noaudio.mjs http://localhost:PORT/ /tmp/video-only.webm
+// WCODEC=vp09.00.51.08 adds the test-only ?wcodec= override so the silent-clip
+// export exercises the WebCodecs direct-mux pipeline (worker render + mp4-muxer
+// audio/video) instead of the wasm encoder.
 import { chromium } from 'playwright-core';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -30,7 +33,9 @@ page.on('console', (m) => {
 });
 page.on('pageerror', (e) => errors.push(String(e)));
 
-await page.goto(BASE, { waitUntil: 'load' });
+const url = new URL(BASE);
+if (process.env.WCODEC) url.searchParams.set('wcodec', process.env.WCODEC);
+await page.goto(url.toString(), { waitUntil: 'load' });
 await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
 await page.setInputFiles('input[type="file"]', FILE);
 await page.waitForSelector('[data-editor-frame], [data-clip]', { timeout: 20000 }).catch(() => {});

@@ -7,11 +7,24 @@
 const buffer: string[] = [];
 const LIMIT = 48;
 
+/**
+ * Optional forwarding sink. The render worker installs one that posts each
+ * line to the main thread, which re-logs it there (console + main buffer) —
+ * so a set sink REPLACES the local console.log to avoid double-printing the
+ * same line from both contexts (the e2e suite counts console lines).
+ */
+let sink: ((message: string) => void) | null = null;
+
+export function setExportLogSink(fn: ((message: string) => void) | null): void {
+  sink = fn;
+}
+
 export function exportLog(message: string): void {
   const stamp = new Date().toISOString().slice(11, 19);
   buffer.push(`${stamp} ${message}`);
   if (buffer.length > LIMIT) buffer.shift();
-  console.log('[export]', message);
+  if (sink) sink(message);
+  else console.log('[export]', message);
 }
 
 export function exportLogTail(count = 12): string[] {

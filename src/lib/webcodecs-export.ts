@@ -9,8 +9,9 @@ import { exportLog } from './export-log';
  * WebCodecs render path: decode each clip in an offscreen <video>, step it
  * frame by frame (paused seeks + requestVideoFrameCallback), draw each
  * presented frame onto an OffscreenCanvas and hand it to a (preferably
- * hardware) VideoEncoder. The encoded chunks are muxed into a video-only MP4
- * with mp4-muxer; the caller adds the AAC audio track afterwards.
+ * hardware) VideoEncoder. The encoded chunks are muxed with mp4-muxer; the
+ * caller's ffmpeg-encoded AAC audio (raw ADTS frames) is muxed directly into
+ * the same file, producing the final faststart MP4 with no ffmpeg remux.
  *
  * This exists because single-threaded wasm x264 cannot finish a 2160x3840
  * encode on real phones/laptops, and the pthread core deadlocks in Chrome.
@@ -33,6 +34,98 @@ import { exportLog } from './export-log';
 export interface WebCodecsPlan {
   config: VideoEncoderConfig;
   muxerCodec: 'avc' | 'vp9' | 'av1' | 'hevc';
+}
+
+// ---------------------------------------------------------------------------
+// ADTS AAC parsing: the audio pipeline (ffmpeg.wasm) emits raw AAC in an ADTS
+// stream, and the frames are muxed directly into the mp4-muxer output next to
+// the video track — eliminating the former "-c copy" ffmpeg remux (and the
+// MEMFS round-trip of the entire video) from the export's critical path.
+// ---------------------------------------------------------------------------
+
+export interface AdtsFrame {
+  data: Uint8Array;
+  timestampUs: number;
+  durationUs: number;
+}
+
+export interface AdtsAudio {
+  sampleRate: number;
+  numberOfChannels: number;
+  /** MPEG-4 AudioSpecificConfig (esds decoder description) */
+  audioSpecificConfig: Uint8Array;
+  frames: AdtsFrame[];
+}
+
+/** ADTS sampling_frequency_index table (ISO 14496-3). */
+const ADTS_SAMPLE_RATES = [
+  96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+  16000, 12000, 11025, 8000, 7350,
+];
+
+/**
+ * Parse an ADTS AAC elementary stream into per-frame payloads with timestamps
+ * on a gapless 1024-samples-per-frame grid starting at 0. Header layout
+ * (7 bytes, 9 with CRC): 12-bit syncword 0xFFF, MPEG version/layer,
+ * protection_absent; profile (AOT-1), sampling_frequency_index and channel
+ * configuration; 13-bit frame_length spanning bytes 3-5. Also builds the
+ * AudioSpecificConfig (AOT, freq index, channel config) the MP4 esds needs.
+ */
+export function parseAdts(bytes: Uint8Array): AdtsAudio {
+  const frames: AdtsFrame[] = [];
+  let sampleRate = 0;
+  let numberOfChannels = 0;
+  let objectType = 2; // AAC-LC
+  let freqIndex = -1;
+  let chanCfg = 0;
+  let offset = 0;
+  while (offset + 7 <= bytes.length) {
+    if (bytes[offset] !== 0xff || (bytes[offset + 1] & 0xf0) !== 0xf0) {
+      throw new Error(`ADTS sync lost at byte ${offset}`);
+    }
+    const protectionAbsent = (bytes[offset + 1] & 0x01) === 1;
+    const headerLength = protectionAbsent ? 7 : 9;
+    const profile = (bytes[offset + 2] >> 6) & 0x03; // AOT - 1
+    const thisFreqIndex = (bytes[offset + 2] >> 2) & 0x0f;
+    const thisChanCfg = ((bytes[offset + 2] & 0x01) << 2) | (bytes[offset + 3] >> 6);
+    const frameLength =
+      ((bytes[offset + 3] & 0x03) << 11) | (bytes[offset + 4] << 3) | (bytes[offset + 5] >> 5);
+    if (frameLength < headerLength || offset + frameLength > bytes.length) {
+      throw new Error(`ADTS frame length ${frameLength} invalid at byte ${offset}`);
+    }
+    const rate = ADTS_SAMPLE_RATES[thisFreqIndex];
+    if (!rate) throw new Error(`ADTS sampling frequency index ${thisFreqIndex} unsupported`);
+    if (freqIndex < 0) {
+      objectType = profile + 1;
+      freqIndex = thisFreqIndex;
+      sampleRate = rate;
+      chanCfg = thisChanCfg;
+      numberOfChannels = thisChanCfg;
+    }
+    frames.push({
+      data: bytes.slice(offset + headerLength, offset + frameLength),
+      timestampUs: 0, // filled below on the gapless sample grid
+      durationUs: 0,
+    });
+    offset += frameLength;
+  }
+  if (!frames.length || !sampleRate || !numberOfChannels) {
+    throw new Error('ADTS stream contained no decodable frames');
+  }
+  // Gapless grid: frame i covers samples [i*1024, (i+1)*1024) at sampleRate.
+  // Deriving each timestamp from the sample index (not by accumulating a
+  // rounded per-frame duration) keeps long tracks drift-free.
+  const tsAt = (i: number) => Math.round((i * 1024 * 1_000_000) / sampleRate);
+  for (let i = 0; i < frames.length; i++) {
+    frames[i].timestampUs = tsAt(i);
+    frames[i].durationUs = tsAt(i + 1) - tsAt(i);
+  }
+  // AudioSpecificConfig: 5 bits AOT, 4 bits frequency index, 4 bits channel
+  // config (AOT is always <= 4 here, so the escape encodings never apply).
+  const asc = new Uint8Array(2);
+  asc[0] = (objectType << 3) | (freqIndex >> 1);
+  asc[1] = ((freqIndex & 0x01) << 7) | (chanCfg << 3);
+  return { sampleRate, numberOfChannels, audioSpecificConfig: asc, frames };
 }
 
 // Test-only escape hatch: headless Chromium builds used by the e2e suite ship
@@ -219,7 +312,19 @@ let bitmapResizeBroken = false;
 // createImageBitmap rung for that page load so the e2e suite can prove the
 // WebGL rung specifically. Per-page-load query param only; persistent state
 // is deliberately NOT honored so the override cannot linger for real users.
+let scalerOverrideValue: string | null | undefined;
+
+/**
+ * Inject the scaler override explicitly. The render worker has no access to
+ * the page URL (its `location` is the worker script URL), so the main thread
+ * reads ?scaler= and passes it along in the start message.
+ */
+export function setScalerOverride(value: string | null): void {
+  scalerOverrideValue = value;
+}
+
 function scalerOverride(): string | null {
+  if (scalerOverrideValue !== undefined) return scalerOverrideValue;
   try {
     return new URLSearchParams(window.location.search).get('scaler');
   } catch {
@@ -777,15 +882,25 @@ export async function demuxClip(blob: Blob, signal?: AbortSignal): Promise<Demux
   };
   let fragmented = false;
   file.onSamples = (id: number, _user: unknown, batch: Sample[]) => {
+    // Copy the whole batch into ONE contiguous buffer (each sample becomes a
+    // subarray view) instead of one .slice() allocation per sample: same
+    // memory bound (exactly the payload bytes are retained, mp4box's buffers
+    // are still released below), far less allocator churn on long clips.
+    let batchBytes = 0;
+    for (const sample of batch) if (sample.data) batchBytes += sample.data.byteLength;
+    const block = new Uint8Array(batchBytes);
+    let write = 0;
     for (const sample of batch) {
       if (!sample.data) continue;
       if (sample.moof_number !== undefined) fragmented = true;
+      block.set(sample.data, write);
       samples.push({
         isSync: sample.is_sync,
         tsUs: Math.round((sample.cts * 1_000_000) / sample.timescale),
         durUs: Math.round((sample.duration * 1_000_000) / sample.timescale),
-        data: sample.data.slice(), // copy: the original lives in mp4box's buffer
+        data: block.subarray(write, write + sample.data.byteLength),
       });
+      write += sample.data.byteLength;
     }
     // Memory discipline: hand the consumed batch's buffers back to mp4box.
     const last = batch[batch.length - 1];
@@ -888,8 +1003,10 @@ export async function captureClipViaDecoder(
   state: RenderState,
   onSeconds: (s: number) => void,
   signal?: AbortSignal,
+  predemuxed?: Promise<DemuxedClip>,
 ): Promise<void> {
-  const demuxed = await demuxClip(blob, signal);
+  const demuxed = await (predemuxed ?? demuxClip(blob, signal));
+  if (signal?.aborted) throw abortError();
   // Some muxers (Chromium's MediaRecorder among them) write vpcC level 0,
   // yielding a codec string like "vp09.00.00.08" that VideoDecoder's parser
   // rejects — level 00 is not a defined VP9 level. Offer a normalized
@@ -1067,7 +1184,12 @@ export async function captureClipViaDecoder(
 }
 
 /**
- * Render all clips to a video-only MP4 (bytes) using the given encoder plan.
+ * Render all clips to an MP4 (bytes) using the given encoder plan. When
+ * `getAudio` is provided, its ADTS-parsed AAC frames are muxed directly into
+ * the same file (awaited only after the video is fully encoded, so the ffmpeg
+ * audio pipeline runs concurrently with the render) and the output is the
+ * FINAL faststart MP4 — no ffmpeg remux follows. Without `getAudio` the output
+ * is video-only, as before.
  * Throws on any failure; the caller is expected to fall back to wasm.
  * Aborting the signal stops the capture loop, closes the encoder and rejects
  * with an AbortError DOMException.
@@ -1078,6 +1200,7 @@ export async function renderVideoWebCodecs(
   width: number,
   height: number,
   plan: WebCodecsPlan,
+  getAudio?: () => Promise<AdtsAudio>,
   onProgress?: (p: number) => void,
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
@@ -1085,7 +1208,7 @@ export async function renderVideoWebCodecs(
   let attemptUsedDecoder = false;
   try {
     return await renderVideoAttempt(clips, blobs, width, height, plan, true,
-      (used) => { attemptUsedDecoder = used; }, onProgress, signal);
+      (used) => { attemptUsedDecoder = used; }, getAudio, onProgress, signal);
   } catch (error) {
     // Full-render safety net: a decoder-path death AFTER frames reached the
     // muxer cannot be retried per-clip (duplicate frames), so restart the
@@ -1096,7 +1219,7 @@ export async function renderVideoWebCodecs(
     if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error;
     if (!attemptUsedDecoder) throw error;
     exportLog(`render restart: element-only after decoder failure (${error instanceof Error ? error.message : error})`);
-    return await renderVideoAttempt(clips, blobs, width, height, plan, false, () => {}, onProgress, signal);
+    return await renderVideoAttempt(clips, blobs, width, height, plan, false, () => {}, getAudio, onProgress, signal);
   }
 }
 
@@ -1108,6 +1231,7 @@ async function renderVideoAttempt(
   plan: WebCodecsPlan,
   allowDecoderPath: boolean,
   onDecoderUsed: (used: boolean) => void,
+  getAudio?: () => Promise<AdtsAudio>,
   onProgress?: (p: number) => void,
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
@@ -1116,11 +1240,20 @@ async function renderVideoAttempt(
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
     video: { codec: plan.muxerCodec, width, height },
-    // The final ffmpeg "-c copy" remux applies +faststart; keep muxing cheap.
+    // When audio is muxed here the output IS the delivered file, so it must be
+    // faststart itself: 'in-memory' buffers samples (they were headed for one
+    // ArrayBuffer anyway) and writes moov before mdat at finalize. Audio-less
+    // (legacy) renders keep the cheap end-of-file moov; the ffmpeg remux that
+    // consumed them applied +faststart.
     // Timestamps are anchored per clip (first captured frame = clip offset),
     // so the first sample lands at exactly 0 and no muxer-level offset — which
-    // would shift video against the separately-encoded audio — is needed.
-    fastStart: false,
+    // would shift video against the separately-encoded audio — is needed. The
+    // AAC frames from parseAdts start at 0 on a gapless grid, matching how the
+    // former remux laid out audio.m4a.
+    fastStart: getAudio ? 'in-memory' : false,
+    ...(getAudio
+      ? { audio: { codec: 'aac' as const, sampleRate: 48000, numberOfChannels: 2 } }
+      : {}),
   });
 
   const state: RenderState = {
@@ -1176,12 +1309,44 @@ async function renderVideoAttempt(
     return v;
   };
 
+  // Throttle progress to ~10 updates/sec: onSeconds fires per captured frame,
+  // and pushing every frame through React state/DOM updates measurably taxes
+  // the 2-core render loop. The final onProgress(1) below is unconditional.
+  let lastProgressAt = 0;
+  const throttledProgress = onProgress
+    ? (p: number) => {
+        const now = Date.now();
+        if (now - lastProgressAt >= 100) {
+          lastProgressAt = now;
+          onProgress(p);
+        }
+      }
+    : undefined;
+
+  // One-ahead demux prefetch: clip N+1's demux (blob read + mp4box parse +
+  // sample extraction) is CPU-light next to decode/encode, so it runs
+  // concurrently while clip N occupies the codecs. Exactly ONE clip is
+  // prefetched (bounded memory); the promise observes `signal`, and any
+  // rejection is parked (no-op catch) until the owning clip awaits it — or
+  // dropped entirely in the finally when the render aborts/fails.
+  let prefetch: { index: number; promise: Promise<DemuxedClip> } | null = null;
+
   try {
     encoder.configure(plan.config);
     for (let i = 0; i < clips.length; i++) {
       const done = clips.slice(0, i).reduce((s, c) => s + clipLen(c), 0);
-      const progress = (s: number) => onProgress?.(Math.min(0.99, (done + s) / total));
+      const progress = (s: number) => throttledProgress?.(Math.min(0.99, (done + s) / total));
       exportLog(`clip ${i + 1}/${clips.length}: decode+capture start`);
+      if (
+        allowDecoderPath &&
+        i + 1 < clips.length &&
+        (!prefetch || prefetch.index !== i + 1) &&
+        decoderPathEligible(clips[i + 1], blobs[i + 1])
+      ) {
+        const promise = demuxClip(blobs[i + 1], signal);
+        promise.catch(() => {}); // parked until awaited; never unhandled
+        prefetch = { index: i + 1, promise };
+      }
       const framesBefore = state.frames;
       // PRIMARY: demuxer-based decode (mp4box + VideoDecoder, no media
       // elements) for eligible MP4 clips. Fall back to the element path only
@@ -1190,8 +1355,10 @@ async function renderVideoAttempt(
       let captured = false;
       if (allowDecoderPath && decoderPathEligible(clips[i], blobs[i])) {
         onDecoderUsed(true);
+        const predemuxed = prefetch?.index === i ? prefetch.promise : undefined;
+        if (predemuxed) prefetch = null;
         try {
-          await captureClipViaDecoder(clips[i], blobs[i], canvas, ctx, encoder, state, progress, signal);
+          await captureClipViaDecoder(clips[i], blobs[i], canvas, ctx, encoder, state, progress, signal, predemuxed);
           captured = true;
           exportLog(`clip ${i + 1}/${clips.length} mode=decoder`);
         } catch (error) {
@@ -1200,6 +1367,12 @@ async function renderVideoAttempt(
         }
       }
       if (!captured) {
+        // In a worker there is no DOM: the element path cannot ever succeed,
+        // so fail the worker attempt immediately instead of burning the
+        // 400ms retry (the main thread falls back to an in-page render).
+        if (typeof document === 'undefined') {
+          throw new Error('element capture path unavailable in this context (no DOM)');
+        }
         try {
           await captureClipViaElement(clips[i], blobs[i], makeVideo(), canvas, ctx, encoder, state, progress, signal);
         } catch (error) {
@@ -1217,14 +1390,48 @@ async function renderVideoAttempt(
       }
       // Give iOS's lazy AVPlayer teardown a beat before opening the next
       // decoder session; without it, back-to-back sessions starve on phones.
-      if (i + 1 < clips.length) await new Promise((r) => setTimeout(r, 150));
+      // Only needed when THIS clip went through a <video> element — the
+      // demuxer path opens no AVPlayer-backed session, so pausing after
+      // decoder-mode clips would only add dead time.
+      if (!captured && i + 1 < clips.length) await new Promise((r) => setTimeout(r, 150));
     }
     await encoder.flush();
     if (signal?.aborted) throw abortError();
     if (state.error) throw state.error instanceof Error ? state.error : new Error(String(state.error));
     if (!state.frames) throw new Error('no frames encoded');
+    if (getAudio) {
+      // The audio pipeline has been running concurrently in the ffmpeg worker;
+      // by the time the video is flushed it is normally already done.
+      const audio = await getAudio();
+      if (signal?.aborted) throw abortError();
+      if (audio.sampleRate !== 48000 || audio.numberOfChannels !== 2) {
+        // The ffmpeg audio chain normalizes to 48kHz stereo; anything else
+        // means the pipeline changed and the declared track config is wrong.
+        throw new Error(
+          `unexpected AAC format ${audio.sampleRate}Hz/${audio.numberOfChannels}ch (expected 48000/2)`,
+        );
+      }
+      const meta: EncodedAudioChunkMetadata = {
+        decoderConfig: {
+          codec: 'mp4a.40.2',
+          sampleRate: audio.sampleRate,
+          numberOfChannels: audio.numberOfChannels,
+          description: audio.audioSpecificConfig,
+        },
+      };
+      for (let i = 0; i < audio.frames.length; i++) {
+        const f = audio.frames[i];
+        // Every AAC frame is independently decodable — all 'key'. The esds
+        // decoder description travels on the first chunk's metadata.
+        muxer.addAudioChunkRaw(f.data, 'key', f.timestampUs, f.durationUs, i === 0 ? meta : undefined);
+      }
+      exportLog(`audio muxed directly: ${audio.frames.length} AAC frames @${audio.sampleRate}Hz`);
+    }
     muxer.finalize();
   } finally {
+    // Drop the prefetched demux so its samples are collectable immediately if
+    // the render aborted or failed (its rejection is already parked above).
+    prefetch = null;
     releaseFrameScaler();
     try {
       if (encoder.state !== 'closed') encoder.close();

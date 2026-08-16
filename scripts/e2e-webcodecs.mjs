@@ -106,8 +106,11 @@ const dialog = page.getByRole('dialog', { name: 'Export video' });
 // bypass the encoder under test; force the 4K transcode path explicitly.
 await dialog.getByRole('button', { name: '4K', exact: true }).click();
 await dialog.getByText(/4K · 2160 × 3840/).waitFor();
+// Benchmark: wall time from clicking Start export to "Video ready".
+const exportStartedAt = Date.now();
 await dialog.getByRole('button', { name: 'Start export' }).click();
 await dialog.getByText('Video ready to share or download').waitFor({ timeout: 300000 });
+const exportMs = Date.now() - exportStartedAt;
 const downloadPromise = page.waitForEvent('download', { timeout: 60000 });
 await dialog.getByRole('button', { name: 'Download MP4' }).click();
 const download = await downloadPromise;
@@ -196,7 +199,7 @@ if (forcedScaler === 'webgl' && !exportLogs.some((l) => l.includes('scaler: webg
 }
 
 console.log(JSON.stringify({
-  clipCount, output, bytes: fs.statSync(output).size, usedWebCodecs, fellBack, decoderClips, elementClips,
+  clipCount, exportMs, output, bytes: fs.statSync(output).size, usedWebCodecs, fellBack, decoderClips, elementClips,
   forcedScaler, scalerLog, ssimUpright, ssimFlipped,
   video: { width: video.width, height: video.height, duration: videoDur, frames: exportedFrames },
   audio: { codec: audio.codec_name, duration: audioDur },
