@@ -205,6 +205,59 @@ interface RenderState {
 
 const abortError = () => new DOMException('Export cancelled', 'AbortError');
 
+/**
+ * Scale/crop a decoded frame to the output size, preferring a single
+ * GPU-accelerated createImageBitmap crop+resize over the 2D-canvas draw +
+ * readback that dominated per-frame cost on phones (a 1080p->4K upscale
+ * through a 33MP canvas ran at single-digit fps on iPhone). Falls back to the
+ * canvas path permanently on the first failure (older engines lack resize
+ * options).
+ */
+let bitmapResizeBroken = false;
+async function scaleFrame(
+  frame: VideoFrame,
+  timestamp: number,
+  duration: number,
+  canvas: OffscreenCanvas,
+  ctx: OffscreenCanvasRenderingContext2D,
+): Promise<VideoFrame> {
+  const vw = frame.displayWidth;
+  const vh = frame.displayHeight;
+  const W = canvas.width;
+  const H = canvas.height;
+  if (!bitmapResizeBroken && typeof createImageBitmap === 'function') {
+    try {
+      // Cover semantics: crop the centered source rect whose aspect matches
+      // the output, then resize — one GPU op instead of draw + readback.
+      const scale = Math.max(W / vw, H / vh);
+      const sw = Math.min(vw, Math.round(W / scale));
+      const sh = Math.min(vh, Math.round(H / scale));
+      const sx = Math.floor((vw - sw) / 2);
+      const sy = Math.floor((vh - sh) / 2);
+      const bitmap = await createImageBitmap(frame, sx, sy, sw, sh, {
+        resizeWidth: W,
+        resizeHeight: H,
+        resizeQuality: 'medium',
+      });
+      try {
+        if (bitmap.width === W && bitmap.height === H) {
+          return new VideoFrame(bitmap, { timestamp, duration });
+        }
+        // Engine ignored the resize options — fall through to canvas.
+        bitmapResizeBroken = true;
+        exportLog('bitmap resize unsupported (size mismatch); using canvas scaling');
+      } finally {
+        bitmap.close();
+      }
+    } catch {
+      bitmapResizeBroken = true;
+      exportLog('bitmap resize failed; using canvas scaling');
+    }
+  }
+  drawCover(ctx, frame, vw, vh, W, H);
+  return new VideoFrame(canvas, { timestamp, duration });
+}
+
 function drawCover(
   ctx: OffscreenCanvasRenderingContext2D,
   source: CanvasImageSource,
@@ -231,7 +284,7 @@ function waitForQueueDrain(
     const check = () => {
       state.lastActivity = Date.now();
       if (signal?.aborted) reject(abortError());
-      else if (encoder.state !== 'configured' || encoder.encodeQueueSize <= 2) resolve();
+      else if (encoder.state !== 'configured' || encoder.encodeQueueSize <= 4) resolve();
       else setTimeout(check, 40);
     };
     check();
@@ -368,7 +421,7 @@ async function captureClipViaElement(
         captured += 1;
         lastT = t;
         onSeconds(rel);
-        if (encoder.encodeQueueSize > 4) await waitForQueueDrain(encoder, state, signal);
+        if (encoder.encodeQueueSize > 8) await waitForQueueDrain(encoder, state, signal);
       }
 
       // advance to the next distinct frame
@@ -735,11 +788,19 @@ export async function captureClipViaDecoder(
       let ts = base + Math.round(rel * 1_000_000);
       if (ts <= state.lastTs) ts = state.lastTs + 1_000; // strictly increasing for the muxer
       state.lastTs = ts;
-      drawCover(ctx, frame, frame.displayWidth, frame.displayHeight, canvas.width, canvas.height);
       // Explicit non-negative duration: the encoder propagates it to the
       // chunk, so the muxer never derives one from timestamp deltas.
       const duration = frame.duration && frame.duration > 0 ? frame.duration : 33_333;
-      const out = new VideoFrame(canvas, { timestamp: ts, duration });
+      let out: VideoFrame;
+      if (frame.displayWidth === canvas.width && frame.displayHeight === canvas.height) {
+        // Dimensions already match the output (e.g. true 4K capture exported
+        // at 4K): wrap the decoded frame with new timing instead of the
+        // 33-megapixel canvas draw + readback — a zero-copy retimestamp that
+        // roughly halves per-frame cost on the dominant path.
+        out = new VideoFrame(frame, { timestamp: ts, duration });
+      } else {
+        out = await scaleFrame(frame, ts, duration, canvas, ctx);
+      }
       const keyFrame = state.frames === 0 || ts - state.lastKeyTs >= 2_000_000;
       if (keyFrame) state.lastKeyTs = ts;
       encoder.encode(out, { keyFrame });
@@ -750,7 +811,7 @@ export async function captureClipViaDecoder(
     } finally {
       frame.close();
     }
-    if (encoder.encodeQueueSize > 4) await waitForQueueDrain(encoder, state, signal);
+    if (encoder.encodeQueueSize > 8) await waitForQueueDrain(encoder, state, signal);
   };
 
   try {
@@ -783,10 +844,10 @@ export async function captureClipViaDecoder(
       }));
       fed += 1;
       // Backpressure: bounded decode queue and bounded pool of live frames.
-      while (pending.length > 0 && (pending.length > 2 || decoder.decodeQueueSize > 4)) {
+      while (pending.length > 0 && (pending.length > 4 || decoder.decodeQueueSize > 8)) {
         await consume(pending.shift()!);
       }
-      while (decoder.decodeQueueSize > 4 && pending.length === 0) {
+      while (decoder.decodeQueueSize > 8 && pending.length === 0) {
         await decoderTick(state, signal);
         throwIfBroken();
       }

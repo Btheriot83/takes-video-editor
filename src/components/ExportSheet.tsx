@@ -189,8 +189,11 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
             </p>
             <button onClick={share}
               className="w-full bg-white text-black font-semibold py-3 rounded-xl active:scale-[0.98] flex items-center justify-center gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
-              <Share2 size={17} /> Share
+              <Share2 size={17} /> Save to Photos / Share
             </button>
+            <p className="text-[11px] leading-snug text-white/50">
+              Opens the system sheet — save to Photos, iCloud Drive, Google Drive, AirDrop, or send it anywhere.
+            </p>
             <button onClick={download}
               className="w-full bg-white/10 font-medium py-3 rounded-xl active:scale-[0.98] flex items-center justify-center gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
               <Download size={17} /> Download MP4
