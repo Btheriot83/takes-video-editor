@@ -96,7 +96,7 @@ export default function Editor() {
     exportQualityTouchedRef.current = true;
     setExportQuality(quality);
     // Remembered so the Camera screen can nudge habitual 4K exporters toward
-    // 4K capture (which unlocks the instant no-re-encode export paths).
+    // 4K capture (which can unlock the no-re-encode export paths).
     setLastExportQuality(quality);
   }, [setLastExportQuality]);
 
