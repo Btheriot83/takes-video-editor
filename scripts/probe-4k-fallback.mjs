@@ -55,7 +55,7 @@ if (await frame.getAttribute('data-capture-quality') !== '4K') throw new Error('
 const capW = Number(await frame.getAttribute('data-capture-width'));
 const capH = Number(await frame.getAttribute('data-capture-height'));
 if (!(capW && capH) || Math.min(capW, capH) >= 2160) throw new Error(`expected a sub-4K capture, got ${capW}x${capH}`);
-const badge = await page.getByText(/^Camera /).textContent();
+const badge = await page.locator('[data-capture-badge]').textContent();
 if (!badge.includes(`${capW}×${capH}`)) throw new Error(`badge "${badge}" does not report the real capture size ${capW}x${capH}`);
 log(`badge honestly reports ${capW}×${capH}`);
 

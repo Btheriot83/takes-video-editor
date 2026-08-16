@@ -58,6 +58,9 @@ await page.locator('[data-editor-frame]').waitFor();
 
 await page.getByText('Export video', { exact: true }).click();
 const dialog = page.getByRole('dialog', { name: 'Export video' });
+// HD fake-camera clips default the sheet to 1080p, which would remux and
+// bypass the encoder under test; force the 4K transcode path explicitly.
+await dialog.getByRole('button', { name: '4K', exact: true }).click();
 await dialog.getByText(/4K · 2160 × 3840/).waitFor();
 await dialog.getByRole('button', { name: 'Start export' }).click();
 await dialog.getByText('Video ready to share or download').waitFor({ timeout: 300000 });

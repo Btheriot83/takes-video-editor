@@ -48,6 +48,32 @@ export function captureConstraints(facing: 'user' | 'environment', quality: Capt
 }
 
 /**
+ * Landscape-convention 4K retry constraints. iOS lists its camera modes in
+ * landscape, so portrait ideals 2160x3840 sit closer (by fitness distance) to
+ * 1920x1080 than to 3840x2160 and 4K silently never engages. Retrying with
+ * landscape ideals — plus advanced exact sets for both orientations — lets
+ * WebKit pick the real 4K mode.
+ */
+export function ultraHDRetryConstraints(facing: 'user' | 'environment'): MediaTrackConstraints {
+  const size = CAPTURE_DIMENSIONS['4K'];
+  return {
+    facingMode: { ideal: facing },
+    width: { ideal: size.height },
+    height: { ideal: size.width },
+    frameRate: { ideal: 30, max: 30 },
+    advanced: [
+      { width: size.height, height: size.width },
+      { width: size.width, height: size.height },
+    ],
+  };
+}
+
+function streamIsUltraHD(stream: MediaStream): boolean {
+  const settings = stream.getVideoTracks()[0]?.getSettings?.();
+  return isUltraHDCapture(settings?.width, settings?.height);
+}
+
+/**
  * Recording bitrate matched to the delivered capture size. 4K-class frames
  * need roughly 4x the bits of 1080x1920 to keep the same visual quality;
  * everything else stays at the proven HD rate.
@@ -60,12 +86,31 @@ export async function getCameraStream(
   facing: 'user' | 'environment',
   quality: CaptureQuality = 'HD',
 ): Promise<MediaStream> {
+  const audio: MediaTrackConstraints = { echoCancellation: true, noiseSuppression: true };
   const base: MediaStreamConstraints = {
     video: captureConstraints(facing, quality),
-    audio: { echoCancellation: true, noiseSuppression: true },
+    audio,
   };
   try {
-    return await navigator.mediaDevices.getUserMedia(base);
+    let stream = await navigator.mediaDevices.getUserMedia(base);
+    if (quality === '4K' && !streamIsUltraHD(stream)) {
+      // iOS resolves portrait 2160x3840 ideals to 1920x1080 (see
+      // ultraHDRetryConstraints). Retry ONCE with landscape ideals before
+      // letting the Camera screen show the "4K not available" notice.
+      stream.getTracks().forEach((track) => track.stop());
+      try {
+        const retry = await navigator.mediaDevices.getUserMedia({
+          video: ultraHDRetryConstraints(facing),
+          audio,
+        });
+        if (streamIsUltraHD(retry)) return retry;
+        // Still not 4K-class: discard the landscape stream so preview and
+        // recording keep the portrait convention.
+        retry.getTracks().forEach((track) => track.stop());
+      } catch { /* retry constraints rejected; reopen the portrait stream */ }
+      stream = await navigator.mediaDevices.getUserMedia(base);
+    }
+    return stream;
   } catch {
     // fallback: any camera (some desktops choke on facingMode ideal with audio constraints)
     return navigator.mediaDevices.getUserMedia({ video: true, audio: true });
