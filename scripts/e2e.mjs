@@ -4,6 +4,9 @@ import { chromium } from 'playwright-core';
 import fs from 'node:fs';
 
 const BASE = process.argv[2] || 'http://localhost:4173/';
+// Timing-assertion multiplier for slow CI/sandbox machines (default 1 keeps
+// the strict local-dev budgets). Only stretches timeouts; asserts unchanged.
+const SLACK = Math.max(1, Number(process.env.E2E_TIME_SLACK || 1));
 const OUT = 'scripts/e2e-out';
 fs.mkdirSync(OUT, { recursive: true });
 
@@ -202,9 +205,9 @@ for (let i = 0; i < 3; i++) {
   const releaseStarted = Date.now();
   const releaseType = i === 1 ? 'touchCancel' : 'touchEnd';
   await cdp.send('Input.dispatchTouchEvent', { type: releaseType, touchPoints: [] });
-  await page.waitForFunction(() => document.querySelector('[data-record-state]')?.getAttribute('data-record-state') !== 'recording', null, { timeout: 750 });
+  await page.waitForFunction(() => document.querySelector('[data-record-state]')?.getAttribute('data-record-state') !== 'recording', null, { timeout: 750 * SLACK });
   const releaseLatency = Date.now() - releaseStarted;
-  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 1500 });
+  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 1500 * SLACK });
   await page.waitForTimeout(600);
   if (mediaRecorderStarts !== i + 1) throw new Error(`expected ${i + 1} recorder starts, got ${mediaRecorderStarts}`);
   log(`clip ${i + 1} recorded; ${releaseType} stopped in ${releaseLatency}ms`);

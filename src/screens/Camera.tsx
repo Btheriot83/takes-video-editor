@@ -48,11 +48,15 @@ export default function Camera() {
   const [torchOn, setTorchOn] = useState(false);
   const [captureSize, setCaptureSize] = useState<{ width?: number; height?: number; frameRate?: number } | null>(null);
   const [capabilityNotice, setCapabilityNotice] = useState<string | null>(null);
+  const savedTimerRef = useRef<number | null>(null);
+  const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  const [poppedClipId, setPoppedClipId] = useState<string | null>(null);
 
   const {
     clips, addClipFromBlob, importFiles, setScreen, total,
     aspectRatio, setAspectRatio, captureQuality, setCaptureQuality,
   } = useStore();
+  const lastExportQuality = useStore((s) => s.lastExportQuality);
 
   const showCapabilityNotice = useCallback((message: string, durationMs = 2200) => {
     setCapabilityNotice(message);
@@ -115,6 +119,7 @@ export default function Camera() {
 
   useEffect(() => () => {
     if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
+    if (savedTimerRef.current) window.clearTimeout(savedTimerRef.current);
     if (zoomFrameRef.current) window.cancelAnimationFrame(zoomFrameRef.current);
   }, []);
 
@@ -137,7 +142,17 @@ export default function Camera() {
       if (blob.size > 0) {
         // Camera thumbnails are deferred so mobile decoders are fully
         // available for the next recording instead of competing in parallel.
-        await addClipFromBlob(blob, blob.type, false);
+        const clip = await addClipFromBlob(blob, blob.type, false);
+        // Unmissable saved confirmation: users reported not knowing whether
+        // releasing the button actually kept the clip.
+        const count = useStore.getState().clips.length;
+        setSavedNotice(`Clip saved ✓ · ${count} clip${count === 1 ? '' : 's'}`);
+        setPoppedClipId(clip.id);
+        if (savedTimerRef.current) window.clearTimeout(savedTimerRef.current);
+        savedTimerRef.current = window.setTimeout(() => {
+          setSavedNotice(null);
+          setPoppedClipId(null);
+        }, 2600);
         // Clear crash-recovery chunks only after the media and project entry
         // are both safely stored.
         await active.finalize();
@@ -347,7 +362,19 @@ export default function Camera() {
                   captureQuality === quality ? 'bg-white text-black' : 'text-white/70'
                 }`}
               >
-                {quality}
+                <span className="relative">
+                  {quality}
+                  {/* Subtle steer: someone who last exported at 4K but is
+                      capturing HD is giving up the instant no-re-encode 4K
+                      export. A dot, not a modal. */}
+                  {quality === '4K' && captureQuality === 'HD' && lastExportQuality === '4K' && (
+                    <span
+                      data-capture-4k-nudge
+                      title="You last exported in 4K — capturing in 4K makes 4K export instant"
+                      className="absolute -right-1.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-400"
+                    />
+                  )}
+                </span>
               </button>
             ))}
           </div>
@@ -410,9 +437,9 @@ export default function Camera() {
           </div>
 
           {recording && (
-            <div className="absolute left-3 top-3 flex items-center gap-2 rounded-full bg-black/65 px-3 py-1.5 text-xs font-semibold tabular-nums">
-              <span className="h-2 w-2 rounded-full bg-red-500" />
-              {fmtTime(elapsed)}
+            <div className="absolute left-3 top-3 flex items-center gap-2 rounded-full bg-red-600 px-3 py-1.5 text-xs font-bold tabular-nums text-white shadow-lg">
+              <span className="h-2 w-2 animate-pulse rounded-full bg-white" />
+              REC {fmtTime(elapsed)}
             </div>
           )}
         </div>
@@ -420,6 +447,16 @@ export default function Camera() {
         {error && (
           <div role="alert" className="absolute inset-x-4 top-4 z-20 rounded-xl bg-neutral-900 p-4 text-center text-sm shadow-lg">
             {error}
+          </div>
+        )}
+
+        {savedNotice && (
+          <div
+            data-saved-notice
+            role="status"
+            className="absolute bottom-4 left-1/2 z-20 w-max max-w-[calc(100%-2rem)] -translate-x-1/2 rounded-full bg-white px-4 py-2 text-center text-sm font-semibold text-black shadow-lg"
+          >
+            {savedNotice}
           </div>
         )}
 
@@ -436,19 +473,25 @@ export default function Camera() {
             type="button"
             disabled={controlsDisabled}
             onClick={() => setScreen('editor')}
-            className="mx-auto mb-3 flex min-h-11 max-w-full items-center gap-2 rounded-full bg-white/10 px-2 pr-4 text-left transition-colors active:bg-white/15 disabled:opacity-40"
+            aria-label={`Edit ${clips.length} clip${clips.length === 1 ? '' : 's'}`}
+            className="mx-auto mb-3 flex min-h-11 max-w-full items-center gap-2 rounded-full bg-white px-2 pr-1.5 text-left text-black shadow-lg transition-colors active:bg-white/85 disabled:opacity-40"
           >
             <span className="flex -space-x-2">
-              {clips.slice(-3).map((clip) => (
-                <span key={clip.id} className="h-8 w-8 overflow-hidden rounded-md border border-black bg-neutral-800">
+              {clips.slice(-3).map((clip, index, shown) => (
+                <span
+                  key={clip.id}
+                  className={`h-8 w-8 overflow-hidden rounded-md border border-white bg-neutral-800 ${
+                    clip.id === poppedClipId && index === shown.length - 1 ? 'animate-thumb-pop' : ''
+                  }`}
+                >
                   {clip.thumbs[0] && <img src={clip.thumbs[0]} className="h-full w-full object-cover" alt="" />}
                 </span>
               ))}
             </span>
-            <span className="truncate text-xs font-medium">
+            <span className="truncate text-xs font-semibold">
               {clips.length} clip{clips.length === 1 ? '' : 's'} · {fmtTime(clips.reduce((sum, clip) => sum + clipLen(clip), 0))}
             </span>
-            <span className="ml-auto text-xs font-semibold">Edit</span>
+            <span className="ml-auto rounded-full bg-black px-3 py-1.5 text-xs font-bold text-white">Edit</span>
           </button>
         )}
 
@@ -510,12 +553,24 @@ export default function Camera() {
                 }
               }}
               onBlur={() => endMatchingHold('keyboard', 'keyboard')}
-              className={`relative flex h-[78px] w-[78px] touch-none items-center justify-center rounded-full border-[5px] border-white transition-transform duration-150 active:scale-95 disabled:opacity-35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white ${recording ? 'scale-110' : ''}`}
+              className={`relative flex h-[78px] w-[78px] touch-none items-center justify-center rounded-full border-[5px] transition-transform duration-150 active:scale-95 disabled:opacity-35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white ${recording ? 'scale-110 border-red-500' : 'border-white'}`}
             >
-              <span className={`block bg-red-500 transition-all duration-150 ${recording ? 'h-[62px] w-[62px]' : 'h-[58px] w-[58px] rounded-full'}`} />
+              {recording && (
+                <span aria-hidden="true" className="absolute -inset-1.5 animate-record-pulse rounded-full border-2 border-red-500" />
+              )}
+              {/* While recording the inner shape becomes a rounded square — the
+                  universal "stop" glyph — so release-to-stop reads visually,
+                  not just in the hint text. */}
+              <span className={`block bg-red-500 transition-all duration-150 ${recording ? 'h-[36px] w-[36px] rounded-lg' : 'h-[58px] w-[58px] rounded-full'}`} />
             </button>
-            <span id="record-hint" className="mt-2 text-[11px] font-medium text-white/60">
-              {recording ? 'Release to stop' : 'Hold to record'}
+            <span
+              id="record-hint"
+              aria-live="polite"
+              className={`mt-2 rounded-full px-2.5 py-0.5 text-[11px] transition-colors ${
+                recording ? 'bg-red-600 font-bold text-white' : 'font-medium text-white/60'
+              }`}
+            >
+              {recording ? 'Recording — release to stop' : 'Hold to record'}
             </span>
           </div>
 

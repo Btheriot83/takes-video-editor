@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { totalDuration, clipLen, DEFAULT_ASPECT_RATIO, DEFAULT_CAPTURE_QUALITY } from '../types/clip';
-import type { AspectRatio, CaptureQuality, Clip } from '../types/clip';
+import type { AspectRatio, CaptureQuality, Clip, ExportQuality } from '../types/clip';
 import { History, trimClip, splitClip, moveClip, duplicateClip, uid } from '../lib/editor';
 import {
   saveProject, loadProject, saveBlob, getBlob, deleteBlob, recRecover, recFinalize, gcBlobs, clearProject,
@@ -22,6 +22,14 @@ interface State {
   total: number;
   aspectRatio: AspectRatio;
   captureQuality: CaptureQuality;
+  /**
+   * Last export quality the user explicitly chose, persisted across sessions.
+   * Read by the Camera screen to badge the 4K capture toggle when someone who
+   * exports at 4K is still capturing HD (an HD capture forces an upscale
+   * transcode instead of the instant copy-path 4K export).
+   */
+  lastExportQuality: ExportQuality | null;
+  setLastExportQuality: (quality: ExportQuality) => void;
 
   init: () => Promise<void>;
   addClipFromBlob: (blob: Blob, mimeType: string, generateThumbs?: boolean) => Promise<Clip>;
@@ -42,6 +50,18 @@ interface State {
   reorder: (from: number, to: number) => void;
   newProject: () => Promise<void>;
   dismissNotice: () => void;
+}
+
+const LAST_EXPORT_QUALITY_KEY = 'takes.lastExportQuality';
+
+/** localStorage can throw (Safari private mode); the preference is optional. */
+function readLastExportQuality(): ExportQuality | null {
+  try {
+    const value = localStorage.getItem(LAST_EXPORT_QUALITY_KEY);
+    return value === '4K' || value === '1080p' ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 const history = new History();
@@ -75,6 +95,7 @@ export const useStore = create<State>((set, get) => ({
   total: 0,
   aspectRatio: DEFAULT_ASPECT_RATIO,
   captureQuality: DEFAULT_CAPTURE_QUALITY,
+  lastExportQuality: readLastExportQuality(),
 
   init: async () => {
     let notice: string | null = null;
@@ -172,6 +193,12 @@ export const useStore = create<State>((set, get) => ({
   setCaptureQuality: (captureQuality) => {
     set({ captureQuality });
     persist(get().clips, get().aspectRatio, captureQuality);
+  },
+  setLastExportQuality: (quality) => {
+    set({ lastExportQuality: quality });
+    try {
+      localStorage.setItem(LAST_EXPORT_QUALITY_KEY, quality);
+    } catch { /* private mode: keep it session-only */ }
   },
 
   commit: (next, selectId) => {

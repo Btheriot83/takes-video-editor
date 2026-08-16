@@ -62,11 +62,43 @@ for (let i = 0; i < 2; i++) {
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
   await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
   await page.waitForTimeout(1200);
+  if (i === 0) {
+    await page.screenshot({ path: `${OUT}/camera-recording-390.png` });
+    await measure('camera-recording');
+  }
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  if (i === 0) {
+    await page.waitForSelector('[data-saved-notice]', { timeout: 10000 });
+    await page.screenshot({ path: `${OUT}/camera-saved-390.png` });
+    await measure('camera-just-saved');
+  }
   await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 10000 });
 }
+await page.waitForTimeout(2800); // let the saved toast dismiss for the steady-state shot
 await page.screenshot({ path: `${OUT}/camera-clips-390.png` });
 await measure('camera-with-clips');
+await page.setViewportSize({ width: 320, height: 568 });
+await page.waitForTimeout(300);
+await page.screenshot({ path: `${OUT}/camera-clips-320.png` });
+await measure('camera-with-clips');
+{
+  // Compact-viewport recording + saved states.
+  const record = page.getByRole('button', { name: 'Hold to record' });
+  const box = await record.boundingBox();
+  const point = { x: box.x + box.width / 2, y: box.y + box.height / 2, id: 9 };
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
+  await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
+  await page.waitForTimeout(1200);
+  await page.screenshot({ path: `${OUT}/camera-recording-320.png` });
+  await measure('camera-recording');
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  await page.waitForSelector('[data-saved-notice]', { timeout: 10000 });
+  await page.screenshot({ path: `${OUT}/camera-saved-320.png` });
+  await measure('camera-just-saved');
+  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 10000 });
+}
+await page.setViewportSize({ width: 390, height: 844 });
+await page.waitForTimeout(300);
 
 await page.getByText('Edit', { exact: true }).click();
 await page.waitForSelector('text=Split', { timeout: 15000 });

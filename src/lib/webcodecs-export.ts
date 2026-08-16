@@ -1,5 +1,5 @@
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
-import { createFile, DataStream, Endianness, MP4BoxBuffer } from 'mp4box';
+import { createFile, DataStream, Endianness, Log, MP4BoxBuffer } from 'mp4box';
 import type { ISOFile, Movie, Sample, Track } from 'mp4box';
 import { clipLen } from '../types/clip';
 import type { Clip, ExportQuality } from '../types/clip';
@@ -200,18 +200,23 @@ export async function planWebCodecsEncode(
   // 60fps ceiling: capture never exceeds it and higher figures are probe
   // artifacts that inflate the H.264 level past what hardware accepts.
   const framerate = Math.min(60, Math.max(1, Math.round(maxSourceFps)));
-  // latencyMode 'realtime' disables B-frame reordering. Safari's VideoToolbox
-  // H.264 encoder otherwise emits B-frames, whose out-of-presentation-order
-  // chunks make mp4-muxer compute a NEGATIVE sample duration and abort
-  // ("addVideoChunkRaw's fourth argument (duration) must be a non-negative
-  // real number" — observed on iPhone). Chrome's encoder is realtime-biased
-  // already, so this is behavior-neutral there.
-  const base: VideoEncoderConfig = { codec: '', width, height, bitrate, framerate, latencyMode: 'realtime' };
+  // QUALITY (default) latency mode first: latencyMode 'realtime' was set
+  // globally to suppress Safari VideoToolbox B-frames (whose out-of-order
+  // chunks broke the muxer), but a realtime session is wall-clock PACED on
+  // VideoToolbox — exports took roughly the content duration on iPhone.
+  // Quality mode unlocks faster-than-realtime encoding; the render carries a
+  // runtime guard that detects out-of-presentation-order (B-frame) chunks and
+  // restarts the render once with this same config plus latencyMode
+  // 'realtime' (see renderVideoWebCodecs), so encoders that DO reorder
+  // (Safari) still produce a correct file while encoders that don't (Chrome)
+  // keep the fast path.
+  const base: VideoEncoderConfig = { codec: '', width, height, bitrate, framerate };
 
   const override = codecOverride();
   const candidates: VideoEncoderConfig[] = [];
   if (override) {
     candidates.push({ ...base, codec: override });
+    candidates.push({ ...base, codec: override, latencyMode: 'realtime' });
   } else {
     // High profile; level derived from output size and source frame rate
     // (e.g. 5.1 covers 2160x3840@30, 5.2 is required above 30fps at 4K).
@@ -219,14 +224,20 @@ export async function planWebCodecsEncode(
       `avc1.6400${avcLevelFor(width, height, fps).toString(16).padStart(2, '0').toUpperCase()}`;
     const avc = { avc: { format: 'avc' as const } };
     // Prefer real hardware; accept the platform's native software encoder as a
-    // second choice (still native code, far faster than wasm x264). A final
+    // second choice (still native code, far faster than wasm x264). A
     // conservative rung (30fps envelope, level for 30) covers hardware that
-    // rejects the higher level despite claiming support.
-    candidates.push({ ...base, codec: codecFor(framerate), hardwareAcceleration: 'prefer-hardware', ...avc });
-    candidates.push({ ...base, codec: codecFor(framerate), hardwareAcceleration: 'no-preference', ...avc });
+    // rejects the higher level despite claiming support. Each shape is tried
+    // in quality mode first, then the whole ladder repeats with latencyMode
+    // 'realtime' for platforms whose encoder only preflights in realtime.
+    const shapes: VideoEncoderConfig[] = [
+      { ...base, codec: codecFor(framerate), hardwareAcceleration: 'prefer-hardware', ...avc },
+      { ...base, codec: codecFor(framerate), hardwareAcceleration: 'no-preference', ...avc },
+    ];
     if (framerate > 30) {
-      candidates.push({ ...base, framerate: 30, codec: codecFor(30), hardwareAcceleration: 'prefer-hardware', ...avc });
+      shapes.push({ ...base, framerate: 30, codec: codecFor(30), hardwareAcceleration: 'prefer-hardware', ...avc });
     }
+    candidates.push(...shapes);
+    candidates.push(...shapes.map((shape) => ({ ...shape, latencyMode: 'realtime' as const })));
   }
 
   for (const config of candidates) {
@@ -242,10 +253,13 @@ export async function planWebCodecsEncode(
       // configs it accepts can still fail at configure()/first encode. Prove
       // the config with a real one-frame encode before committing the export.
       if (await preflightEncode(config)) {
-        exportLog(`encoder preflight OK: ${config.codec} ${config.hardwareAcceleration ?? 'default'} @${config.framerate}fps`);
+        exportLog(
+          `encoder preflight OK: ${config.codec} ${config.hardwareAcceleration ?? 'default'} ` +
+          `@${config.framerate}fps latency=${config.latencyMode ?? 'quality'}`,
+        );
         return { config, muxerCodec };
       }
-      exportLog(`encoder preflight failed: ${config.codec} ${config.hardwareAcceleration ?? 'default'}`);
+      exportLog(`encoder preflight failed: ${config.codec} ${config.hardwareAcceleration ?? 'default'} latency=${config.latencyMode ?? 'quality'}`);
     } catch {
       // An unknown codec string or option throws; just try the next candidate.
     }
@@ -291,12 +305,34 @@ interface RenderState {
   offsetUs: number;
   lastTs: number;
   lastKeyTs: number;
+  /** timestamp of the last encoder chunk fed to the muxer (reorder guard) */
+  lastMuxTs: number;
   frames: number;
   error: unknown;
   lastActivity: number;
 }
 
 const abortError = () => new DOMException('Export cancelled', 'AbortError');
+
+/**
+ * Thrown (via state.error) when the encoder emits chunks whose timestamps go
+ * backwards — i.e. it reorders frames with B-frames (Safari VideoToolbox in
+ * quality latency mode). WebCodecs delivers chunks in decode order, so with
+ * strictly-increasing input pts a backwards timestamp can ONLY mean B-frame
+ * reordering, which mp4-muxer's monotonic addVideoChunkRaw feed cannot
+ * represent without dts/ctts bookkeeping WebCodecs gives us no dts for.
+ * renderVideoWebCodecs catches this and restarts the render once with
+ * latencyMode 'realtime', which disables B-frames.
+ */
+export class ReorderedChunksError extends Error {
+  readonly reorderedChunks = true;
+  constructor(previousUs: number, currentUs: number) {
+    super(`encoder emitted out-of-order (B-frame) chunks: ${currentUs}us after ${previousUs}us`);
+  }
+}
+
+const isReorderedChunksError = (error: unknown): boolean =>
+  !!error && typeof error === 'object' && (error as { reorderedChunks?: boolean }).reorderedChunks === true;
 
 /**
  * Scale/crop a decoded frame to the output size, preferring a single
@@ -564,20 +600,60 @@ function drawCover(
   ctx.drawImage(source, (width - dw) / 2, (height - dh) / 2, dw, dh);
 }
 
+/**
+ * Wait until `isDone()` (typically "queue drained below the watermark").
+ * Where the codec supports the WebCodecs 'dequeue' event, waits on that event
+ * (fired whenever [en/de]codeQueueSize decreases) with only a slow safety
+ * poll for abort/error responsiveness; otherwise falls back to 40ms polling.
+ */
+function waitForDequeue(
+  codec: VideoEncoder | VideoDecoder,
+  isDone: () => boolean,
+  state: RenderState,
+  signal?: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const target = codec as unknown as {
+      addEventListener?: (type: string, cb: () => void) => void;
+      removeEventListener?: (type: string, cb: () => void) => void;
+    };
+    const useEvent = 'ondequeue' in codec && typeof target.addEventListener === 'function';
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      if (useEvent) target.removeEventListener?.('dequeue', check);
+    };
+    const check = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      state.lastActivity = Date.now();
+      if (signal?.aborted) {
+        cleanup();
+        reject(abortError());
+        return;
+      }
+      if (state.error || isDone()) {
+        cleanup();
+        resolve(); // state.error is rethrown by the caller's own checks
+        return;
+      }
+      timer = setTimeout(check, useEvent ? 250 : 40);
+    };
+    if (useEvent) target.addEventListener?.('dequeue', check);
+    check();
+  });
+}
+
 function waitForQueueDrain(
   encoder: VideoEncoder,
   state: RenderState,
   signal?: AbortSignal,
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const check = () => {
-      state.lastActivity = Date.now();
-      if (signal?.aborted) reject(abortError());
-      else if (encoder.state !== 'configured' || encoder.encodeQueueSize <= 4) resolve();
-      else setTimeout(check, 40);
-    };
-    check();
-  });
+  return waitForDequeue(
+    encoder,
+    () => encoder.state !== 'configured' || encoder.encodeQueueSize <= 4,
+    state,
+    signal,
+  );
 }
 
 /**
@@ -968,6 +1044,92 @@ export async function demuxClip(blob: Blob, signal?: AbortSignal): Promise<Demux
   return demuxed;
 }
 
+/**
+ * Lightweight MP4 header probe via mp4box (pure JS, no ffmpeg): reports
+ * whether the file has an audio track, its video frame rate, and the first
+ * video track's codec string + encoded (pre-rotation) dimensions — the latter
+ * feed the multi-clip "-c copy" uniformity check, so one parse per blob serves
+ * both the encoder-planning and copy-path needs. Replaces the
+ * former per-clip ffmpeg `-i` probe on the export critical path — that probe
+ * required the whole ffmpeg wasm module to be loaded and each blob written to
+ * MEMFS before the render could start (2-4s of dead time at 0% progress).
+ * Returns null when the blob is not parsable MP4 (e.g. WebM); the caller
+ * falls back to the ffmpeg probe for those.
+ *
+ * Non-fragmented files stop parsing right after moov (sample counts live in
+ * stbl); fragmented files (Safari MediaRecorder) are appended fully so moof
+ * sample counts accumulate — still pure in-memory JS, far cheaper than the
+ * ffmpeg round-trip.
+ */
+export async function probeMp4Blob(
+  blob: Blob,
+  signal?: AbortSignal,
+): Promise<{
+  hasAudio: boolean;
+  fps: number | null;
+  codec: string | null;
+  codedWidth: number | null;
+  codedHeight: number | null;
+  /** tkhd display/rotation matrix of the first video track (9 fixed-point values). */
+  matrix: number[] | null;
+} | null> {
+  // Non-MP4 input (e.g. a WebM blob) makes mp4box's BoxParser call
+  // Log.error("BoxParser", "Invalid box type...") WITHOUT an isofile, which
+  // bypasses onError and prints straight to console.error before we return
+  // null. Console-error-sensitive gates (the e2e suites fail the run on any
+  // console error) must not trip on that expected fallback, so route
+  // Log.error through onError-or-silence for the duration of the parse.
+  const originalLogError = Log.error;
+  Log.error = ((module: string, msg: string, isofile?: { onError?: (m: string, s: string) => void }) => {
+    isofile?.onError?.(module, msg);
+  }) as typeof Log.error;
+  try {
+    const file = createFile();
+    let ready: Movie | null = null;
+    let failed = false;
+    file.onError = () => { failed = true; };
+    file.onReady = (info: Movie) => { ready = info; };
+    const buffer = await blob.arrayBuffer();
+    const CHUNK = 8 * 1024 * 1024;
+    for (let offset = 0; offset < buffer.byteLength; offset += CHUNK) {
+      if (signal?.aborted) throw abortError();
+      const end = Math.min(buffer.byteLength, offset + CHUNK);
+      file.appendBuffer(MP4BoxBuffer.fromArrayBuffer(buffer.slice(offset, end), offset));
+      if (failed) return null;
+      const readyInfo = ready as Movie | null;
+      if (readyInfo && !readyInfo.isFragmented && (readyInfo.videoTracks?.[0]?.nb_samples ?? 0) > 0) {
+        break; // moov parsed and sample table present — nothing more needed
+      }
+      if (end < buffer.byteLength) await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    file.flush();
+    if (failed || !ready) return null;
+    // Re-read the info so fragmented files include every parsed moof's samples.
+    const info = file.getInfo() ?? (ready as Movie);
+    const hasAudio = (info.audioTracks?.length ?? 0) > 0;
+    let fps: number | null = null;
+    const video = info.videoTracks?.[0];
+    if (video && video.timescale > 0) {
+      const durationSec = (video.samples_duration || video.duration || 0) / video.timescale;
+      if (durationSec > 0 && video.nb_samples > 0) {
+        const value = video.nb_samples / durationSec;
+        if (Number.isFinite(value) && value >= 1 && value <= 240) fps = value;
+      }
+    }
+    const codec = video?.codec ?? null;
+    const codedWidth = video?.video?.width ?? video?.track_width ?? null;
+    const codedHeight = video?.video?.height ?? video?.track_height ?? null;
+    const matrix = video?.matrix ? Array.from(video.matrix as ArrayLike<number>) : null;
+    file.stop();
+    return { hasAudio, fps, codec, codedWidth, codedHeight, matrix };
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error;
+    return null;
+  } finally {
+    Log.error = originalLogError;
+  }
+}
+
 /** Abortable/error-aware short sleep used by decoder backpressure waits. */
 function decoderTick(state: RenderState, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -1148,8 +1310,17 @@ export async function captureClipViaDecoder(
       while (pending.length > 0 && (pending.length > 4 || decoder.decodeQueueSize > 8)) {
         await consume(pending.shift()!);
       }
-      while (decoder.decodeQueueSize > 8 && pending.length === 0) {
-        await decoderTick(state, signal);
+      if (decoder.decodeQueueSize > 8 && pending.length === 0) {
+        await waitForDequeue(
+          decoder,
+          () =>
+            decoder.state !== 'configured' ||
+            decoder.decodeQueueSize <= 8 ||
+            pending.length > 0 ||
+            decodeFailure !== null,
+          state,
+          signal,
+        );
         throwIfBroken();
       }
     }
@@ -1205,6 +1376,35 @@ export async function renderVideoWebCodecs(
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
   if (signal?.aborted) throw abortError();
+  try {
+    return await renderVideoWithElementRestart(clips, blobs, width, height, plan, getAudio, onProgress, signal);
+  } catch (error) {
+    // B-frame safety net: the encoder plan prefers quality latency mode
+    // (faster than realtime on hardware), but an encoder that reorders
+    // output (B-frames — Safari VideoToolbox) cannot feed the monotonic
+    // muxer. Restart the whole render ONCE with the same config in realtime
+    // latency mode, which disables B-frames — the known-good former behavior.
+    if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error;
+    if (!isReorderedChunksError(error) || plan.config.latencyMode === 'realtime') throw error;
+    exportLog('render restart: realtime encoder config after out-of-order (B-frame) chunks');
+    const realtimePlan: WebCodecsPlan = {
+      ...plan,
+      config: { ...plan.config, latencyMode: 'realtime' },
+    };
+    return await renderVideoWithElementRestart(clips, blobs, width, height, realtimePlan, getAudio, onProgress, signal);
+  }
+}
+
+async function renderVideoWithElementRestart(
+  clips: Clip[],
+  blobs: Blob[],
+  width: number,
+  height: number,
+  plan: WebCodecsPlan,
+  getAudio?: () => Promise<AdtsAudio>,
+  onProgress?: (p: number) => void,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
   let attemptUsedDecoder = false;
   try {
     return await renderVideoAttempt(clips, blobs, width, height, plan, true,
@@ -1214,9 +1414,11 @@ export async function renderVideoWebCodecs(
     // muxer cannot be retried per-clip (duplicate frames), so restart the
     // whole render once — fresh muxer, encoder and state — with the decoder
     // path disabled, giving the element path a genuine shot before the caller
-    // falls back to wasm (which 4K mobile cannot survive). Aborts and renders
-    // that never touched the decoder path propagate unchanged.
+    // falls back to wasm (which 4K mobile cannot survive). Aborts, encoder
+    // reorder errors (handled by the caller with a realtime config restart)
+    // and renders that never touched the decoder path propagate unchanged.
     if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error;
+    if (isReorderedChunksError(error)) throw error;
     if (!attemptUsedDecoder) throw error;
     exportLog(`render restart: element-only after decoder failure (${error instanceof Error ? error.message : error})`);
     return await renderVideoAttempt(clips, blobs, width, height, plan, false, () => {}, getAudio, onProgress, signal);
@@ -1260,6 +1462,7 @@ async function renderVideoAttempt(
     offsetUs: 0,
     lastTs: -1,
     lastKeyTs: 0,
+    lastMuxTs: -1,
     frames: 0,
     error: null,
     lastActivity: Date.now(),
@@ -1269,6 +1472,17 @@ async function renderVideoAttempt(
     output: (chunk, meta) => {
       state.lastActivity = Date.now();
       try {
+        // Reorder guard: encoder output arrives in DECODE order, and input pts
+        // are strictly increasing, so a backwards timestamp means the encoder
+        // produced B-frames (Safari VideoToolbox in quality latency mode) —
+        // which the monotonic muxer feed cannot represent. Surface a typed
+        // error; renderVideoWebCodecs restarts once with latencyMode
+        // 'realtime' (B-frames disabled).
+        if (chunk.timestamp < state.lastMuxTs) {
+          if (!state.error) state.error = new ReorderedChunksError(state.lastMuxTs, chunk.timestamp);
+          return;
+        }
+        state.lastMuxTs = chunk.timestamp;
         // Feed the muxer through the raw API with a clamped duration: encoder
         // implementations (Safari) have emitted chunks whose absent/negative
         // duration aborts addVideoChunk. Timestamps are already strictly
@@ -1333,6 +1547,7 @@ async function renderVideoAttempt(
 
   try {
     encoder.configure(plan.config);
+    exportLog(`encoder latency mode: ${plan.config.latencyMode ?? 'quality'}`);
     for (let i = 0; i < clips.length; i++) {
       const done = clips.slice(0, i).reduce((s, c) => s + clipLen(c), 0);
       const progress = (s: number) => throttledProgress?.(Math.min(0.99, (done + s) / total));

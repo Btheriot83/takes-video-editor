@@ -19,6 +19,34 @@ export function isUltraHDCapture(width?: number, height?: number): boolean {
   return Math.min(width ?? 0, height ?? 0) >= 2160;
 }
 
+/**
+ * True when a clip's stored dimensions equal the export output frame, i.e. the
+ * copy paths (return-unchanged / concat "-c copy" remux) can serve it without
+ * re-encoding.
+ *
+ * Clip dimensions are DISPLAY dimensions: probeVideo reads
+ * HTMLVideoElement.videoWidth/videoHeight, which apply the container's
+ * rotation matrix. Verified in Chromium: an mp4 encoded 640x360 with a 90°
+ * displaymatrix reports videoWidth=360, videoHeight=640. Consequences:
+ *
+ * - A 4K capture stored landscape-encoded (3840x2160) WITH a 90° rotation
+ *   matrix — what the iOS landscape-mode 4K retry produces — is stored here
+ *   as 2160x3840 and matches portrait 4K output. Remuxing it is safe: stream
+ *   copy preserves the display matrix, so players still show it upright.
+ * - A true landscape-encoded stream with NO rotation flag is stored as
+ *   3840x2160 and does NOT match 2160x3840. That is deliberate: a remux
+ *   cannot rotate pixels, so accepting bare transposed dimensions would ship
+ *   a sideways video. Such sources must transcode.
+ * - Same-width different-aspect sources (e.g. 2160x2160 vs 2160x3840) never
+ *   match; they need the scale/crop render, not a remux.
+ */
+export function clipMatchesOutput(
+  clip: { width: number; height: number },
+  output: { width: number; height: number },
+): boolean {
+  return clip.width === output.width && clip.height === output.height;
+}
+
 export const ASPECT_RATIOS: Record<AspectRatio, { css: string; outputLabel: string }> = {
   '16:9': { css: '9 / 16', outputLabel: '9:16 portrait' },
   '4:3': { css: '3 / 4', outputLabel: '3:4 portrait' },

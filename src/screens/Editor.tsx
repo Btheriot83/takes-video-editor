@@ -88,10 +88,14 @@ export default function Editor() {
     setExportQuality(clips.some((c) => isUltraHDCapture(c.width, c.height)) ? '4K' : '1080p');
   }, [clips]);
 
+  const setLastExportQuality = useStore((s) => s.setLastExportQuality);
   const chooseExportQuality = useCallback((quality: ExportQuality) => {
     exportQualityTouchedRef.current = true;
     setExportQuality(quality);
-  }, []);
+    // Remembered so the Camera screen can nudge habitual 4K exporters toward
+    // 4K capture (which unlocks the instant no-re-encode export paths).
+    setLastExportQuality(quality);
+  }, [setLastExportQuality]);
 
   const total = useMemo(() => totalDuration(clips), [clips]);
   const selected = clips.find((c) => c.id === selectedId) ?? null;

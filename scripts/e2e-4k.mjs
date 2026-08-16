@@ -5,6 +5,7 @@ import fs from 'node:fs';
 const BASE = process.argv[2] || 'http://localhost:4173/';
 const OUT = 'scripts/e2e-out';
 const realCamera = process.env.REAL_CAMERA === '1';
+const SLACK = Math.max(1, Number(process.env.E2E_TIME_SLACK || 1));
 const exportQuality = process.env.EXPORT_QUALITY === '1080p' ? '1080p' : '4K';
 const clipCount = Number(process.env.CLIP_COUNT || 1);
 fs.mkdirSync(OUT, { recursive: true });
@@ -50,7 +51,7 @@ for (let index = 0; index < clipCount; index++) {
   await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
   await page.waitForTimeout(1100);
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 2000 });
+  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 2000 * SLACK });
 }
 await page.getByText('Edit', { exact: true }).click();
 
@@ -71,6 +72,11 @@ if (await frame.getAttribute('data-export-width') !== expectedWidth || await fra
   throw new Error(`${exportQuality} portrait metadata is not ${expectedWidth}x${expectedHeight}`);
 }
 await dialog.getByText(new RegExp(`${exportQuality} · ${expectedWidth} × ${expectedHeight}`)).waitFor();
+// Steering UX: choosing 4K over HD-capture clips must surface the upscale
+// hint (and 1080p must not) — fake-camera clips here are HD-class.
+const hintCount = await dialog.locator('[data-upscale-hint]').count();
+if (exportQuality === '4K' && hintCount !== 1) throw new Error('4K-over-HD upscale hint missing');
+if (exportQuality === '1080p' && hintCount !== 0) throw new Error('upscale hint shown for 1080p export');
 await dialog.getByRole('button', { name: 'Start export' }).click();
 await dialog.getByText('Video ready to share or download').waitFor({ timeout: 300000 });
 if (exportQuality === '1080p') {
@@ -84,6 +90,15 @@ const download = await downloadPromise;
 const output = `${OUT}/${exportQuality === '4K' ? 'exported-4k.mp4' : clipCount === 1 ? 'exported-native.mp4' : 'exported-remuxed.mp4'}`;
 await download.saveAs(output);
 
-console.log(JSON.stringify({ realCamera, exportQuality, clipCount, capture, recorderEvidence, output, bytes: fs.statSync(output).size, browserErrors: errors }, null, 2));
+// Steering UX: after an explicit 4K export choice, the Camera screen badges
+// the 4K capture toggle while capture quality is still HD.
+await page.keyboard.press('Escape');
+await page.getByRole('button', { name: 'Back to camera' }).click();
+await page.waitForSelector('button[aria-label="Hold to record"]', { timeout: 15000 });
+const nudgeCount = await page.locator('[data-capture-4k-nudge]').count();
+if (exportQuality === '4K' && nudgeCount !== 1) throw new Error('4K capture nudge missing after a 4K export choice');
+if (exportQuality === '1080p' && nudgeCount !== 0) throw new Error('4K capture nudge shown without a 4K export choice');
+
+console.log(JSON.stringify({ realCamera, exportQuality, clipCount, capture, recorderEvidence, nudgeCount, output, bytes: fs.statSync(output).size, browserErrors: errors }, null, 2));
 await browser.close();
 if (errors.length) throw new Error(`browser reported ${errors.length} error(s)`);

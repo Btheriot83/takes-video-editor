@@ -1,7 +1,8 @@
-import { clipLen, exportDimensions } from '../types/clip';
+import { clipLen, clipMatchesOutput, exportDimensions } from '../types/clip';
+import { mp4MetasShareCopyableCodec } from './mp4-meta';
 import type { AspectRatio, Clip, ExportQuality } from '../types/clip';
 import type { FFmpeg } from '@ffmpeg/ffmpeg';
-import { planWebCodecsEncode } from './webcodecs-export';
+import { planWebCodecsEncode, probeMp4Blob } from './webcodecs-export';
 import { renderVideoWorkerFirst } from './render-worker-client';
 import { clearExportLog, exportLog } from './export-log';
 
@@ -245,17 +246,61 @@ async function runExport(
 
   const total = clips.reduce((s, c) => s + clipLen(c), 0);
   const output = exportDimensions(aspectRatio, quality);
-  const sourcesMatchOutput = clips.every((clip) =>
-    clip.width === output.width && clip.height === output.height,
-  );
+  // clip.width/height are DISPLAY dimensions (probeVideo reads
+  // videoWidth/videoHeight, which apply the container rotation matrix), so
+  // this compares display-to-display: a rotation-flagged landscape 4K capture
+  // is stored portrait and matches (remux keeps the matrix, players show it
+  // upright), while a true landscape-encoded stream without a rotation flag
+  // stays landscape here and correctly falls through to the transcode paths.
+  // See clipMatchesOutput for the full safety argument.
+  const sourcesMatchOutput = clips.every((clip) => clipMatchesOutput(clip, output));
   const allMp4 = clips.every((clip, i) =>
     clip.mimeType.includes('mp4') || blobs[i].type.includes('mp4'),
   );
   const allUntrimmed = clips.every(isUntrimmed);
-  const sameCameraCodec = clips.every((clip) =>
-    clip.mimeType === clips[0].mimeType && clip.mimeType.includes('avc1'),
-  );
+  const sameMimeType = clips.every((clip) => clip.mimeType === clips[0].mimeType);
 
+  /**
+   * Single mp4box probe pass per blob (pure JS, no ffmpeg load): one parse
+   * yields fps + audio-track presence for encoder planning AND the codec +
+   * encoded dimensions the multi-clip "-c copy" uniformity check needs, so the
+   * copy-path gate and the transcode planner never parse the same blob twice.
+   * null = not parsable as MP4 (e.g. WebM) — the transcode path falls back to
+   * an ffmpeg probe for those, and the copy path treats null as "transcode".
+   */
+  const mp4ProbeCache: (Awaited<ReturnType<typeof probeMp4Blob>> | undefined)[] = [];
+  const probeBlobCached = async (i: number) => {
+    if (mp4ProbeCache[i] === undefined) mp4ProbeCache[i] = await probeMp4Blob(blobs[i], signal);
+    return mp4ProbeCache[i];
+  };
+
+  /**
+   * Multi-clip "-c copy" concat needs every clip on the same copy-safe codec
+   * AND the same tkhd rotation/display matrix. The mimeType alone can prove
+   * neither: iOS may report a bare "video/mp4" (no codec string), and even a
+   * fully parameterized avc1 type says nothing about orientation — two avc1
+   * clips with identical coded dims can carry 90° vs 270° matrices (both
+   * display portrait, both pass clipMatchesOutput), and the concat output
+   * would keep only the first clip's matrix, playing the other 180° wrong.
+   * So EVERY remux candidate set is probed with mp4box (cheap JS header
+   * parse, cached and shared with the fps/audio planner) and must be uniform
+   * in codec, coded dims and matrix. Any doubt -> transcode; a probe-failed
+   * genuine camera file merely loses the shortcut, and the concat exit-code
+   * fallback below still guards the exec itself.
+   */
+  const sameCameraCodec = async (): Promise<boolean> => {
+    if (!sameMimeType) return false;
+    const metas = [];
+    for (let i = 0; i < blobs.length; i++) metas.push(await probeBlobCached(i));
+    const uniform = mp4MetasShareCopyableCodec(metas);
+    exportLog(`remux uniformity probe (codec+dims+rotation matrix): ${uniform ? 'uniform — copy-safe' : 'not uniform/unknown — transcoding'}`);
+    return uniform;
+  };
+
+  exportLog(
+    `copy-path check: dimsMatch=${sourcesMatchOutput} mp4=${allMp4} untrimmed=${allUntrimmed} ` +
+    `sameMime=${sameMimeType} sources=${clips.map((c) => `${c.width}x${c.height}`).join(',')} out=${output.width}x${output.height}`,
+  );
   if (clips.length === 1 && allMp4 && allUntrimmed && sourcesMatchOutput) {
     onProgress?.('Using camera original', 1);
     return {
@@ -267,8 +312,13 @@ async function runExport(
   }
 
   throwIfAborted();
-  const ffmpeg = await getFFmpeg();
-  throwIfAborted();
+  // Kick off the ffmpeg wasm load WITHOUT awaiting it: the render path no
+  // longer needs ffmpeg before the concurrent audio task, so the module load
+  // (fetch + compile) overlaps probing/planning/rendering instead of holding
+  // the export at 0% progress. Every consumer awaits `ffmpegReady` at its
+  // point of first use.
+  const ffmpegReady = getFFmpeg();
+  ffmpegReady.catch(() => { /* surfaced where awaited */ });
   onProgress?.('Preparing media', 0.02);
   const ext = (m: string) => (m.includes('mp4') ? 'mp4' : 'webm');
   const inputs: string[] = clips.map((clip, i) => `in${i}.${ext(clip.mimeType || blobs[i].type)}`);
@@ -280,17 +330,21 @@ async function runExport(
   let memfsHasInputs = false;
   const writeAllInputs = async () => {
     if (memfsHasInputs) return;
+    const ffmpeg = await ffmpegReady;
     for (let i = 0; i < clips.length; i++) {
       await ffmpeg.writeFile(inputs[i], new Uint8Array(await blobs[i].arrayBuffer()));
     }
     memfsHasInputs = true;
   };
   const dropAllInputs = async () => {
+    const ffmpeg = await ffmpegReady;
     for (const name of inputs) await ffmpeg.deleteFile(name).catch(() => {});
     memfsHasInputs = false;
   };
 
-  if (clips.length > 1 && allMp4 && allUntrimmed && sourcesMatchOutput && sameCameraCodec) {
+  if (clips.length > 1 && allMp4 && allUntrimmed && sourcesMatchOutput && await sameCameraCodec()) {
+    throwIfAborted();
+    const ffmpeg = await ffmpegReady;
     throwIfAborted();
     await writeAllInputs();
     const concatFile = 'concat.txt';
@@ -316,21 +370,30 @@ async function runExport(
     await dropAllInputs();
   }
 
-  // Light per-clip probe pass: header parse only (`-i` with no output), one
-  // clip resident in MEMFS at a time. Kept separate from the audio encode so
-  // encoder planning (which needs the max source fps) can happen immediately
-  // and the heavy audio work can overlap the video render below.
+  // Per-clip probe pass for fps + audio-track presence. Primary: mp4box in
+  // pure JS — no ffmpeg load wait, no MEMFS write, so the render can start
+  // immediately (the former ffmpeg `-i` probe serialized 2-4s of dead time at
+  // 0% progress behind the wasm module load). ffmpeg probing remains only as
+  // a fallback for blobs mp4box cannot parse (e.g. WebM sources).
   throwIfAborted();
   onProgress?.('Preparing media', 0.03);
   const probes: InputProbe[] = [];
   for (let i = 0; i < clips.length; i++) {
     throwIfAborted();
-    await ffmpeg.writeFile(inputs[i], new Uint8Array(await blobs[i].arrayBuffer()));
-    const [probe] = await probeInputs(ffmpeg, [inputs[i]]);
-    await ffmpeg.deleteFile(inputs[i]).catch(() => {});
+    let probe: InputProbe | null = await probeBlobCached(i);
+    if (!probe) {
+      const ffmpeg = await ffmpegReady;
+      throwIfAborted();
+      await ffmpeg.writeFile(inputs[i], new Uint8Array(await blobs[i].arrayBuffer()));
+      [probe] = await probeInputs(ffmpeg, [inputs[i]]);
+      await ffmpeg.deleteFile(inputs[i]).catch(() => {});
+    }
     probes.push(probe);
     onProgress?.('Preparing media', 0.03 + 0.03 * ((i + 1) / clips.length));
   }
+  exportLog(
+    `probe: ${probes.map((p, i) => `clip${i + 1} fps=${p.fps ? p.fps.toFixed(1) : '?'} audio=${p.hasAudio ? 'y' : 'n'}`).join(' ')}`,
+  );
   // Cap at 60 for encoder planning: phone/browser capture never exceeds 60fps
   // and anything above it here is a probe artifact that would produce an
   // encoder envelope real hardware rejects.
@@ -354,6 +417,10 @@ async function runExport(
    * happens, it does not add to it.
    */
   const encodeAudioTrack = async (): Promise<Uint8Array> => {
+    // First point of REQUIRED ffmpeg use on the webcodecs path: the module
+    // load (kicked off at export start) overlaps probing/planning/render.
+    const ffmpeg = await ffmpegReady;
+    if (signal?.aborted) throw abortError();
     const audioSegments: string[] = [];
     try {
       for (let i = 0; i < clips.length; i++) {
@@ -428,7 +495,10 @@ async function runExport(
       return settled.adts;
     };
     try {
-      exportLog(`using webcodecs encoder: ${plan.config.codec} ${plan.config.hardwareAcceleration ?? 'default'}`);
+      exportLog(
+        `using webcodecs encoder: ${plan.config.codec} ${plan.config.hardwareAcceleration ?? 'default'} ` +
+        `latency=${plan.config.latencyMode ?? 'quality'}`,
+      );
       onProgress?.('Rendering video', 0.09);
       // The render (worker-first, main-thread fallback) muxes the AAC frames
       // directly next to the video and finalizes a faststart MP4 — the
@@ -452,7 +522,8 @@ async function runExport(
       webcodecsFailure = error instanceof Error ? error.message : String(error);
       exportLog(`webcodecs path failed (${webcodecsFailure}); falling back to wasm encoder`);
       console.warn('[export] webcodecs path failed; falling back to wasm encoder', error);
-      for (const n of ['audio.aac', 'out.mp4']) ffmpeg.deleteFile(n).catch(() => {});
+      const loaded = await ffmpegReady.catch(() => null);
+      for (const n of ['audio.aac', 'out.mp4']) loaded?.deleteFile(n).catch(() => {});
       if (quality === '4K' && isMobileClass()) {
         // See above: a phone-class wasm 4K encode never finishes in practice.
         throw new Error(`Export failed: ${webcodecsFailure}. Try again, or export at 1080p.`);
@@ -460,6 +531,8 @@ async function runExport(
     }
   }
 
+  throwIfAborted();
+  const ffmpeg = await ffmpegReady;
   throwIfAborted();
   await ffmpeg.deleteFile('audio.aac').catch(() => {});
   // The combined wasm encode needs every input present at once.

@@ -4,7 +4,7 @@ import { useStore } from '../state/store';
 import { getBlob } from '../lib/db';
 import { exportMp4, shareFile, downloadBlob } from '../lib/ffmpeg';
 import { exportLogTail } from '../lib/export-log';
-import { totalDuration, fmtTime, exportDimensions } from '../types/clip';
+import { totalDuration, fmtTime, exportDimensions, isUltraHDCapture } from '../types/clip';
 import { ASPECT_RATIOS } from '../types/clip';
 import type { ExportQuality } from '../types/clip';
 
@@ -151,6 +151,14 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
               ))}
             </div>
             <p className="mt-1.5 text-[11px] leading-snug text-white/55">1080p exports faster. 4K is larger and can take much longer on this device.</p>
+            {/* 4K-capture clips can export at 4K instantly (no re-encode);
+                HD-capture clips forced to 4K take the slow upscale render.
+                Say so before the user commits to the wait. */}
+            {quality === '4K' && !clips.some((c) => isUltraHDCapture(c.width, c.height)) && (
+              <p data-upscale-hint className="mt-1.5 text-[11px] leading-snug text-amber-300/90">
+                Recorded in 1080p — 4K will upscale and render slower. Record with the 4K camera toggle for instant 4K export.
+              </p>
+            )}
           </div>
         )}
 
