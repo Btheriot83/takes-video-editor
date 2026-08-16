@@ -39,17 +39,40 @@ const COPYABLE_CODEC = /^(avc1|avc3|hvc1|hev1|vp09)/;
  * rotation=270 clips concat-copy to a single rotation=90 file.
  */
 export function mp4MetasShareCopyableCodec(metas: (Mp4VideoMeta | null)[]): boolean {
-  if (!metas.length) return false;
-  for (const meta of metas) {
-    if (!meta?.codec || !COPYABLE_CODEC.test(meta.codec)) return false;
-    if (!meta.codedWidth || !meta.codedHeight) return false;
-    if (!meta.matrix || meta.matrix.length !== 9) return false;
-  }
-  const first = metas[0]!;
-  return metas.every((meta) =>
-    meta!.codec === first.codec &&
-    meta!.codedWidth === first.codedWidth &&
-    meta!.codedHeight === first.codedHeight &&
-    meta!.matrix!.every((value, i) => value === first.matrix![i]),
+  return classifyMp4CopySafety(metas) === 'uniform';
+}
+
+/**
+ * Three-way probe verdict, used by the remux gate's provenance handling:
+ *
+ * - 'uniform'  — every clip probed completely and matches: copy-safe.
+ * - 'mismatch' — the probe POSITIVELY disqualified the set: a parsed clip
+ *   carries a non-copy-safe codec, or two fully-parsed clips disagree on
+ *   codec/coded dims/rotation matrix. Never remux, regardless of provenance —
+ *   this is what keeps the mixed-rotation import hole closed.
+ * - 'unknown'  — the probe could not decide (a clip failed to parse or lacks
+ *   codec/dims/matrix) and no parsed pair disagrees. Imported sets treat this
+ *   as doubt and transcode; all-recording sets may trust provenance instead
+ *   (in-app recordings are uniform by construction), because iOS Safari
+ *   MediaRecorder MP4s are exactly the files this probe most often fails on.
+ */
+export type Mp4CopySafety = 'uniform' | 'mismatch' | 'unknown';
+
+export function classifyMp4CopySafety(metas: (Mp4VideoMeta | null)[]): Mp4CopySafety {
+  if (!metas.length) return 'unknown';
+  const complete = metas.filter((meta): meta is Mp4VideoMeta =>
+    !!meta?.codec && !!meta.codedWidth && !!meta.codedHeight && !!meta.matrix && meta.matrix.length === 9,
   );
+  // A parsed non-copy-safe codec disqualifies outright, even with gaps.
+  if (complete.some((meta) => !COPYABLE_CODEC.test(meta.codec!))) return 'mismatch';
+  // Any disagreement between two fully-parsed clips is a positive mismatch,
+  // even when other clips in the set failed to parse.
+  const first = complete[0];
+  if (first && !complete.every((meta) =>
+    meta.codec === first.codec &&
+    meta.codedWidth === first.codedWidth &&
+    meta.codedHeight === first.codedHeight &&
+    meta.matrix!.every((value, i) => value === first.matrix![i]),
+  )) return 'mismatch';
+  return complete.length === metas.length ? 'uniform' : 'unknown';
 }

@@ -61,11 +61,36 @@ export function exportDimensions(aspectRatio: AspectRatio, quality: ExportQualit
   return { width, height: Math.round(height) };
 }
 
+/**
+ * Clip provenance. 'recording' = captured by this app's own MediaRecorder in
+ * this session (uniform by construction: same recorder, same session settings),
+ * which lets the multi-clip remux gate trust the set when the mp4box probe
+ * cannot prove uniformity. 'import' = arrived via file import (or a legacy
+ * clip saved before this field existed) — such clips keep the full strict
+ * codec+dims+rotation-matrix probe requirement.
+ */
+export type ClipSource = 'recording' | 'import';
+
 export interface Clip {
   id: string;
   /** key into the blobs store in IndexedDB */
   blobKey: string;
   mimeType: string;
+  /** Provenance; legacy clips loaded without it default to 'import' for safety. */
+  source: ClipSource;
+  /**
+   * MediaRecorder.mimeType stamped at record time — the recorder's ACTUAL
+   * negotiated codec string, distinct from `mimeType` (which comes from
+   * blob.type and can be bare "video/mp4"). Provenance-trusted remux requires
+   * an identical NON-EMPTY stamp across the whole set: 'recording' provenance
+   * alone persists across sessions and browser updates, so without the stamp
+   * an avc1-session clip and an hvc1-session clip (both bare "video/mp4",
+   * probe inconclusive) could concat "-c copy" into a corrupt file — ffmpeg
+   * exits 0 on mixed-codec concats, so the exit-code backstop does not catch
+   * it. Absent on imports and on legacy clips (which therefore never receive
+   * provenance trust and keep the strict probe).
+   */
+  recorderMimeType?: string;
   /** source duration in seconds (untrimmed) */
   duration: number;
   /** trim range within the source, seconds */

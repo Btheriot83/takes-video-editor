@@ -36,7 +36,7 @@ page.on('pageerror', (e) => errors.push(String(e)));
 const url = new URL(BASE);
 if (process.env.WCODEC) url.searchParams.set('wcodec', process.env.WCODEC);
 await page.goto(url.toString(), { waitUntil: 'load' });
-await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
 await page.setInputFiles('input[type="file"]', FILE);
 await page.waitForSelector('[data-editor-frame], [data-clip]', { timeout: 20000 }).catch(() => {});
 // Import may land on camera or editor; go to editor if needed.

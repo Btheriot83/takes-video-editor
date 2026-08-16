@@ -1,5 +1,6 @@
-import { clipLen, clipMatchesOutput, exportDimensions } from '../types/clip';
-import { mp4MetasShareCopyableCodec } from './mp4-meta';
+import { clipLen, exportDimensions } from '../types/clip';
+import { classifyMp4CopySafety } from './mp4-meta';
+import { copyPathRejections, recorderProvenanceTrust, remuxProbeDecision } from './export-gate';
 import type { AspectRatio, Clip, ExportQuality } from '../types/clip';
 import type { FFmpeg } from '@ffmpeg/ffmpeg';
 import { planWebCodecsEncode, probeMp4Blob } from './webcodecs-export';
@@ -102,9 +103,6 @@ export interface ExportResult {
   seconds: number;
   mode: 'native' | 'remuxed' | 'transcoded';
 }
-
-const isUntrimmed = (clip: Clip) =>
-  clip.trimIn <= 1 / 60 && Math.abs(clip.trimOut - clip.duration) <= 1 / 60;
 
 interface InputProbe {
   hasAudio: boolean;
@@ -253,12 +251,13 @@ async function runExport(
   // upright), while a true landscape-encoded stream without a rotation flag
   // stays landscape here and correctly falls through to the transcode paths.
   // See clipMatchesOutput for the full safety argument.
-  const sourcesMatchOutput = clips.every((clip) => clipMatchesOutput(clip, output));
-  const allMp4 = clips.every((clip, i) =>
-    clip.mimeType.includes('mp4') || blobs[i].type.includes('mp4'),
-  );
-  const allUntrimmed = clips.every(isUntrimmed);
-  const sameMimeType = clips.every((clip) => clip.mimeType === clips[0].mimeType);
+  const copyRejections = copyPathRejections(clips, blobs.map((b) => b.type), output);
+  const copyEligible = copyRejections.length === 0;
+  // Recorder-provenance trust: only sets that are all in-app recordings WITH
+  // an identical non-empty recorder codec stamp qualify (see export-gate.ts —
+  // 'recording' alone spans browser updates that can change the negotiated
+  // codec, so it is never sufficient on its own).
+  const provenance = recorderProvenanceTrust(clips);
 
   /**
    * Single mp4box probe pass per blob (pure JS, no ffmpeg load): one parse
@@ -283,25 +282,35 @@ async function runExport(
    * display portrait, both pass clipMatchesOutput), and the concat output
    * would keep only the first clip's matrix, playing the other 180° wrong.
    * So EVERY remux candidate set is probed with mp4box (cheap JS header
-   * parse, cached and shared with the fps/audio planner) and must be uniform
-   * in codec, coded dims and matrix. Any doubt -> transcode; a probe-failed
-   * genuine camera file merely loses the shortcut, and the concat exit-code
-   * fallback below still guards the exec itself.
+   * parse, cached and shared with the fps/audio planner).
+   *
+   * Provenance trust: the probe still runs and a POSITIVE mismatch always
+   * vetoes, but a probe that merely fails to parse must not veto a set of
+   * in-app recordings that all carry the SAME stamped recorder codec
+   * (Clip.recorderMimeType) — such sets are uniform by construction, and
+   * real iOS Safari MediaRecorder MP4s are exactly the files mp4box most
+   * often fails on. Imported clips, unstamped legacy recordings, and
+   * codec-drifted recording sets keep the full strict requirement (any
+   * doubt -> transcode). The concat exit-code fallback below remains the
+   * last-resort guard for every path.
    */
-  const sameCameraCodec = async (): Promise<boolean> => {
-    if (!sameMimeType) return false;
+  const remuxAllowed = async (): Promise<boolean> => {
     const metas = [];
     for (let i = 0; i < blobs.length; i++) metas.push(await probeBlobCached(i));
-    const uniform = mp4MetasShareCopyableCodec(metas);
-    exportLog(`remux uniformity probe (codec+dims+rotation matrix): ${uniform ? 'uniform — copy-safe' : 'not uniform/unknown — transcoding'}`);
-    return uniform;
+    const classification = classifyMp4CopySafety(metas);
+    const decision = remuxProbeDecision(classification, provenance);
+    exportLog(`remux uniformity probe: ${classification}; ${decision.reason}`);
+    return decision.allow;
   };
 
   exportLog(
-    `copy-path check: dimsMatch=${sourcesMatchOutput} mp4=${allMp4} untrimmed=${allUntrimmed} ` +
-    `sameMime=${sameMimeType} sources=${clips.map((c) => `${c.width}x${c.height}`).join(',')} out=${output.width}x${output.height}`,
+    `copy-path check: sources=${clips.map((c) => `${c.width}x${c.height}`).join(',')} out=${output.width}x${output.height} ` +
+    `provenance=${provenance.trusted ? `trusted (${provenance.reason})` : `untrusted (${provenance.reason})`} ` +
+    `-> ${copyEligible ? 'eligible' : 'rejected'}`,
   );
-  if (clips.length === 1 && allMp4 && allUntrimmed && sourcesMatchOutput) {
+  for (const reason of copyRejections) exportLog(`copy-path rejected: ${reason}`);
+  if (clips.length === 1 && copyEligible) {
+    exportLog('copy path: single untrimmed matching clip — returning camera original (mode=native, no re-encode)');
     onProgress?.('Using camera original', 1);
     return {
       blob: blobs[0],
@@ -342,7 +351,7 @@ async function runExport(
     memfsHasInputs = false;
   };
 
-  if (clips.length > 1 && allMp4 && allUntrimmed && sourcesMatchOutput && await sameCameraCodec()) {
+  if (clips.length > 1 && copyEligible && await remuxAllowed()) {
     throwIfAborted();
     const ffmpeg = await ffmpegReady;
     throwIfAborted();
@@ -357,6 +366,7 @@ async function runExport(
       '-movflags', '+faststart', '-map_metadata', '-1', 'out.mp4',
     ]);
     if (remuxCode === 0) {
+      exportLog('copy path: concat "-c copy" remux succeeded (mode=remuxed, no re-encode)');
       const data = await ffmpeg.readFile('out.mp4');
       const bytes = (data as Uint8Array).byteLength;
       const blob = new Blob([new Uint8Array(data as Uint8Array).buffer as ArrayBuffer], { type: 'video/mp4' });
@@ -364,7 +374,7 @@ async function runExport(
       onProgress?.('Done', 1);
       return { blob, bytes, seconds: (performance.now() - started) / 1000, mode: 'remuxed' };
     }
-    exportLog('lossless join was incompatible; rendering instead');
+    exportLog(`copy-path rejected: concat "-c copy" exited nonzero (code ${remuxCode}) — rendering instead`);
     await ffmpeg.deleteFile(concatFile).catch(() => {});
     await ffmpeg.deleteFile('out.mp4').catch(() => {});
     await dropAllInputs();

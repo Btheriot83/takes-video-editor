@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mp4MetasShareCopyableCodec } from './mp4-meta';
+import { classifyMp4CopySafety, mp4MetasShareCopyableCodec } from './mp4-meta';
 import type { Mp4VideoMeta } from './mp4-meta';
 
 // Real tkhd matrices as mp4box reports them (fixed-point 16.16 / 2.30).
@@ -50,5 +50,35 @@ describe('mp4MetasShareCopyableCodec', () => {
   it('accepts uniform vp09 (Chrome MediaRecorder vp9-in-mp4)', () => {
     const vp9 = meta({ codec: 'vp09.00.51.08', matrix: [...IDENTITY] });
     expect(mp4MetasShareCopyableCodec([vp9, meta({ codec: 'vp09.00.51.08', matrix: [...IDENTITY] })])).toBe(true);
+  });
+});
+
+describe('classifyMp4CopySafety (three-way verdict for provenance gating)', () => {
+  it('classifies a fully-parsed matching set as uniform', () => {
+    expect(classifyMp4CopySafety([meta(), meta()])).toBe('uniform');
+  });
+
+  it('classifies parse failures / missing fields as unknown (not mismatch)', () => {
+    expect(classifyMp4CopySafety([meta(), null])).toBe('unknown');
+    expect(classifyMp4CopySafety([meta(), meta({ matrix: null })])).toBe('unknown');
+    expect(classifyMp4CopySafety([meta({ codec: null }), meta()])).toBe('unknown');
+    expect(classifyMp4CopySafety([meta({ matrix: [65536, 0, 0] })])).toBe('unknown');
+    expect(classifyMp4CopySafety([])).toBe('unknown');
+  });
+
+  it('classifies positive disagreements as mismatch', () => {
+    expect(classifyMp4CopySafety([meta({ matrix: [...ROT90] }), meta({ matrix: [...ROT270] })])).toBe('mismatch');
+    expect(classifyMp4CopySafety([meta(), meta({ codec: 'hvc1.1.6.L120' })])).toBe('mismatch');
+    expect(classifyMp4CopySafety([meta(), meta({ codedWidth: 2160, codedHeight: 3840 })])).toBe('mismatch');
+  });
+
+  it('classifies a non-copy-safe codec as mismatch even when other clips fail to parse', () => {
+    expect(classifyMp4CopySafety([meta({ codec: 'mp4v.20.9' }), null])).toBe('mismatch');
+  });
+
+  it('reports mismatch when two parsed clips disagree even if a third failed to parse', () => {
+    // The provenance trust path must not paper over a positively observed
+    // rotation disagreement just because one clip was unparsable.
+    expect(classifyMp4CopySafety([meta({ matrix: [...ROT90] }), null, meta({ matrix: [...ROT270] })])).toBe('mismatch');
   });
 });

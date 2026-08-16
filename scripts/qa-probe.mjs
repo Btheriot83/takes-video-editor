@@ -45,7 +45,7 @@ async function measure(label) {
 }
 
 await page.goto(BASE, { waitUntil: 'load' });
-await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
 await page.screenshot({ path: `${OUT}/camera-390.png` });
 await measure('camera');
 await page.setViewportSize({ width: 320, height: 568 });
@@ -56,11 +56,11 @@ await page.setViewportSize({ width: 390, height: 844 });
 
 // record 2 clips
 for (let i = 0; i < 2; i++) {
-  const record = page.getByRole('button', { name: 'Hold to record' });
+  const record = page.getByRole('button', { name: 'Tap to record' });
   const box = await record.boundingBox();
   const point = { x: box.x + box.width / 2, y: box.y + box.height / 2, id: i + 1 };
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
-  await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
+  await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
   await page.waitForTimeout(1200);
   if (i === 0) {
     await page.screenshot({ path: `${OUT}/camera-recording-390.png` });
@@ -72,7 +72,7 @@ for (let i = 0; i < 2; i++) {
     await page.screenshot({ path: `${OUT}/camera-saved-390.png` });
     await measure('camera-just-saved');
   }
-  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 10000 });
+  await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 10000 });
 }
 await page.waitForTimeout(2800); // let the saved toast dismiss for the steady-state shot
 await page.screenshot({ path: `${OUT}/camera-clips-390.png` });
@@ -83,11 +83,11 @@ await page.screenshot({ path: `${OUT}/camera-clips-320.png` });
 await measure('camera-with-clips');
 {
   // Compact-viewport recording + saved states.
-  const record = page.getByRole('button', { name: 'Hold to record' });
+  const record = page.getByRole('button', { name: 'Tap to record' });
   const box = await record.boundingBox();
   const point = { x: box.x + box.width / 2, y: box.y + box.height / 2, id: 9 };
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
-  await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
+  await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
   await page.waitForTimeout(1200);
   await page.screenshot({ path: `${OUT}/camera-recording-320.png` });
   await measure('camera-recording');
@@ -95,7 +95,7 @@ await measure('camera-with-clips');
   await page.waitForSelector('[data-saved-notice]', { timeout: 10000 });
   await page.screenshot({ path: `${OUT}/camera-saved-320.png` });
   await measure('camera-just-saved');
-  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 10000 });
+  await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 10000 });
 }
 await page.setViewportSize({ width: 390, height: 844 });
 await page.waitForTimeout(300);

@@ -16,6 +16,15 @@ type ActiveHold = { kind: 'pointer' | 'touch'; id: number } | { kind: 'keyboard'
 const RATIOS: AspectRatio[] = ['16:9', '4:3', '1:1'];
 const QUALITIES: CaptureQuality[] = ['HD', '4K'];
 
+/**
+ * Press-duration boundary between the two record gestures (Instagram/TikTok
+ * convention): a press released within this window is a TAP — recording
+ * continues after the finger lifts and the button becomes an explicit Stop
+ * control (tap again to stop). A press held longer is a HOLD — releasing it
+ * stops and saves, exactly as before.
+ */
+const TAP_TOGGLE_MS = 350;
+
 function distance(a: { x: number; y: number }, b: { x: number; y: number }) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
@@ -28,6 +37,15 @@ export default function Camera() {
   const activeHoldRef = useRef<ActiveHold | null>(null);
   const startingRef = useRef(false);
   const stoppingRef = useRef(false);
+  /** performance.now() at the press that started the current recording. */
+  const pressStartedAtRef = useRef(0);
+  /**
+   * True when a short tap latched the recording ON: the press has been
+   * released but recording deliberately continues until the next tap stops
+   * it. Checked by the async start completion so a tap released before the
+   * recorder finished starting keeps recording instead of instantly stopping.
+   */
+  const latchedRef = useRef(false);
   const pointersRef = useRef(new Map<number, { x: number; y: number }>());
   const pinchRef = useRef<{ distance: number; zoom: number } | null>(null);
   const zoomFrameRef = useRef<number | null>(null);
@@ -134,6 +152,7 @@ export default function Camera() {
   const finishRecording = useCallback(async (active: ActiveRecording | null) => {
     if (!active || stoppingRef.current) return;
     stoppingRef.current = true;
+    latchedRef.current = false;
     setStopping(true);
     if (recRef.current === active) recRef.current = null;
     setRecording(false);
@@ -142,7 +161,9 @@ export default function Camera() {
       if (blob.size > 0) {
         // Camera thumbnails are deferred so mobile decoders are fully
         // available for the next recording instead of competing in parallel.
-        const clip = await addClipFromBlob(blob, blob.type, false);
+        // Stamp the recorder's ACTUAL negotiated codec string: provenance
+        // trust for remux requires it to match across every clip in the set.
+        const clip = await addClipFromBlob(blob, blob.type, false, 'recording', active.mimeType);
         // Unmissable saved confirmation: users reported not knowing whether
         // releasing the button actually kept the clip.
         const count = useStore.getState().clips.length;
@@ -190,6 +211,8 @@ export default function Camera() {
     // Claim the gesture synchronously so duplicate touch/pointer events cannot
     // start a second recorder before React renders the starting state.
     activeHoldRef.current = source;
+    latchedRef.current = false;
+    pressStartedAtRef.current = performance.now();
     startingRef.current = true;
     setStarting(true);
     const stream = streamRef.current;
@@ -197,7 +220,10 @@ export default function Camera() {
       try {
         const active = await startRecording(stream, setElapsed, facing);
         recRef.current = active;
-        if (activeHoldRef.current !== source) {
+        // Released before the recorder finished starting: a hold-release (or a
+        // cancel) stops immediately, but a tap-latch keeps recording — the tap
+        // gesture's whole point is that the finger has already lifted.
+        if (activeHoldRef.current !== source && !latchedRef.current) {
           await finishRecording(active);
           return;
         }
@@ -205,6 +231,7 @@ export default function Camera() {
       } catch (recordingError) {
         console.error('[cam] start recording failed', recordingError);
         if (activeHoldRef.current === source) activeHoldRef.current = null;
+        latchedRef.current = false;
         setError('Recording is not supported in this browser.');
       } finally {
         startingRef.current = false;
@@ -213,45 +240,73 @@ export default function Camera() {
     })();
   }, [error, facing, finishRecording, streamReady]);
 
-  const stopActiveHold = useCallback(() => {
+  /**
+   * A press while a tap-latched recording runs is the STOP gesture. Everything
+   * else starts a recording (or is absorbed by startHold's duplicate guards).
+   */
+  const handlePressStart = useCallback((source: ActiveHold) => {
+    if (latchedRef.current && !activeHoldRef.current && !stoppingRef.current) {
+      latchedRef.current = false;
+      // If the recorder is still starting (very fast double tap), clearing the
+      // latch makes the pending start's completion stop-and-save immediately.
+      if (recRef.current) void finishRecording(recRef.current);
+      return;
+    }
+    startHold(source);
+  }, [finishRecording, startHold]);
+
+  /**
+   * Press released. `cancelled` marks non-deliberate endings (pointercancel /
+   * touchcancel / blur): those always stop, never latch. A deliberate release
+   * within TAP_TOGGLE_MS latches the recording on (tap-to-record); a longer
+   * hold keeps the classic release-to-stop behavior.
+   */
+  const releaseActiveHold = useCallback((cancelled = false) => {
     if (!activeHoldRef.current) return;
+    const heldMs = performance.now() - pressStartedAtRef.current;
     activeHoldRef.current = null;
+    if (!cancelled && heldMs < TAP_TOGGLE_MS) {
+      latchedRef.current = true;
+      return;
+    }
     if (recRef.current) void finishRecording(recRef.current);
   }, [finishRecording]);
 
-  const endMatchingHold = useCallback((kind: ActiveHold['kind'], id: number | 'keyboard') => {
+  const endMatchingHold = useCallback((kind: ActiveHold['kind'], id: number | 'keyboard', cancelled = false) => {
     const active = activeHoldRef.current;
     if (!active || active.kind !== kind || active.id !== id) return;
-    stopActiveHold();
-  }, [stopActiveHold]);
+    releaseActiveHold(cancelled);
+  }, [releaseActiveHold]);
 
   useEffect(() => {
     const endPointerHold = (event: PointerEvent) => endMatchingHold('pointer', event.pointerId);
+    const cancelPointerHold = (event: PointerEvent) => endMatchingHold('pointer', event.pointerId, true);
     const endTouchHold = (event: TouchEvent) => {
       const active = activeHoldRef.current;
       if (!active) return;
       if (active.kind === 'touch' && Array.from(event.changedTouches).some((touch) => touch.identifier === active.id)) {
-        stopActiveHold();
+        releaseActiveHold();
       } else if (active.kind === 'pointer' && event.touches.length === 0) {
         // Some mobile WebKit versions omit the final pointerup after capture;
         // touchend remains the reliable release signal.
-        stopActiveHold();
+        releaseActiveHold();
       }
     };
-    const cancelTouchHold = () => stopActiveHold();
+    const cancelTouchHold = () => releaseActiveHold(true);
+    const cancelOnBlur = () => releaseActiveHold(true);
     window.addEventListener('pointerup', endPointerHold, true);
-    window.addEventListener('pointercancel', endPointerHold, true);
+    window.addEventListener('pointercancel', cancelPointerHold, true);
     window.addEventListener('touchend', endTouchHold, true);
     window.addEventListener('touchcancel', cancelTouchHold, true);
-    window.addEventListener('blur', stopActiveHold);
+    window.addEventListener('blur', cancelOnBlur);
     return () => {
       window.removeEventListener('pointerup', endPointerHold, true);
-      window.removeEventListener('pointercancel', endPointerHold, true);
+      window.removeEventListener('pointercancel', cancelPointerHold, true);
       window.removeEventListener('touchend', endTouchHold, true);
       window.removeEventListener('touchcancel', cancelTouchHold, true);
-      window.removeEventListener('blur', stopActiveHold);
+      window.removeEventListener('blur', cancelOnBlur);
     };
-  }, [endMatchingHold, stopActiveHold]);
+  }, [endMatchingHold, releaseActiveHold]);
 
   const toggleTorch = async () => {
     const track = streamRef.current?.getVideoTracks()[0];
@@ -511,7 +566,7 @@ export default function Camera() {
             <button
               type="button"
               disabled={!streamReady || !!error || stopping}
-              aria-label={recording ? 'Release to stop recording' : 'Hold to record'}
+              aria-label={recording ? 'Stop recording' : 'Tap to record'}
               aria-describedby="record-hint"
               data-record-state={recording ? 'recording' : starting ? 'starting' : stopping ? 'stopping' : 'idle'}
               onContextMenu={(event) => event.preventDefault()}
@@ -520,30 +575,33 @@ export default function Camera() {
                 if (event.button !== 0 || !event.isPrimary) return;
                 event.preventDefault();
                 event.currentTarget.setPointerCapture?.(event.pointerId);
-                startHold({ kind: 'pointer', id: event.pointerId });
+                handlePressStart({ kind: 'pointer', id: event.pointerId });
               }}
               onPointerUp={(event) => { event.preventDefault(); endMatchingHold('pointer', event.pointerId); }}
-              onPointerCancel={(event) => endMatchingHold('pointer', event.pointerId)}
-              onLostPointerCapture={(event) => endMatchingHold('pointer', event.pointerId)}
+              onPointerCancel={(event) => endMatchingHold('pointer', event.pointerId, true)}
+              onLostPointerCapture={(event) => endMatchingHold('pointer', event.pointerId, true)}
               onTouchStart={(event) => {
                 const touch = event.changedTouches[0];
-                if (touch) startHold({ kind: 'touch', id: touch.identifier });
+                if (touch) handlePressStart({ kind: 'touch', id: touch.identifier });
               }}
               onTouchEnd={(event) => {
                 const active = activeHoldRef.current;
                 if (active?.kind === 'touch' && Array.from(event.changedTouches).some((touch) => touch.identifier === active.id)) {
-                  stopActiveHold();
+                  releaseActiveHold();
                 } else if (active?.kind === 'pointer' && event.touches.length === 0) {
-                  stopActiveHold();
+                  releaseActiveHold();
                 }
               }}
               onTouchCancel={() => {
-                if (activeHoldRef.current?.kind !== 'keyboard') stopActiveHold();
+                if (activeHoldRef.current?.kind !== 'keyboard') releaseActiveHold(true);
               }}
               onKeyDown={(event) => {
                 if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) {
                   event.preventDefault();
-                  startHold({ kind: 'keyboard', id: 'keyboard' });
+                  // Keyboard is a natural toggle: a normal key press is under
+                  // TAP_TOGGLE_MS, so press starts (and latches) and the next
+                  // press stops. Holding the key long keeps hold semantics.
+                  handlePressStart({ kind: 'keyboard', id: 'keyboard' });
                 }
               }}
               onKeyUp={(event) => {
@@ -552,15 +610,16 @@ export default function Camera() {
                   endMatchingHold('keyboard', 'keyboard');
                 }
               }}
-              onBlur={() => endMatchingHold('keyboard', 'keyboard')}
+              onBlur={() => endMatchingHold('keyboard', 'keyboard', true)}
               className={`relative flex h-[78px] w-[78px] touch-none items-center justify-center rounded-full border-[5px] transition-transform duration-150 active:scale-95 disabled:opacity-35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white ${recording ? 'scale-110 border-red-500' : 'border-white'}`}
             >
               {recording && (
                 <span aria-hidden="true" className="absolute -inset-1.5 animate-record-pulse rounded-full border-2 border-red-500" />
               )}
               {/* While recording the inner shape becomes a rounded square — the
-                  universal "stop" glyph — so release-to-stop reads visually,
-                  not just in the hint text. */}
+                  universal "stop" glyph — so the button reads as an explicit
+                  STOP control (tap to stop; a held press still stops on
+                  release), not just in the hint text. */}
               <span className={`block bg-red-500 transition-all duration-150 ${recording ? 'h-[36px] w-[36px] rounded-lg' : 'h-[58px] w-[58px] rounded-full'}`} />
             </button>
             <span
@@ -570,7 +629,7 @@ export default function Camera() {
                 recording ? 'bg-red-600 font-bold text-white' : 'font-medium text-white/60'
               }`}
             >
-              {recording ? 'Recording — release to stop' : 'Hold to record'}
+              {recording ? 'Tap to stop' : 'Tap to record'}
             </span>
           </div>
 

@@ -34,6 +34,15 @@ export interface ActiveRecording {
   pause: () => void;
   resume: () => void;
   paused: boolean;
+  /**
+   * The recorder's ACTUAL negotiated mimeType (MediaRecorder.mimeType after
+   * start, falling back to the requested candidate). Stamped onto recorded
+   * clips as Clip.recorderMimeType: provenance-trusted remux requires every
+   * clip in the set to carry the same non-empty stamp, so clips recorded
+   * before/after a browser update that changed the negotiated codec can never
+   * be silently concat-copied together.
+   */
+  mimeType: string;
 }
 
 /** Portrait-convention video constraints for a capture quality. */
@@ -174,6 +183,7 @@ export async function startRecording(
   console.log('[rec] started, state=', rec.state);
 
   return {
+    get mimeType() { return rec.mimeType || mimeType; },
     get paused() { return rec.state === 'paused'; },
     pause: () => { if (rec.state === 'recording') rec.pause(); },
     resume: () => { if (rec.state === 'paused') rec.resume(); },

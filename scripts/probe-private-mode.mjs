@@ -67,21 +67,21 @@ async function assertNoSaveError(page, where) {
 }
 
 async function recordClip(page, cdp, id) {
-  const record = page.getByRole('button', { name: 'Hold to record' });
+  const record = page.getByRole('button', { name: 'Tap to record' });
   const box = await record.boundingBox();
   const point = { x: box.x + box.width / 2, y: box.y + box.height / 2, id };
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
   // Before the fallback fix this wait itself failed: recBegin() threw and the
   // camera showed the role=alert error instead of entering the recording state.
   try {
-    await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
+    await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
   } catch (error) {
     await assertNoSaveError(page, 'recording start');
     throw error;
   }
   await page.waitForTimeout(2000);
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 10000 });
+  await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 10000 });
   await page.waitForTimeout(400);
   await assertNoSaveError(page, 'recording save');
 }
@@ -107,7 +107,7 @@ async function runScenario(scenario, { full }) {
   page.on('pageerror', (e) => errors.push(String(e)));
 
   await page.goto(BASE, { waitUntil: 'load' });
-  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
+  await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
   await assertNoSaveError(page, 'startup');
   log('camera open with broken IndexedDB');
 

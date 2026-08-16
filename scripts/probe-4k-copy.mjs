@@ -42,7 +42,7 @@ async function run({ clipCount, aspect, expectCopy }) {
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); if (m.text().startsWith('[export]') || m.text().startsWith('[ffmpeg]')) console.log(m.text().slice(0,160)); });
 
   await page.goto(BASE, { waitUntil: 'load' });
-  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
+  await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
   await page.getByRole('button', { name: '4K', exact: true }).click();
   await page.getByRole('button', { name: aspect, exact: true }).click();
   await page.waitForFunction(() => document.querySelector('[data-camera-frame]')?.getAttribute('data-capture-width') === '2160', null, { timeout: 15000 });
@@ -52,15 +52,15 @@ async function run({ clipCount, aspect, expectCopy }) {
     height: await frame.getAttribute('data-capture-height'),
   };
 
-  const record = page.getByRole('button', { name: 'Hold to record' });
+  const record = page.getByRole('button', { name: 'Tap to record' });
   for (let i = 0; i < clipCount; i++) {
     const box = await record.boundingBox();
     const point = { x: box.x + box.width / 2, y: box.y + box.height / 2, id: i + 1 };
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
-    await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
+    await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
     await page.waitForTimeout(1200);
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-    await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 20000 });
+    await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 20000 });
   }
 
   await page.getByText('Edit', { exact: true }).click();

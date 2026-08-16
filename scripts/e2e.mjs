@@ -44,7 +44,7 @@ const t0 = Date.now();
 const log = (m) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s] ${m}`);
 
 await page.goto(BASE, { waitUntil: 'load' });
-await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
 await page.screenshot({ path: `${OUT}/1-camera.png` });
 log('camera open');
 
@@ -83,7 +83,7 @@ if (await page.getByRole('button', { name: 'HD', exact: true }).getAttribute('ar
   throw new Error('HD capture quality is not the default');
 }
 await page.getByRole('button', { name: '4K', exact: true }).click();
-await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
 const qualityFrame = page.locator('[data-camera-frame]');
 if (await qualityFrame.getAttribute('data-capture-quality') !== '4K') throw new Error('frame did not reflect the 4K capture setting');
 // The 4K request may need up to three sequential getUserMedia attempts
@@ -118,7 +118,7 @@ if (await qualityFrame.getAttribute('data-capture-quality') !== '4K') throw new 
   }
 }
 await page.getByRole('button', { name: 'HD', exact: true }).click();
-await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
 if (await qualityFrame.getAttribute('data-capture-quality') !== 'HD') throw new Error('switching back to HD capture failed');
 log('capture quality toggle verified (back on HD)');
 
@@ -173,13 +173,47 @@ const fallbackVisible = await page.getByText('Pinch zoom is unavailable on this 
 if (!fallbackVisible && !/([2-9]|1\.[1-9])×/.test(zoomText)) throw new Error('pinch zoom produced neither zoom nor fallback state');
 log(fallbackVisible ? 'pinch zoom fallback verified' : 'pinch zoom verified');
 
-// record 3 clips of ~2s each
+// record 3 clips of ~2s each: clips 1-2 via the classic hold gesture
+// (touchEnd / touchCancel releases), clip 3 via the tap-toggle path.
 for (let i = 0; i < 3; i++) {
-  const record = page.getByRole('button', { name: 'Hold to record' });
+  const record = page.getByRole('button', { name: 'Tap to record' });
   const recordBox = await record.boundingBox();
   const recordPoint = { x: recordBox.x + recordBox.width / 2, y: recordBox.y + recordBox.height / 2, id: i + 1 };
+
+  if (i === 2) {
+    // TAP-TOGGLE: a short tap (<350ms press) starts the recording, which must
+    // CONTINUE after the finger lifts; the button becomes an explicit red
+    // Stop control; a second tap stops and saves.
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [recordPoint] });
+    await page.waitForTimeout(80);
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
+    await page.waitForTimeout(900);
+    if (await page.locator('[data-record-state]').getAttribute('data-record-state') !== 'recording') {
+      throw new Error('tap-started recording did not continue after the finger lifted');
+    }
+    if (!(await page.getByRole('button', { name: 'Stop recording' }).isVisible())) {
+      throw new Error('record button did not become a Stop control after a tap');
+    }
+    await page.waitForTimeout(1100);
+    const tapStopStarted = Date.now();
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ ...recordPoint, id: 31 }] });
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    await page.waitForFunction(() => document.querySelector('[data-record-state]')?.getAttribute('data-record-state') !== 'recording', null, { timeout: 750 * SLACK });
+    const tapStopLatency = Date.now() - tapStopStarted;
+    await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 1500 * SLACK });
+    // The tap-recorded clip must be SAVED like any other.
+    await page.waitForSelector('[data-saved-notice]', { timeout: 5000 });
+    const savedText = await page.locator('[data-saved-notice]').textContent();
+    if (!savedText.includes('3 clips')) throw new Error(`tap-toggle clip not saved: toast "${savedText}"`);
+    await page.waitForTimeout(600);
+    if (mediaRecorderStarts !== 3) throw new Error(`expected 3 recorder starts, got ${mediaRecorderStarts}`);
+    log(`clip 3 recorded via tap-toggle (continued after lift; tap-stop in ${tapStopLatency}ms; saved toast "${savedText}")`);
+    continue;
+  }
+
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [recordPoint] });
-  await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
+  await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
 
   if (i === 0) {
     // A second finger/down event while the primary hold is active must not
@@ -189,7 +223,7 @@ for (let i = 0; i < 3; i++) {
       touchPoints: [recordPoint, { ...recordPoint, x: recordPoint.x + 6, id: 99 }],
     });
     await page.waitForTimeout(700);
-    if (!(await page.getByRole('button', { name: 'Release to stop recording' }).isVisible())) {
+    if (!(await page.getByRole('button', { name: 'Stop recording' }).isVisible())) {
       throw new Error('recording did not continue while the touch was held');
     }
     if (mediaRecorderStarts !== 1) throw new Error(`duplicate hold started ${mediaRecorderStarts} recorders`);
@@ -207,7 +241,7 @@ for (let i = 0; i < 3; i++) {
   await cdp.send('Input.dispatchTouchEvent', { type: releaseType, touchPoints: [] });
   await page.waitForFunction(() => document.querySelector('[data-record-state]')?.getAttribute('data-record-state') !== 'recording', null, { timeout: 750 * SLACK });
   const releaseLatency = Date.now() - releaseStarted;
-  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 1500 * SLACK });
+  await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 1500 * SLACK });
   await page.waitForTimeout(600);
   if (mediaRecorderStarts !== i + 1) throw new Error(`expected ${i + 1} recorder starts, got ${mediaRecorderStarts}`);
   log(`clip ${i + 1} recorded; ${releaseType} stopped in ${releaseLatency}ms`);

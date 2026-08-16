@@ -26,15 +26,15 @@ page.on('console', (m) => {
 page.on('pageerror', (e) => errors.push(String(e)));
 
 await page.goto(BASE, { waitUntil: 'load' });
-await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
-const record = page.getByRole('button', { name: 'Hold to record' });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
+const record = page.getByRole('button', { name: 'Tap to record' });
 const box = await record.boundingBox();
 const point = { x: box.x + box.width / 2, y: box.y + box.height / 2, id: 1 };
 await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
-await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
+await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
 await page.waitForTimeout(1500);
 await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 2000 });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 2000 });
 await page.getByText('Edit', { exact: true }).click();
 await page.locator('[data-editor-frame]').waitFor();
 

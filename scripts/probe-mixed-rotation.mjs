@@ -41,7 +41,7 @@ async function run(files, expectText, label) {
   page.on('pageerror', (e) => errors.push(String(e)));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   await page.goto(BASE, { waitUntil: 'load' });
-  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
+  await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
   await page.setInputFiles('input[type="file"]', files);
   await page.locator('[data-editor-frame]').waitFor({ timeout: 20000 });
   await page.getByText('Export video', { exact: true }).click();

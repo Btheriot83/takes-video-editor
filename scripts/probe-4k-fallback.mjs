@@ -42,14 +42,14 @@ page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 const log = (m) => console.log(`[probe-4k-fallback] ${m}`);
 
 await page.goto(BASE, { waitUntil: 'load' });
-await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
 
 await page.getByRole('button', { name: '4K', exact: true }).click();
 // The notice appears as soon as the reopened stream reports a sub-4K size.
 await page.getByText('4K not available on this camera').waitFor({ timeout: 15000 });
 log('capability notice shown for unavailable 4K');
 
-await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
 const frame = page.locator('[data-camera-frame]');
 if (await frame.getAttribute('data-capture-quality') !== '4K') throw new Error('4K setting was not applied to the frame');
 const capW = Number(await frame.getAttribute('data-capture-width'));
@@ -60,17 +60,17 @@ if (!badge.includes(`${capW}×${capH}`)) throw new Error(`badge "${badge}" does 
 log(`badge honestly reports ${capW}×${capH}`);
 
 // Recording must still work at whatever the camera delivered.
-const record = page.getByRole('button', { name: 'Hold to record' });
+const record = page.getByRole('button', { name: 'Tap to record' });
 const box = await record.boundingBox();
 const cdp = await ctx.newCDPSession(page);
 await cdp.send('Input.dispatchTouchEvent', {
   type: 'touchStart',
   touchPoints: [{ x: box.x + box.width / 2, y: box.y + box.height / 2, id: 1 }],
 });
-await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
+await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
 await page.waitForTimeout(1500);
 await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 5000 });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 5000 });
 await page.waitForTimeout(600);
 const clipBadge = await page.getByText(/1 clip ·/).isVisible().catch(() => false);
 if (!clipBadge) throw new Error('recording in the fallback resolution did not produce a clip');

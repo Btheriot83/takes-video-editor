@@ -36,8 +36,8 @@ page.on('console', (message) => {
 page.on('pageerror', (error) => errors.push(String(error)));
 
 await page.goto(BASE, { waitUntil: 'load' });
-await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
-const record = page.getByRole('button', { name: 'Hold to record' });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
+const record = page.getByRole('button', { name: 'Tap to record' });
 const cameraFrame = page.locator('[data-camera-frame]');
 const capture = {
   width: await cameraFrame.getAttribute('data-capture-width'),
@@ -48,10 +48,10 @@ for (let index = 0; index < clipCount; index++) {
   const box = await record.boundingBox();
   const point = { x: box.x + box.width / 2, y: box.y + box.height / 2, id: index + 1 };
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
-  await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
+  await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
   await page.waitForTimeout(1100);
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 2000 * SLACK });
+  await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 2000 * SLACK });
 }
 await page.getByText('Edit', { exact: true }).click();
 
@@ -94,7 +94,7 @@ await download.saveAs(output);
 // the 4K capture toggle while capture quality is still HD.
 await page.keyboard.press('Escape');
 await page.getByRole('button', { name: 'Back to camera' }).click();
-await page.waitForSelector('button[aria-label="Hold to record"]', { timeout: 15000 });
+await page.waitForSelector('button[aria-label="Tap to record"]', { timeout: 15000 });
 const nudgeCount = await page.locator('[data-capture-4k-nudge]').count();
 if (exportQuality === '4K' && nudgeCount !== 1) throw new Error('4K capture nudge missing after a 4K export choice');
 if (exportQuality === '1080p' && nudgeCount !== 0) throw new Error('4K capture nudge shown without a 4K export choice');

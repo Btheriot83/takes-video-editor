@@ -4,7 +4,7 @@ import { ASPECT_RATIOS, clipLen, totalDuration, FRAME, exportDimensions } from '
 import type { Clip } from '../types/clip';
 
 const mk = (id: string, dur: number, trimIn = 0, trimOut?: number): Clip => ({
-  id, blobKey: 'b' + id, mimeType: 'video/webm', duration: dur,
+  id, blobKey: 'b' + id, mimeType: 'video/webm', source: 'recording', duration: dur,
   trimIn, trimOut: trimOut ?? dur, width: 1080, height: 1920, createdAt: 0, thumbs: [],
 });
 

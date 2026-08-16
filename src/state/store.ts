@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { totalDuration, clipLen, DEFAULT_ASPECT_RATIO, DEFAULT_CAPTURE_QUALITY } from '../types/clip';
-import type { AspectRatio, CaptureQuality, Clip, ExportQuality } from '../types/clip';
+import type { AspectRatio, CaptureQuality, Clip, ClipSource, ExportQuality } from '../types/clip';
 import { History, trimClip, splitClip, moveClip, duplicateClip, uid } from '../lib/editor';
 import {
   saveProject, loadProject, saveBlob, getBlob, deleteBlob, recRecover, recFinalize, gcBlobs, clearProject,
@@ -32,7 +32,7 @@ interface State {
   setLastExportQuality: (quality: ExportQuality) => void;
 
   init: () => Promise<void>;
-  addClipFromBlob: (blob: Blob, mimeType: string, generateThumbs?: boolean) => Promise<Clip>;
+  addClipFromBlob: (blob: Blob, mimeType: string, generateThumbs?: boolean, source?: ClipSource, recorderMimeType?: string) => Promise<Clip>;
   importFiles: (files: FileList | File[]) => Promise<void>;
   select: (id: string | null) => void;
   setScreen: (s: Screen) => void;
@@ -107,7 +107,9 @@ export const useStore = create<State>((set, get) => ({
       if (p?.clips.length) {
         for (const clip of p.clips) {
           try {
-            if (await getBlob(clip.blobKey)) existing.push(clip);
+            // Legacy clips (saved before provenance existed) load as 'import'
+            // so they never receive recorder-provenance remux trust.
+            if (await getBlob(clip.blobKey)) existing.push({ ...clip, source: clip.source ?? 'import' });
           } catch {
             // A single damaged entry must not leave the whole app on Loading.
           }
@@ -128,7 +130,9 @@ export const useStore = create<State>((set, get) => ({
 
       const rec = await recRecover();
       if (rec && rec.blob.size > 10_000) {
-        const clip = await get().addClipFromBlob(rec.blob, rec.mimeType);
+        // Crash-recovered chunks came from this app's own recorder; the meta
+        // mimeType stored by recBegin IS the recorder's negotiated stamp.
+        const clip = await get().addClipFromBlob(rec.blob, rec.mimeType, true, 'recording', rec.mimeType);
         await recFinalize();
         notice = `Recovered an interrupted recording (${clipLen(clip).toFixed(1)}s).`;
       }
@@ -140,7 +144,7 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
-  addClipFromBlob: async (blob, mimeType, generateThumbs = true) => {
+  addClipFromBlob: async (blob, mimeType, generateThumbs = true, source = 'import', recorderMimeType) => {
     const blobKey = uid();
     // Persist the irreplaceable media before doing any decoder work. Camera
     // recovery data is kept until this clip and its project entry are durable.
@@ -150,6 +154,10 @@ export const useStore = create<State>((set, get) => ({
       id: uid(),
       blobKey,
       mimeType,
+      source,
+      // Only recordings carry the stamp; an empty string is stored as absent
+      // so it can never satisfy the non-empty equality the remux trust needs.
+      ...(source === 'recording' && recorderMimeType ? { recorderMimeType } : {}),
       duration: meta.duration,
       trimIn: 0,
       trimOut: meta.duration,
@@ -178,7 +186,7 @@ export const useStore = create<State>((set, get) => ({
   importFiles: async (files) => {
     for (const f of Array.from(files)) {
       if (!f.type.startsWith('video/')) continue;
-      await get().addClipFromBlob(f, f.type);
+      await get().addClipFromBlob(f, f.type, true, 'import');
     }
     if (get().clips.length) set({ screen: 'editor' });
   },

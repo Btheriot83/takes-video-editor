@@ -207,6 +207,14 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
               <Download size={17} /> Download MP4
             </button>
             {handoffNotice && <p role="status" className="text-xs leading-relaxed text-white/55">{handoffNotice}</p>}
+            {/* Success-state diagnostics: the same breadcrumb tail as the error
+                state, collapsed. A field report ("my 1080p export was slow")
+                arrives as a phone screenshot — this shows which export path
+                actually ran and, if a copy path was rejected, exactly why. */}
+            <details className="text-[10px] text-white/40">
+              <summary className="cursor-pointer select-none py-1">Technical details</summary>
+              <pre className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap break-all rounded bg-black/40 p-2 leading-relaxed">{exportLogTail().join('\n') || 'no log entries'}</pre>
+            </details>
           </div>
         )}
 

@@ -49,16 +49,16 @@ url.searchParams.set('wcodec', 'vp09.00.51.08');
 const forcedScaler = process.env.SCALER || '';
 if (forcedScaler) url.searchParams.set('scaler', forcedScaler);
 await page.goto(url.toString(), { waitUntil: 'load' });
-await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 15000 });
-const record = page.getByRole('button', { name: 'Hold to record' });
+await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
+const record = page.getByRole('button', { name: 'Tap to record' });
 for (let index = 0; index < clipCount; index++) {
   const box = await record.boundingBox();
   const point = { x: box.x + box.width / 2, y: box.y + box.height / 2, id: index + 1 };
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
-  await page.waitForSelector('button[aria-label="Release to stop recording"]', { timeout: 5000 });
+  await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
   await page.waitForTimeout(1100);
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-  await page.waitForSelector('button[aria-label="Hold to record"]:not([disabled])', { timeout: 2000 });
+  await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 2000 });
 }
 await page.getByText('Edit', { exact: true }).click();
 await page.locator('[data-editor-frame]').waitFor();
