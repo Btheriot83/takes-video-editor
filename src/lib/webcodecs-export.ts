@@ -107,7 +107,13 @@ export async function planWebCodecsEncode(
   // 60fps ceiling: capture never exceeds it and higher figures are probe
   // artifacts that inflate the H.264 level past what hardware accepts.
   const framerate = Math.min(60, Math.max(1, Math.round(maxSourceFps)));
-  const base: VideoEncoderConfig = { codec: '', width, height, bitrate, framerate };
+  // latencyMode 'realtime' disables B-frame reordering. Safari's VideoToolbox
+  // H.264 encoder otherwise emits B-frames, whose out-of-presentation-order
+  // chunks make mp4-muxer compute a NEGATIVE sample duration and abort
+  // ("addVideoChunkRaw's fourth argument (duration) must be a non-negative
+  // real number" — observed on iPhone). Chrome's encoder is realtime-biased
+  // already, so this is behavior-neutral there.
+  const base: VideoEncoderConfig = { codec: '', width, height, bitrate, framerate, latencyMode: 'realtime' };
 
   const override = codecOverride();
   const candidates: VideoEncoderConfig[] = [];
@@ -351,7 +357,9 @@ async function captureClipViaElement(
         if (ts <= state.lastTs) ts = state.lastTs + 1_000;
         state.lastTs = ts;
         drawCover(ctx, video, video.videoWidth, video.videoHeight, canvas.width, canvas.height);
-        const frame = new VideoFrame(canvas, { timestamp: ts });
+        // Explicit non-negative duration (see decoder path note).
+        const frameDuration = Number.isFinite(minDelta) && minDelta > 0 ? Math.round(minDelta * 1_000_000) : 33_333;
+        const frame = new VideoFrame(canvas, { timestamp: ts, duration: frameDuration });
         const keyFrame = state.frames === 0 || ts - state.lastKeyTs >= 2_000_000;
         if (keyFrame) state.lastKeyTs = ts;
         encoder.encode(frame, { keyFrame });
@@ -635,7 +643,10 @@ async function captureClipViaDecoder(
       if (ts <= state.lastTs) ts = state.lastTs + 1_000; // strictly increasing for the muxer
       state.lastTs = ts;
       drawCover(ctx, frame, frame.displayWidth, frame.displayHeight, canvas.width, canvas.height);
-      const out = new VideoFrame(canvas, { timestamp: ts });
+      // Explicit non-negative duration: the encoder propagates it to the
+      // chunk, so the muxer never derives one from timestamp deltas.
+      const duration = frame.duration && frame.duration > 0 ? frame.duration : 33_333;
+      const out = new VideoFrame(canvas, { timestamp: ts, duration });
       const keyFrame = state.frames === 0 || ts - state.lastKeyTs >= 2_000_000;
       if (keyFrame) state.lastKeyTs = ts;
       encoder.encode(out, { keyFrame });
@@ -744,7 +755,16 @@ export async function renderVideoWebCodecs(
     output: (chunk, meta) => {
       state.lastActivity = Date.now();
       try {
-        muxer.addVideoChunk(chunk, meta);
+        // Feed the muxer through the raw API with a clamped duration: encoder
+        // implementations (Safari) have emitted chunks whose absent/negative
+        // duration aborts addVideoChunk. Timestamps are already strictly
+        // increasing by construction.
+        const data = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(data);
+        const duration = Number.isFinite(chunk.duration) && (chunk.duration as number) > 0
+          ? (chunk.duration as number)
+          : 33_333;
+        muxer.addVideoChunkRaw(data, chunk.type as 'key' | 'delta', chunk.timestamp, duration, meta);
       } catch (error) {
         state.error = error;
       }
