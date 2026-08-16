@@ -1,4 +1,6 @@
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+import { createFile, DataStream, Endianness, MP4BoxBuffer } from 'mp4box';
+import type { ISOFile, Movie, Sample, Track } from 'mp4box';
 import { clipLen } from '../types/clip';
 import type { Clip, ExportQuality } from '../types/clip';
 import { exportLog } from './export-log';
@@ -199,19 +201,19 @@ const abortError = () => new DOMException('Export cancelled', 'AbortError');
 
 function drawCover(
   ctx: OffscreenCanvasRenderingContext2D,
-  video: HTMLVideoElement,
+  source: CanvasImageSource,
+  vw: number,
+  vh: number,
   width: number,
   height: number,
 ) {
   // Same semantics as the wasm filter chain:
   // scale=W:H:force_original_aspect_ratio=increase + centered crop.
-  const vw = video.videoWidth;
-  const vh = video.videoHeight;
-  if (!vw || !vh) throw new Error('video has no dimensions');
+  if (!vw || !vh) throw new Error('source has no dimensions');
   const scale = Math.max(width / vw, height / vh);
   const dw = vw * scale;
   const dh = vh * scale;
-  ctx.drawImage(video, (width - dw) / 2, (height - dh) / 2, dw, dh);
+  ctx.drawImage(source, (width - dw) / 2, (height - dh) / 2, dw, dh);
 }
 
 function waitForQueueDrain(
@@ -256,7 +258,7 @@ function seekPresent(video: HTMLVideoElement, target: number, timeoutMs: number)
   });
 }
 
-async function captureClip(
+async function captureClipViaElement(
   clip: Clip,
   blob: Blob,
   video: HTMLVideoElement,
@@ -271,18 +273,38 @@ async function captureClip(
   const len = clipLen(clip);
   const base = state.offsetUs;
   const EPS = 1e-4;
+  const diag = () =>
+    `readyState=${video.readyState} network=${video.networkState} err=${video.error?.code ?? 'none'}`;
   try {
     video.src = url;
+    video.load();
+    // Wait only for METADATA (readyState >= 1). iOS Safari routinely parks a
+    // paused, never-played video at HAVE_METADATA and does not decode a first
+    // frame (so no `loadeddata`) until a play() or a seek kicks the pipeline —
+    // waiting for loadeddata before the first seek was a structural deadlock
+    // on iPhones ("clip decode timed out"). The first seekPresent below is the
+    // kick, and its rVFC callback is the real "a frame exists" signal.
+    // Event + poll belt-and-braces: events on freshly attached elements race.
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('clip decode timed out')), 10_000);
-      video.onloadeddata = () => {
+      let settled = false;
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(poll);
         clearTimeout(timer);
-        resolve();
+        fn();
       };
-      video.onerror = () => {
-        clearTimeout(timer);
-        reject(new Error('clip failed to decode'));
-      };
+      const timer = setTimeout(
+        () => finish(() => reject(new Error(`clip decode timed out (${diag()})`))),
+        10_000,
+      );
+      const poll = setInterval(() => {
+        if (signal?.aborted) return finish(() => reject(abortError()));
+        if (state.error) return finish(() => reject(state.error instanceof Error ? state.error : new Error(String(state.error))));
+        if (video.readyState >= HTMLMediaElement.HAVE_METADATA) finish(resolve);
+      }, 100);
+      video.onloadedmetadata = () => finish(resolve);
+      video.onerror = () => finish(() => reject(new Error(`clip failed to decode (${diag()})`)));
     });
     video.pause();
 
@@ -299,8 +321,19 @@ async function captureClip(
     const end = Math.min(clip.trimOut, Number.isFinite(video.duration) ? video.duration : clip.trimOut);
 
     let t = await seekPresent(video, Math.max(0, clip.trimIn), 3000);
-    if (t === null) t = await seekPresent(video, Math.max(0, clip.trimIn) + 0.001, 3000);
-    if (t === null) throw new Error('could not present first frame');
+    if (t === null) {
+      // Muted play() nudge: some WebKit states only start the decode pipeline
+      // for an element that has actually played. Play briefly, pause, re-seek.
+      exportLog(`first seek presented nothing (${diag()}); trying play() nudge`);
+      try { await video.play(); } catch { /* autoplay refusal — muted, unlikely */ }
+      await new Promise<void>((resolve) => {
+        const handle = video.requestVideoFrameCallback(() => { clearTimeout(timer); resolve(); });
+        const timer = setTimeout(() => { video.cancelVideoFrameCallback(handle); resolve(); }, 1000);
+      });
+      video.pause();
+      t = await seekPresent(video, Math.max(0, clip.trimIn) + 0.001, 3000);
+    }
+    if (t === null) throw new Error(`could not present first frame (${diag()})`);
 
     for (;;) {
       if (signal?.aborted) throw abortError();
@@ -317,7 +350,7 @@ async function captureClip(
         // Timestamps must be strictly increasing for the muxer.
         if (ts <= state.lastTs) ts = state.lastTs + 1_000;
         state.lastTs = ts;
-        drawCover(ctx, video, canvas.width, canvas.height);
+        drawCover(ctx, video, video.videoWidth, video.videoHeight, canvas.width, canvas.height);
         const frame = new VideoFrame(canvas, { timestamp: ts });
         const keyFrame = state.frames === 0 || ts - state.lastKeyTs >= 2_000_000;
         if (keyFrame) state.lastKeyTs = ts;
@@ -356,14 +389,318 @@ async function captureClip(
   } finally {
     video.onended = null;
     video.onerror = null;
-    video.onloadeddata = null;
+    video.onloadedmetadata = null;
     // Release the decoder promptly (matters on mobile).
     video.removeAttribute('src');
     video.load();
+    video.remove();
     URL.revokeObjectURL(url);
     // Let the release actually start before anything else runs.
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
+  state.offsetUs = base + Math.round(len * 1_000_000);
+}
+
+// ---------------------------------------------------------------------------
+// Demuxer-based decode path (mp4box.js + VideoDecoder): no media elements.
+// This is the deterministic primary path — iPhone Safari has repeatedly broken
+// the element-based decode (paused seek-stepping) in ways rVFC cannot observe;
+// demux + VideoDecoder involves no <video>, no seeks and no compositor.
+// ---------------------------------------------------------------------------
+
+/** Container codecs the decoder path knows how to configure. */
+const DECODABLE_CODEC = /^(avc1|avc3|hvc1|hev1|vp09|av01)/;
+
+/**
+ * Cheap pre-demux gate: MP4 container (recorder MIME or blob type) and a
+ * VideoDecoder implementation. WebM sources and decoder-less engines use the
+ * element path. The per-track codec check happens after demux.
+ */
+export function decoderPathEligible(clip: Clip, blob: Blob): boolean {
+  const type = clip.mimeType || blob.type || '';
+  return type.includes('mp4') && typeof VideoDecoder !== 'undefined';
+}
+
+interface DemuxedClip {
+  codec: string;
+  codedWidth: number;
+  codedHeight: number;
+  description?: Uint8Array;
+  /** timescale-converted samples in decode order; data copied out of mp4box */
+  samples: Array<{ isSync: boolean; tsUs: number; durUs: number; data: Uint8Array }>;
+}
+
+/**
+ * Extract the codec-specific DecoderConfig description for AVC/HEVC: the
+ * avcC/hvcC box payload from the track's stsd entry, minus the 8-byte box
+ * header. VP9/AV1 need no description (vpcC/av1C data travels in the codec
+ * string / bitstream as far as VideoDecoder is concerned).
+ */
+function decoderDescription(file: ISOFile, trackId: number): Uint8Array | undefined {
+  const trak = file.getTrackById(trackId) as unknown as {
+    mdia?: { minf?: { stbl?: { stsd?: { entries?: Array<Record<string, unknown>> } } } };
+  };
+  for (const entry of trak?.mdia?.minf?.stbl?.stsd?.entries ?? []) {
+    const box = (entry.avcC ?? entry.hvcC) as { write: (s: DataStream) => void } | undefined;
+    if (!box) continue;
+    const stream = new DataStream(undefined, 0, Endianness.BIG_ENDIAN);
+    box.write(stream);
+    return new Uint8Array(stream.buffer as ArrayBuffer, 8); // strip box size+type header
+  }
+  return undefined;
+}
+
+/**
+ * Demux the clip's MP4 with mp4box.js and return decode-ready samples for its
+ * video track, or throw if the container/track/codec is unusable (the caller
+ * falls back to the element path). The blob is appended in ~8MB chunks with
+ * correct fileStart offsets; sample payloads are copied out and the originals
+ * released batch-by-batch so mp4box never holds the whole mdat.
+ */
+async function demuxClip(blob: Blob, signal?: AbortSignal): Promise<DemuxedClip> {
+  const file = createFile();
+  let movie: Movie | null = null;
+  let demuxError: string | null = null;
+  let track: Track | null = null;
+  const samples: DemuxedClip['samples'] = [];
+
+  file.onError = (module: string, message: string) => {
+    demuxError = `${module}: ${message}`;
+  };
+  file.onReady = (info: Movie) => {
+    movie = info;
+    // Extraction must be armed synchronously inside onReady: mp4box (v2) does
+    // not re-deliver samples parsed from buffers appended before extraction
+    // was configured, and onReady fires mid-appendBuffer.
+    const found = info.videoTracks?.[0];
+    if (!found) {
+      demuxError = 'mp4 has no video track';
+      return;
+    }
+    if (!DECODABLE_CODEC.test(found.codec)) {
+      demuxError = `unsupported track codec for decoder path: ${found.codec}`;
+      return;
+    }
+    track = found;
+    file.setExtractionOptions(found.id, null, { nbSamples: 100 });
+    file.start();
+  };
+  file.onSamples = (id: number, _user: unknown, batch: Sample[]) => {
+    for (const sample of batch) {
+      if (!sample.data) continue;
+      samples.push({
+        isSync: sample.is_sync,
+        tsUs: Math.round((sample.cts * 1_000_000) / sample.timescale),
+        durUs: Math.round((sample.duration * 1_000_000) / sample.timescale),
+        data: sample.data.slice(), // copy: the original lives in mp4box's buffer
+      });
+    }
+    // Memory discipline: hand the consumed batch's buffers back to mp4box.
+    const last = batch[batch.length - 1];
+    if (last) file.releaseUsedSamples(id, last.number);
+  };
+
+  const buffer = await blob.arrayBuffer();
+  const CHUNK = 8 * 1024 * 1024;
+  for (let offset = 0; offset < buffer.byteLength; offset += CHUNK) {
+    if (signal?.aborted) throw abortError();
+    const end = Math.min(buffer.byteLength, offset + CHUNK);
+    file.appendBuffer(MP4BoxBuffer.fromArrayBuffer(buffer.slice(offset, end), offset));
+    if (demuxError) throw new Error(`mp4 demux failed (${demuxError})`);
+    // Yield between chunks so a Cancel can interleave on big files.
+    if (end < buffer.byteLength) await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  file.flush();
+  if (demuxError) throw new Error(`mp4 demux failed (${demuxError})`);
+  // (callbacks above assign these; widen past TS's closure-blind narrowing)
+  const readyTrack = track as Track | null;
+  if (!movie || !readyTrack) throw new Error('mp4 demux produced no movie metadata');
+  if (!samples.length) throw new Error('mp4 demux produced no video samples');
+
+  const demuxed: DemuxedClip = {
+    codec: readyTrack.codec,
+    codedWidth: readyTrack.video?.width ?? readyTrack.track_width,
+    codedHeight: readyTrack.video?.height ?? readyTrack.track_height,
+    description: decoderDescription(file, readyTrack.id),
+    samples,
+  };
+  file.stop();
+  return demuxed;
+}
+
+/** Abortable/error-aware short sleep used by decoder backpressure waits. */
+function decoderTick(state: RenderState, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortError());
+    if (state.error) return reject(state.error instanceof Error ? state.error : new Error(String(state.error)));
+    setTimeout(() => {
+      state.lastActivity = Date.now();
+      if (signal?.aborted) reject(abortError());
+      else if (state.error) reject(state.error instanceof Error ? state.error : new Error(String(state.error)));
+      else resolve();
+    }, 10);
+  });
+}
+
+/**
+ * PRIMARY capture path: demux the clip with mp4box.js, decode its samples with
+ * VideoDecoder, cover-crop each kept frame onto the shared canvas and hand it
+ * to the encoder. No media elements are involved, so none of the iOS <video>
+ * lifecycle pathologies apply. Timestamp semantics are identical to the
+ * element path: the first kept frame anchors the clip (rel + state.offsetUs),
+ * with the same strictly-increasing clamp, preserving VFR timing exactly.
+ *
+ * Trim: decoding starts at the last sync sample at/before trimIn; decoded
+ * frames before trimIn are closed immediately, frames in [trimIn, trimOut)
+ * are kept, and feeding stops at the first sample cts >= trimOut.
+ */
+async function captureClipViaDecoder(
+  clip: Clip,
+  blob: Blob,
+  canvas: OffscreenCanvas,
+  ctx: OffscreenCanvasRenderingContext2D,
+  encoder: VideoEncoder,
+  state: RenderState,
+  onSeconds: (s: number) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const demuxed = await demuxClip(blob, signal);
+  // Some muxers (Chromium's MediaRecorder among them) write vpcC level 0,
+  // yielding a codec string like "vp09.00.00.08" that VideoDecoder's parser
+  // rejects — level 00 is not a defined VP9 level. Offer a normalized
+  // candidate with a generous level (5.1 covers 4K@60) as a fallback; the
+  // level only advertises capability, decoders accept content below it.
+  const codecCandidates = [demuxed.codec];
+  const vp9BadLevel = demuxed.codec.match(/^vp09\.(\d{2})\.00\.(.+)$/);
+  if (vp9BadLevel) codecCandidates.push(`vp09.${vp9BadLevel[1]}.51.${vp9BadLevel[2]}`);
+  let codec: string | null = null;
+  for (const candidate of codecCandidates) {
+    try {
+      const support = await VideoDecoder.isConfigSupported({
+        codec: candidate,
+        description: demuxed.description,
+        codedWidth: demuxed.codedWidth,
+        codedHeight: demuxed.codedHeight,
+      });
+      if (support.supported) { codec = candidate; break; }
+    } catch { /* malformed codec string — try the next candidate */ }
+  }
+  if (!codec) throw new Error(`VideoDecoder rejects ${codecCandidates.join(', ')}`);
+  demuxed.codec = codec;
+
+  const len = clipLen(clip);
+  const base = state.offsetUs;
+  const trimInUs = Math.round(clip.trimIn * 1_000_000);
+  const trimOutUs = Math.round(clip.trimOut * 1_000_000);
+
+  // Decode must start on a sync sample: last keyframe at/before trimIn.
+  let startIndex = 0;
+  for (let i = 0; i < demuxed.samples.length; i++) {
+    if (demuxed.samples[i].isSync && demuxed.samples[i].tsUs <= trimInUs) startIndex = i;
+  }
+
+  let captured = 0;
+  let firstT = -1; // clip-local anchor, seconds (first KEPT frame)
+  const pending: VideoFrame[] = [];
+  let decodeFailure: unknown = null;
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      state.lastActivity = Date.now();
+      // Trim in decoder output: pre-trimIn frames close immediately, and
+      // anything at/after trimOut (decode-order stragglers) closes too.
+      if (frame.timestamp < trimInUs || frame.timestamp >= trimOutUs) {
+        frame.close();
+        return;
+      }
+      pending.push(frame);
+    },
+    error: (error) => {
+      decodeFailure = error;
+    },
+  });
+
+  const throwIfBroken = () => {
+    if (signal?.aborted) throw abortError();
+    if (decodeFailure) throw decodeFailure instanceof Error ? decodeFailure : new Error(String(decodeFailure));
+    if (state.error) throw state.error instanceof Error ? state.error : new Error(String(state.error));
+  };
+
+  // Draw + encode one decoded frame, then close it promptly.
+  const consume = async (frame: VideoFrame) => {
+    try {
+      const t = frame.timestamp / 1_000_000;
+      if (firstT < 0) firstT = t;
+      const rel = Math.min(len, Math.max(0, t - firstT));
+      let ts = base + Math.round(rel * 1_000_000);
+      if (ts <= state.lastTs) ts = state.lastTs + 1_000; // strictly increasing for the muxer
+      state.lastTs = ts;
+      drawCover(ctx, frame, frame.displayWidth, frame.displayHeight, canvas.width, canvas.height);
+      const out = new VideoFrame(canvas, { timestamp: ts });
+      const keyFrame = state.frames === 0 || ts - state.lastKeyTs >= 2_000_000;
+      if (keyFrame) state.lastKeyTs = ts;
+      encoder.encode(out, { keyFrame });
+      out.close();
+      state.frames += 1;
+      captured += 1;
+      onSeconds(rel);
+    } finally {
+      frame.close();
+    }
+    if (encoder.encodeQueueSize > 4) await waitForQueueDrain(encoder, state, signal);
+  };
+
+  try {
+    decoder.configure({
+      codec: demuxed.codec,
+      description: demuxed.description,
+      codedWidth: demuxed.codedWidth,
+      codedHeight: demuxed.codedHeight,
+    });
+
+    for (let i = startIndex; i < demuxed.samples.length; i++) {
+      const sample = demuxed.samples[i];
+      if (sample.tsUs >= trimOutUs) break; // stop feeding past trimOut
+      throwIfBroken();
+      state.lastActivity = Date.now();
+      decoder.decode(new EncodedVideoChunk({
+        type: sample.isSync ? 'key' : 'delta',
+        timestamp: sample.tsUs,
+        duration: sample.durUs,
+        data: sample.data,
+      }));
+      // Backpressure: bounded decode queue and bounded pool of live frames.
+      while (pending.length > 0 && (pending.length > 2 || decoder.decodeQueueSize > 4)) {
+        await consume(pending.shift()!);
+      }
+      while (decoder.decodeQueueSize > 4 && pending.length === 0) {
+        await decoderTick(state, signal);
+        throwIfBroken();
+      }
+    }
+    // Abort-aware flush: keep consuming frames as they surface, and let an
+    // abort or a decoder/encoder error interrupt the wait (Cancel stays
+    // instant even mid-flush).
+    let flushDone = false;
+    let flushError: unknown = null;
+    decoder.flush().then(
+      () => { flushDone = true; },
+      (error) => { flushError = error; flushDone = true; },
+    );
+    while (!flushDone) {
+      while (pending.length > 0) await consume(pending.shift()!);
+      await decoderTick(state, signal);
+    }
+    throwIfBroken();
+    if (flushError) throw flushError instanceof Error ? flushError : new Error(String(flushError));
+    while (pending.length > 0) await consume(pending.shift()!);
+  } finally {
+    for (const frame of pending.splice(0)) frame.close();
+    try {
+      if (decoder.state !== 'closed') decoder.close();
+    } catch { /* already closed */ }
+  }
+  if (!captured) throw new Error('decoder path captured no frames from clip');
+  exportLog(`decoder path captured ${captured} frames (${len.toFixed(2)}s clip, ${demuxed.codec})`);
   state.offsetUs = base + Math.round(len * 1_000_000);
 }
 
@@ -421,15 +758,20 @@ export async function renderVideoWebCodecs(
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('canvas 2d unavailable');
 
-  // Each clip gets a FRESH <video> element. Reusing one element across many
-  // blob-src swaps starves iOS Safari of decoder sessions (AVPlayer-backed
-  // elements release their hardware decoder lazily), which made multi-clip
-  // exports fail on the third clip while one- and two-clip exports passed.
+  // Each clip gets a FRESH <video> element, ATTACHED to the DOM (hidden but
+  // not display:none): iOS Safari deprioritizes or outright refuses media
+  // loading/decoding for detached elements, and skips decode for undisplayed
+  // ones. A 2x2 transparent fixed-position element keeps the decoder honest
+  // without being visible. Fresh-per-clip stays: reusing one element across
+  // blob-src swaps starves iOS of decoder sessions (AVPlayer teardown is lazy).
   const makeVideo = () => {
     const v = document.createElement('video');
     v.muted = true;
     v.playsInline = true;
     v.preload = 'auto';
+    v.style.cssText =
+      'position:fixed;left:0;bottom:0;width:2px;height:2px;opacity:0.01;pointer-events:none;z-index:-1;';
+    document.body.appendChild(v);
     return v;
   };
 
@@ -440,18 +782,36 @@ export async function renderVideoWebCodecs(
       const progress = (s: number) => onProgress?.(Math.min(0.99, (done + s) / total));
       exportLog(`clip ${i + 1}/${clips.length}: decode+capture start`);
       const framesBefore = state.frames;
-      try {
-        await captureClip(clips[i], blobs[i], makeVideo(), canvas, ctx, encoder, state, progress, signal);
-      } catch (error) {
-        // Retry only when the clip contributed nothing yet — a mid-clip retry
-        // would re-encode frames already handed to the muxer.
-        if (signal?.aborted || state.error || state.frames !== framesBefore) throw error;
-        // One retry with another fresh element and a breather: transient
-        // decoder-session exhaustion (iOS) recovers once the previous
-        // element's release completes.
-        exportLog(`clip ${i + 1} capture failed (${error instanceof Error ? error.message : error}); retrying once`);
-        await new Promise((r) => setTimeout(r, 400));
-        await captureClip(clips[i], blobs[i], makeVideo(), canvas, ctx, encoder, state, progress, signal);
+      // PRIMARY: demuxer-based decode (mp4box + VideoDecoder, no media
+      // elements) for eligible MP4 clips. Fall back to the element path only
+      // when the decoder path failed without contributing any frames — once
+      // frames reached the muxer a rerun would duplicate them, so propagate.
+      let captured = false;
+      if (decoderPathEligible(clips[i], blobs[i])) {
+        try {
+          await captureClipViaDecoder(clips[i], blobs[i], canvas, ctx, encoder, state, progress, signal);
+          captured = true;
+          exportLog(`clip ${i + 1}/${clips.length} mode=decoder`);
+        } catch (error) {
+          if (signal?.aborted || state.error || state.frames !== framesBefore) throw error;
+          exportLog(`clip ${i + 1} decoder path failed (${error instanceof Error ? error.message : error}); falling back to element path`);
+        }
+      }
+      if (!captured) {
+        try {
+          await captureClipViaElement(clips[i], blobs[i], makeVideo(), canvas, ctx, encoder, state, progress, signal);
+        } catch (error) {
+          // Retry only when the clip contributed nothing yet — a mid-clip retry
+          // would re-encode frames already handed to the muxer.
+          if (signal?.aborted || state.error || state.frames !== framesBefore) throw error;
+          // One retry with another fresh element and a breather: transient
+          // decoder-session exhaustion (iOS) recovers once the previous
+          // element's release completes.
+          exportLog(`clip ${i + 1} capture failed (${error instanceof Error ? error.message : error}); retrying once`);
+          await new Promise((r) => setTimeout(r, 400));
+          await captureClipViaElement(clips[i], blobs[i], makeVideo(), canvas, ctx, encoder, state, progress, signal);
+        }
+        exportLog(`clip ${i + 1}/${clips.length} mode=element`);
       }
       // Give iOS's lazy AVPlayer teardown a beat before opening the next
       // decoder session; without it, back-to-back sessions starve on phones.

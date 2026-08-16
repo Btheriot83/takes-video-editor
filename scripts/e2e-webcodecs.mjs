@@ -111,6 +111,10 @@ await download.saveAs(output);
 
 const usedWebCodecs = exportLogs.some((l) => l.includes('using webcodecs encoder'));
 const fellBack = exportLogs.some((l) => l.includes('webcodecs path failed'));
+// The demuxer-based decode path (mp4box + VideoDecoder) must carry every clip:
+// the fake camera records vp9-in-mp4, which is decoder-path eligible.
+const decoderClips = exportLogs.filter((l) => / mode=decoder$/.test(l)).length;
+const elementClips = exportLogs.filter((l) => / mode=element$/.test(l)).length;
 
 // --- ffprobe assertions on the delivered file ---
 const streams = JSON.parse(execFileSync('ffprobe', [
@@ -158,7 +162,7 @@ if (!(completeness >= 0.95)) {
 }
 
 console.log(JSON.stringify({
-  clipCount, output, bytes: fs.statSync(output).size, usedWebCodecs, fellBack,
+  clipCount, output, bytes: fs.statSync(output).size, usedWebCodecs, fellBack, decoderClips, elementClips,
   video: { width: video.width, height: video.height, duration: videoDur, frames: exportedFrames },
   audio: { codec: audio.codec_name, duration: audioDur },
   avSkew, moovAt, mdatAt, sourceFrames, completeness,
@@ -166,4 +170,7 @@ console.log(JSON.stringify({
 }, null, 2));
 await browser.close();
 if (!usedWebCodecs || fellBack) throw new Error('export did not complete through the WebCodecs path');
+if (decoderClips !== clipCount || elementClips !== 0) {
+  throw new Error(`expected all ${clipCount} clips via mode=decoder, got decoder=${decoderClips} element=${elementClips}`);
+}
 if (errors.length) throw new Error(`browser reported ${errors.length} error(s)`);
