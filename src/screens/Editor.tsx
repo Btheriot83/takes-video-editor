@@ -7,6 +7,7 @@ import { useStore } from '../state/store';
 import { ASPECT_RATIOS, clipLen, totalDuration, fmtTime, FRAME, exportDimensions, isUltraHDCapture } from '../types/clip';
 import type { Clip, ExportQuality } from '../types/clip';
 import { getBlob } from '../lib/db';
+import { prepareExportAssets } from '../lib/ffmpeg';
 import { clipStart, locate, timelineClipWidth, timelinePlayheadX } from '../lib/editor';
 import ExportSheet from '../components/ExportSheet';
 
@@ -73,6 +74,12 @@ export default function Editor() {
   const fileRef = useRef<HTMLInputElement>(null);
 
   clipUrlsRef.current = clipUrls;
+
+  // Covers restored projects, multi-file imports, duplicates, and splits that
+  // enter the editor without passing through the camera's two-clip effect.
+  useEffect(() => {
+    if (clips.length > 1) void prepareExportAssets();
+  }, [clips.length]);
 
   useEffect(() => () => {
     Object.values(clipUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));

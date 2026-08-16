@@ -17,6 +17,96 @@ let loading: Promise<FFmpegLike> | null = null;
  * load that finishes after a cancel does not republish its instance. */
 let loadToken: object | null = null;
 
+interface PreparedCoreAssets {
+  coreURL: string;
+  wasmURL: string;
+  release: () => void;
+}
+
+interface NetworkInformationLike {
+  saveData?: boolean;
+}
+
+/**
+ * A multi-clip export needs ffmpeg for a safe concat or its AAC track. The
+ * single-threaded wasm core is 32 MB, so fetching it only after "Start export"
+ * makes a cellular connection look like a slow file download even though the
+ * finished MP4 never leaves the device. Fetch the bytes after a second clip is
+ * safely stored, but do not instantiate ffmpeg or allocate its wasm heap until
+ * export actually starts. Blob URLs let the later worker consume these exact
+ * prefetched bytes even on the first visit, before the PWA service worker has
+ * taken control of the page.
+ */
+let preparedCoreAssets: PreparedCoreAssets | null = null;
+let preparingCoreAssets: Promise<PreparedCoreAssets | null> | null = null;
+let preparedCoreExpiry: ReturnType<typeof setTimeout> | null = null;
+const PREPARED_CORE_TTL_MS = 10 * 60_000;
+
+function releasePreparedCoreAssets() {
+  if (preparedCoreExpiry) clearTimeout(preparedCoreExpiry);
+  preparedCoreExpiry = null;
+  preparedCoreAssets?.release();
+  preparedCoreAssets = null;
+}
+
+async function fetchCoreAssets(): Promise<PreparedCoreAssets | null> {
+  if (typeof document === 'undefined' || typeof fetch === 'undefined' || typeof URL.createObjectURL !== 'function') {
+    return null;
+  }
+  const url = (path: string) => new URL(path, document.baseURI).href;
+  const started = performance.now();
+  const paths = [url('ffmpeg/ffmpeg-core.js'), url('ffmpeg/ffmpeg-core.wasm')];
+  const responses = await Promise.all(paths.map((path) => fetch(path, {
+    cache: 'force-cache',
+    credentials: 'same-origin',
+  })));
+  for (let i = 0; i < responses.length; i++) {
+    if (!responses[i].ok) throw new Error(`export asset request failed (${responses[i].status} ${paths[i]})`);
+  }
+  const [coreBlob, wasmBlob] = await Promise.all(responses.map((response) => response.blob()));
+  const coreURL = URL.createObjectURL(new Blob([coreBlob], { type: 'text/javascript' }));
+  const wasmURL = URL.createObjectURL(new Blob([wasmBlob], { type: 'application/wasm' }));
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    URL.revokeObjectURL(coreURL);
+    URL.revokeObjectURL(wasmURL);
+  };
+  console.log(
+    `[export] encoder assets prefetched (${((coreBlob.size + wasmBlob.size) / 1024 / 1024).toFixed(1)} MB in ` +
+    `${((performance.now() - started) / 1000).toFixed(2)}s)`,
+  );
+  return { coreURL, wasmURL, release };
+}
+
+/**
+ * Starts the bandwidth-heavy, memory-light part of export preparation. Safe to
+ * call repeatedly; every caller shares one request. Failures are deliberately
+ * non-fatal because getFFmpeg retains its normal direct-load fallback.
+ */
+export function prepareExportAssets(): Promise<void> {
+  const connection = (navigator as Navigator & { connection?: NetworkInformationLike }).connection;
+  // Respect an explicit user/device request to minimize background data. The
+  // normal on-demand export path remains available when they actually export.
+  if (connection?.saveData || ff || preparedCoreAssets || canUseMtCore()) return Promise.resolve();
+  if (!preparingCoreAssets) {
+    preparingCoreAssets = fetchCoreAssets().then((assets) => {
+      preparedCoreAssets = assets;
+      if (assets) {
+        preparedCoreExpiry = setTimeout(releasePreparedCoreAssets, PREPARED_CORE_TTL_MS);
+      }
+      return assets;
+    }).catch((error) => {
+      console.warn('[export] encoder asset prefetch failed; export will load normally', error);
+      return null;
+    }).finally(() => {
+      preparingCoreAssets = null;
+    });
+  }
+  return preparingCoreAssets.then(() => undefined);
+}
+
 /**
  * Multithreaded encoding needs SharedArrayBuffer, which browsers only enable
  * on cross-origin-isolated pages (COOP/COEP headers). When available it makes
@@ -86,10 +176,18 @@ async function getFFmpeg(): Promise<FFmpegLike> {
           console.warn('[ffmpeg] mt core failed to load; using single-threaded core', error);
         }
       }
-      await inst.load({
-        coreURL: u('ffmpeg/ffmpeg-core.js'),
-        wasmURL: u('ffmpeg/ffmpeg-core.wasm'),
-      });
+      // If the camera/editor began the bandwidth-only preparation after a
+      // second clip, wait for that shared request and load from its object
+      // URLs. Otherwise retain the normal direct network/cache path.
+      const prepared = preparedCoreAssets ?? await preparingCoreAssets;
+      try {
+        await inst.load({
+          coreURL: prepared?.coreURL ?? u('ffmpeg/ffmpeg-core.js'),
+          wasmURL: prepared?.wasmURL ?? u('ffmpeg/ffmpeg-core.wasm'),
+        });
+      } finally {
+        if (prepared) releasePreparedCoreAssets();
+      }
       if (loadToken === token) ff = inst;
       return inst;
     })();

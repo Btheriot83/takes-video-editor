@@ -3,6 +3,7 @@ import { Film, Images, SwitchCamera, Zap, ZapOff } from 'lucide-react';
 import { getCameraStream, startRecording } from '../lib/recorder';
 import type { ActiveRecording } from '../lib/recorder';
 import { storageMode } from '../lib/db';
+import { prepareExportAssets } from '../lib/ffmpeg';
 import { useStore } from '../state/store';
 import { ASPECT_RATIOS, fmtTime, clipLen, isUltraHDCapture } from '../types/clip';
 import type { AspectRatio, CaptureQuality } from '../types/clip';
@@ -141,6 +142,16 @@ export default function Camera() {
     if (savedTimerRef.current) window.clearTimeout(savedTimerRef.current);
     if (zoomFrameRef.current) window.cancelAnimationFrame(zoomFrameRef.current);
   }, []);
+
+  // Two or more clips will need ffmpeg for either a safe no-reencode join or
+  // an AAC render. Pull its 32 MB core forward while the user is still in the
+  // capture flow, after recording persistence/finalization has settled. One
+  // untouched clip keeps the zero-download native fast path.
+  useEffect(() => {
+    if (clips.length > 1 && !recording && !starting && !stopping) {
+      void prepareExportAssets();
+    }
+  }, [clips.length, recording, starting, stopping]);
 
   useEffect(() => {
     const onVisibilityChange = () => {
