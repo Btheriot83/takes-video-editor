@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { captureConstraints, captureVideoBitrate, ultraHDRetryConstraints } from './recorder';
+import { canRecordCameraTrackDirectly, captureConstraints, captureVideoBitrate, ultraHDRetryConstraints } from './recorder';
 import { CAPTURE_DIMENSIONS, isFullUltraHDFrame, isUltraHDCapture } from '../types/clip';
 
 describe('captureConstraints', () => {
@@ -91,5 +91,29 @@ describe('captureVideoBitrate', () => {
     expect(captureVideoBitrate(1080, 1920)).toBe(6_000_000);
     expect(captureVideoBitrate(1280, 720)).toBe(6_000_000);
     expect(captureVideoBitrate(undefined, undefined)).toBe(6_000_000);
+  });
+});
+
+describe('canRecordCameraTrackDirectly', () => {
+  it('keeps an exact portrait camera frame on the native hardware path', () => {
+    expect(canRecordCameraTrackDirectly(
+      { width: 2160, height: 3840 },
+      { width: 2160, height: 3840 },
+    )).toBe(true);
+  });
+
+  it('requires composition when orientation or project framing differs', () => {
+    expect(canRecordCameraTrackDirectly(
+      { width: 3840, height: 2160 },
+      { width: 2160, height: 3840 },
+    )).toBe(false);
+    expect(canRecordCameraTrackDirectly(
+      { width: 2160, height: 3840 },
+      { width: 2160, height: 2160 },
+    )).toBe(false);
+    expect(canRecordCameraTrackDirectly(
+      { width: 0, height: 0 },
+      { width: 2160, height: 3840 },
+    )).toBe(false);
   });
 });

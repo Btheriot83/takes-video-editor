@@ -53,7 +53,7 @@ export interface ActiveRecording {
   /** True when the saved track was normalized to the selected output frame. */
   outputReady: boolean;
   /** How output frames are sampled from the live camera. */
-  captureMode: 'source-synced' | 'timer' | 'raw';
+  captureMode: 'camera-native' | 'source-synced' | 'timer' | 'raw';
 }
 
 type RecordingFrame = { width: number; height: number };
@@ -64,6 +64,20 @@ type ComposedRecordingStream = {
   mode: 'source-synced' | 'timer';
   frameCount: () => number;
 };
+
+/**
+ * The camera track is the smoothest recording source because the phone can
+ * keep it on its native hardware encode path. A 4K canvas redraw is only
+ * necessary when the selected project frame actually differs from the
+ * display-oriented camera frame (for example, a square crop).
+ */
+export function canRecordCameraTrackDirectly(
+  preview: RecordingFrame,
+  output: RecordingFrame,
+): boolean {
+  return preview.width > 0 && preview.height > 0
+    && preview.width === output.width && preview.height === output.height;
+}
 
 function cancelPreviewFrame(preview: HTMLVideoElement, id: number | null): void {
   if (id !== null && typeof preview.cancelVideoFrameCallback === 'function') {
@@ -307,7 +321,11 @@ export async function startRecording(
   const mimeType = pickMimeType();
   const cameraSettings = stream.getVideoTracks()[0]?.getSettings?.();
   const audioSettings = stream.getAudioTracks()[0]?.getSettings?.();
-  let composition = preview && output
+  const cameraNativeOutput = Boolean(preview && output && canRecordCameraTrackDirectly(
+    { width: preview.videoWidth, height: preview.videoHeight },
+    output,
+  ));
+  let composition = !cameraNativeOutput && preview && output
     ? composeOutputReadyStream(stream, preview, output, cameraSettings?.frameRate ?? 30)
     : null;
   let recordingStream = composition?.stream ?? stream;
@@ -316,6 +334,7 @@ export async function startRecording(
     composition ? output?.width : videoSettings?.width,
     composition ? output?.height : videoSettings?.height,
   );
+  const captureMode = () => cameraNativeOutput ? 'camera-native' : composition?.mode ?? 'raw';
 
   const createRecorder = () => new MediaRecorder(recordingStream, {
     mimeType: mimeType || undefined,
@@ -342,12 +361,12 @@ export async function startRecording(
     cameraSettings,
     recordingSettings: videoSettings,
     output,
-    outputReady: Boolean(composition),
-    captureMode: composition?.mode ?? 'raw',
+    outputReady: cameraNativeOutput || Boolean(composition),
+    captureMode: captureMode(),
     audioSettings,
     videoBitsPerSecond,
   });
-  console.log(`[rec] capture mode=${composition?.mode ?? 'raw'}`);
+  console.log(`[rec] capture mode=${captureMode()}`);
 
   let seq = 0;
   const chunks: Blob[] = [];
@@ -397,8 +416,8 @@ export async function startRecording(
 
   return {
     get mimeType() { return rec.mimeType || mimeType; },
-    outputReady: Boolean(composition),
-    captureMode: composition?.mode ?? 'raw',
+    outputReady: cameraNativeOutput || Boolean(composition),
+    captureMode: captureMode(),
     get paused() { return rec.state === 'paused'; },
     pause: () => { if (rec.state === 'recording') rec.pause(); },
     resume: () => { if (rec.state === 'paused') rec.resume(); },
@@ -432,7 +451,7 @@ export async function startRecording(
             mimeType: blob.type,
             videoBitsPerSecond: rec.videoBitsPerSecond,
             audioBitsPerSecond: rec.audioBitsPerSecond,
-            captureMode: composition?.mode ?? 'raw',
+            captureMode: captureMode(),
             capturedFrames,
             measuredFps: elapsed > 0 ? Number((capturedFrames / elapsed).toFixed(1)) : null,
           });

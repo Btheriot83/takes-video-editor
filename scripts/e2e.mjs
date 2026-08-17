@@ -411,6 +411,7 @@ if (timelineRendersDuringPlayback > 3) {
 }
 log(`editor playback verified at ${playbackRate.toFixed(2)}x with ${timelineRendersDuringPlayback} timeline render(s)`);
 const globalStart = Number(await page.locator('[data-editor-playhead]').getAttribute('data-editor-playhead'));
+const timelineRendersBeforeHandoff = Number(await page.locator('[data-timeline-render-count]').getAttribute('data-timeline-render-count'));
 await page.waitForTimeout(1400);
 const globalEnd = Number(await page.locator('[data-editor-playhead]').getAttribute('data-editor-playhead'));
 const crossClipRate = (globalEnd - globalStart) / 1.4;
@@ -421,6 +422,10 @@ if (!Number.isFinite(handoffGap) || handoffGap > 120) throw new Error(`clip hand
 const handoffStartOffset = Number(await page.locator('[data-editor-playhead]').getAttribute('data-last-handoff-start-offset-ms'));
 if (!Number.isFinite(handoffStartOffset) || handoffStartOffset > 50) {
   throw new Error(`clip handoff skipped ${handoffStartOffset}ms of the incoming clip`);
+}
+const timelineRendersAtHandoff = Number(await page.locator('[data-timeline-render-count]').getAttribute('data-timeline-render-count')) - timelineRendersBeforeHandoff;
+if (timelineRendersAtHandoff > 2) {
+  throw new Error(`timeline re-rendered ${timelineRendersAtHandoff} times around the 4K clip handoff`);
 }
 const handoffPlayers = await page.locator('[data-editor-playhead]').evaluate((editor) => {
   const activeSlot = editor.getAttribute('data-editor-active-slot');
@@ -443,7 +448,7 @@ if (!handoffPlayers || handoffPlayers.activePaused || handoffPlayers.activeReady
 const rearPlaybackSlot = await page.locator('[data-editor-playhead]').getAttribute('data-editor-active-slot');
 const rearPlaybackFraming = await page.locator(`[data-editor-video-slot="${rearPlaybackSlot}"]`).getAttribute('data-editor-framing');
 if (rearPlaybackFraming !== 'cover') throw new Error(`rear clip framing was ${rearPlaybackFraming}, expected cover`);
-log(`cross-clip playback verified at ${crossClipRate.toFixed(2)}x; handoff ${handoffGap.toFixed(1)}ms; opening offset ${handoffStartOffset.toFixed(1)}ms`);
+log(`cross-clip playback verified at ${crossClipRate.toFixed(2)}x; handoff ${handoffGap.toFixed(1)}ms; opening offset ${handoffStartOffset.toFixed(1)}ms; ${timelineRendersAtHandoff} boundary render(s)`);
 await page.click('button[aria-label="Pause"]');
 await page.click('text=Split');
 await page.waitForTimeout(300);

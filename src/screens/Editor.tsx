@@ -55,11 +55,12 @@ export default function Editor() {
   const activeSlotRef = useRef<VideoSlot>(0);
   const activeIndexRef = useRef(0);
   const slotIndexRef = useRef<[number | null, number | null]>([null, null]);
+  const primedIndexRef = useRef<[number | null, number | null]>([null, null]);
   const handoffRef = useRef(false);
+  const handoffUiTimerRef = useRef<number | null>(null);
+  const preloadTimerRef = useRef<number | null>(null);
   const [playing, setPlaying] = useState(false);
   const [activeSlot, setActiveSlot] = useState<VideoSlot>(0);
-  const [handoffGapMs, setHandoffGapMs] = useState<number | null>(null);
-  const [handoffStartOffsetMs, setHandoffStartOffsetMs] = useState<number | null>(null);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   // Export quality defaults to the highest source class: 4K only when a clip
@@ -87,6 +88,8 @@ export default function Editor() {
   useEffect(() => () => {
     Object.values(clipUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));
     clipUrlsRef.current = {};
+    if (handoffUiTimerRef.current !== null) window.clearTimeout(handoffUiTimerRef.current);
+    if (preloadTimerRef.current !== null) window.clearTimeout(preloadTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -156,6 +159,7 @@ export default function Editor() {
     v.dataset.editorFraming = framing;
     if (slotIndexRef.current[slot] !== index || v.src !== url) {
       v.pause();
+      primedIndexRef.current[slot] = null;
       v.muted = slot !== activeSlotRef.current;
       v.src = url;
       v.load();
@@ -163,6 +167,7 @@ export default function Editor() {
       await waitForMedia(v);
     }
     await seekMedia(v, clip.trimIn + offset);
+    if (offset > FRAME / 2) primedIndexRef.current[slot] = null;
     return v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
   }, [clips, clipUrls]);
 
@@ -171,6 +176,14 @@ export default function Editor() {
     if (nextIndex >= clips.length) return;
     const slot = (activeSlotRef.current === 0 ? 1 : 0) as VideoSlot;
     void (async () => {
+      const existing = videoRefs.current[slot];
+      if (
+        primedIndexRef.current[slot] === nextIndex &&
+        slotIndexRef.current[slot] === nextIndex &&
+        existing &&
+        existing.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+        Math.abs(existing.currentTime - clips[nextIndex].trimIn) < 0.05
+      ) return;
       if (!await loadSlot(slot, nextIndex, 0)) return;
       const v = videoRefs.current[slot];
       if (!v || activeSlotRef.current === slot || slotIndexRef.current[slot] !== nextIndex) return;
@@ -183,6 +196,9 @@ export default function Editor() {
         if (activeSlotRef.current === slot || slotIndexRef.current[slot] !== nextIndex) return;
         v.pause();
         await seekMedia(v, clips[nextIndex].trimIn);
+        if (activeSlotRef.current !== slot && slotIndexRef.current[slot] === nextIndex) {
+          primedIndexRef.current[slot] = nextIndex;
+        }
       } catch { /* autoplay refused or load interrupted; handoff still works, just colder */ }
     })();
   }, [clips, loadSlot]);
@@ -197,6 +213,7 @@ export default function Editor() {
     if (!await loadSlot(slot, loc.index, loc.offset)) return false;
     activeSlotRef.current = slot;
     activeIndexRef.current = loc.index;
+    primedIndexRef.current[slot] = null;
     setActiveSlot(slot);
     videoRefs.current.forEach((video, index) => { if (video) video.muted = index !== slot; });
     if (autoplay) {
@@ -228,6 +245,11 @@ export default function Editor() {
       video.load();
     });
     slotIndexRef.current = [null, null];
+    primedIndexRef.current = [null, null];
+    if (handoffUiTimerRef.current !== null) window.clearTimeout(handoffUiTimerRef.current);
+    if (preloadTimerRef.current !== null) window.clearTimeout(preloadTimerRef.current);
+    handoffUiTimerRef.current = null;
+    preloadTimerRef.current = null;
   }, [setPlayhead]);
 
   const resumePreviews = useCallback(() => {
@@ -283,9 +305,11 @@ export default function Editor() {
       // visual handoff happens in this frame rather than after a large editor
       // tree has rendered. React then adopts these same inline values.
       incoming.style.opacity = '1';
+      incoming.style.zIndex = '2';
       incoming.setAttribute('aria-hidden', 'false');
       if (outgoing) {
         outgoing.style.opacity = '0';
+        outgoing.style.zIndex = '1';
         outgoing.setAttribute('aria-hidden', 'true');
         outgoing.muted = true;
       }
@@ -294,15 +318,24 @@ export default function Editor() {
 
       activeSlotRef.current = toSlot;
       activeIndexRef.current = nextIndex;
-      setActiveSlot(toSlot);
-      select(clips[nextIndex].id);
+      primedIndexRef.current[toSlot] = null;
       const nextPlayhead = nextStart + incomingOffset;
       playheadRef.current = nextPlayhead;
       renderLivePlayhead(nextPlayhead);
-      setPlayhead(nextPlayhead);
-      setHandoffStartOffsetMs(incomingOffset * 1000);
-      setHandoffGapMs(performance.now() - boundaryStarted);
-      setPlaybackError(null);
+      editorRootRef.current?.setAttribute('data-last-handoff-start-offset-ms', (incomingOffset * 1000).toFixed(1));
+      editorRootRef.current?.setAttribute('data-last-handoff-gap-ms', (performance.now() - boundaryStarted).toFixed(1));
+
+      // Do not reconcile the large React timeline tree on the same frame as
+      // the 4K media-layer cut. The media refs already own playback; this one
+      // deferred render only updates selection/accessibility state afterward.
+      if (handoffUiTimerRef.current !== null) window.clearTimeout(handoffUiTimerRef.current);
+      handoffUiTimerRef.current = window.setTimeout(() => {
+        handoffUiTimerRef.current = null;
+        if (activeSlotRef.current !== toSlot || activeIndexRef.current !== nextIndex) return;
+        setActiveSlot(toSlot);
+        select(clips[nextIndex].id);
+        setPlaybackError(null);
+      }, 80);
     } catch {
       incoming.pause();
       outgoing?.pause();
@@ -311,7 +344,14 @@ export default function Editor() {
       setPlaybackError('Playback stopped because the next clip could not start. Tap play to retry.');
     }
     handoffRef.current = false;
-    preloadAfter(nextIndex);
+    // Starting another 4K decoder at the exact boundary can steal the first
+    // frames from the clip that just became visible. Give that clip a short
+    // clean runway, then prepare the following clip in the spare slot.
+    if (preloadTimerRef.current !== null) window.clearTimeout(preloadTimerRef.current);
+    preloadTimerRef.current = window.setTimeout(() => {
+      preloadTimerRef.current = null;
+      preloadAfter(nextIndex);
+    }, 160);
   }, [clips, loadSlot, preloadAfter, renderLivePlayhead, select, setPlayhead]);
 
   // Frame-timed playback avoids the coarse 200–250ms cadence of timeupdate.
@@ -383,10 +423,10 @@ export default function Editor() {
     }
   };
 
+  const renderedPlayhead = playing ? playheadRef.current : playhead;
+
   return (
-    <div ref={editorRootRef} data-editor-playhead={playhead.toFixed(3)} data-editor-active-slot={activeSlot}
-      data-last-handoff-gap-ms={handoffGapMs?.toFixed(1) ?? ''}
-      data-last-handoff-start-offset-ms={handoffStartOffsetMs?.toFixed(1) ?? ''}
+    <div ref={editorRootRef} data-editor-playhead={renderedPlayhead.toFixed(3)} data-editor-active-slot={activeSlot}
       className="fixed inset-0 bg-neutral-950 text-white flex flex-col select-none">
       {/* header */}
       <div className="pt-[env(safe-area-inset-top)] px-2 py-1.5 flex items-center justify-between gap-1 border-b border-white/10">
@@ -396,7 +436,7 @@ export default function Editor() {
           <ArrowLeft size={20} />
         </button>
         <div className="whitespace-nowrap text-center text-xs min-[360px]:text-sm tabular-nums text-white/70">
-          <span ref={playheadLabelRef}>{fmtTime(playhead)}</span> <span className="text-white/55">/ {fmtTime(total)}</span>
+          <span ref={playheadLabelRef}>{fmtTime(renderedPlayhead)}</span> <span className="text-white/55">/ {fmtTime(total)}</span>
         </div>
         <div className="flex shrink-0 items-center">
           <button onClick={undo} disabled={!canUndo} aria-label="Undo"
@@ -424,8 +464,8 @@ export default function Editor() {
             <video key={slot} ref={(video) => { videoRefs.current[slot as VideoSlot] = video; }}
               data-editor-video-slot={slot} playsInline preload="auto" muted={slot !== activeSlot}
               aria-hidden={slot !== activeSlot}
-              className="absolute inset-0 h-full w-full transition-none"
-              style={{ opacity: slot === activeSlot ? 1 : 0 }} />
+              className="pointer-events-none absolute inset-0 h-full w-full transition-none"
+              style={{ opacity: slot === activeSlot ? 1 : 0, zIndex: slot === activeSlot ? 2 : 1 }} />
           ))}
         </div>
         <button onClick={togglePlay}
@@ -497,7 +537,7 @@ export default function Editor() {
       <Timeline
         clips={clips}
         selectedId={selectedId}
-        playhead={playhead}
+        playhead={renderedPlayhead}
         playheadElementRef={timelinePlayheadRef}
         onSelect={(id, offset) => {
           videoRefs.current.forEach((video) => video?.pause());
