@@ -4,7 +4,7 @@
 // a complete UHD raster; the production retry upgrades it to 3840x2160. The
 // recorder then normalizes that verified source to the selected output frame.
 //  - pass 1 (CLIP_COUNT=1): expects "Camera original preserved" (mode=native)
-//  - pass 2 (CLIP_COUNT=2): expects "Clips joined without re-encoding"
+//  - pass 2 (CLIP_COUNT=2): expects copied video with gapless normalized audio
 //    (mode=remuxed) — this also exercises the mp4box codec-uniformity probe,
 //    because Chrome reports the parameterless-unhelpful "video/mp4" family
 //    rather than an avc1-parameterized type.
@@ -78,7 +78,7 @@ async function run({ clipCount, aspect, expectCopy }) {
   await dialog.getByRole('button', { name: 'Start export' }).click();
   await dialog.getByText('Video ready to share or download').waitFor({ timeout: 300000 });
   const modeText = expectCopy
-    ? (clipCount === 1 ? 'Camera original preserved without re-encoding.' : 'Clips joined without re-encoding.')
+    ? (clipCount === 1 ? 'Camera original preserved without re-encoding.' : 'Video copied without re-encoding; audio joined seamlessly.')
     : `Rendered at 4K output resolution.`;
   await dialog.getByText(modeText).waitFor({ timeout: 5000 });
 

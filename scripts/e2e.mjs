@@ -386,6 +386,7 @@ if (afterUndo !== 4) throw new Error('undo failed');
 // split clip 1 after playing into it
 await page.locator('[data-clip]').nth(0).click();
 await page.waitForTimeout(200);
+const timelineRendersBeforePlayback = Number(await page.locator('[data-timeline-render-count]').getAttribute('data-timeline-render-count'));
 await page.click('button[aria-label="Play"]');
 await page.waitForSelector('button[aria-label="Pause"]', { timeout: 5000 });
 const playbackSlot = await page.locator('[data-editor-playhead]').getAttribute('data-editor-active-slot');
@@ -401,7 +402,14 @@ const playbackEnd = await playbackVideo.evaluate((video) => ({
 }));
 const playbackRate = (playbackEnd.mediaTime - playbackStart.mediaTime) / ((playbackEnd.wallTime - playbackStart.wallTime) / 1000);
 if (playbackRate < 0.85 || playbackRate > 1.15) throw new Error(`editor playback ran at ${playbackRate.toFixed(2)}x`);
-log(`editor playback verified at ${playbackRate.toFixed(2)}x`);
+const timelineRendersDuringPlayback = Number(await page.locator('[data-timeline-render-count]').getAttribute('data-timeline-render-count')) - timelineRendersBeforePlayback;
+// The media clock updates the visible counter and playhead directly. A React
+// render storm here competes with 4K hardware decode on iPhone and produces
+// the exact slightly-slow/choppy preview this gate is meant to prevent.
+if (timelineRendersDuringPlayback > 3) {
+  throw new Error(`timeline re-rendered ${timelineRendersDuringPlayback} times during 1.2s of playback`);
+}
+log(`editor playback verified at ${playbackRate.toFixed(2)}x with ${timelineRendersDuringPlayback} timeline render(s)`);
 const globalStart = Number(await page.locator('[data-editor-playhead]').getAttribute('data-editor-playhead'));
 await page.waitForTimeout(1400);
 const globalEnd = Number(await page.locator('[data-editor-playhead]').getAttribute('data-editor-playhead'));
@@ -413,6 +421,24 @@ if (!Number.isFinite(handoffGap) || handoffGap > 120) throw new Error(`clip hand
 const handoffStartOffset = Number(await page.locator('[data-editor-playhead]').getAttribute('data-last-handoff-start-offset-ms'));
 if (!Number.isFinite(handoffStartOffset) || handoffStartOffset > 50) {
   throw new Error(`clip handoff skipped ${handoffStartOffset}ms of the incoming clip`);
+}
+const handoffPlayers = await page.locator('[data-editor-playhead]').evaluate((editor) => {
+  const activeSlot = editor.getAttribute('data-editor-active-slot');
+  const active = document.querySelector(`[data-editor-video-slot="${activeSlot}"]`);
+  const inactive = document.querySelector(`[data-editor-video-slot="${activeSlot === '0' ? '1' : '0'}"]`);
+  return active instanceof HTMLVideoElement && inactive instanceof HTMLVideoElement
+    ? {
+        activePaused: active.paused,
+        activeReadyState: active.readyState,
+        activeOpacity: getComputedStyle(active).opacity,
+        inactivePaused: inactive.paused,
+        inactiveOpacity: getComputedStyle(inactive).opacity,
+      }
+    : null;
+});
+if (!handoffPlayers || handoffPlayers.activePaused || handoffPlayers.activeReadyState < 2 ||
+    handoffPlayers.activeOpacity !== '1' || !handoffPlayers.inactivePaused || handoffPlayers.inactiveOpacity !== '0') {
+  throw new Error(`clip handoff did not leave one ready, running, visible player: ${JSON.stringify(handoffPlayers)}`);
 }
 const rearPlaybackSlot = await page.locator('[data-editor-playhead]').getAttribute('data-editor-active-slot');
 const rearPlaybackFraming = await page.locator(`[data-editor-video-slot="${rearPlaybackSlot}"]`).getAttribute('data-editor-framing');

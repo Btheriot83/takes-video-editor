@@ -253,16 +253,16 @@ async function probeInputs(ffmpeg: FFmpegLike, names: string[]): Promise<InputPr
  * has no audio stream, the same duration of generated silence so audio-less
  * clips (and all-silent projects) still export a valid MP4 with an AAC track.
  */
-function audioChain(index: number, len: number, hasAudio: boolean): string {
+function audioChain(index: number, len: number, hasAudio: boolean, outputIndex = index): string {
   if (!hasAudio) {
     return (
       `anullsrc=r=48000:cl=stereo,atrim=end=${len},asetpts=PTS-STARTPTS,` +
-      `aformat=sample_fmts=fltp:channel_layouts=stereo[a${index}]`
+      `aformat=sample_fmts=fltp:channel_layouts=stereo[a${outputIndex}]`
     );
   }
   return (
     `[${index}:a]aresample=48000:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,` +
-    `asetpts=PTS-STARTPTS,atrim=end=${len},apad=whole_dur=${len}[a${index}]`
+    `asetpts=PTS-STARTPTS,atrim=end=${len},apad=whole_dur=${len}[a${outputIndex}]`
   );
 }
 
@@ -392,9 +392,11 @@ async function runExport(
    * doubt -> transcode). The concat exit-code fallback below remains the
    * last-resort guard for every path.
    */
+  let remuxMetas: Array<Awaited<ReturnType<typeof probeMp4Blob>>> = [];
   const remuxAllowed = async (): Promise<boolean> => {
-    const metas = [];
+    const metas: Array<Awaited<ReturnType<typeof probeMp4Blob>>> = [];
     for (let i = 0; i < blobs.length; i++) metas.push(await probeBlobCached(i));
+    remuxMetas = metas;
     const classification = classifyMp4CopySafety(metas);
     const decision = remuxProbeDecision(classification, provenance);
     exportLog(`remux uniformity probe: ${classification}; ${decision.reason}`);
@@ -457,14 +459,42 @@ async function runExport(
     const concatFile = 'concat.txt';
     const concatBody = inputs.map((name) => `file '${name}'`).join('\n');
     await ffmpeg.writeFile(concatFile, new TextEncoder().encode(concatBody));
-    onProgress?.('Joining without re-encoding', 0.25);
+    // Keep the expensive 4K video bit-for-bit copied, but put audio on one
+    // continuous sample grid. Copying each MediaRecorder AAC track verbatim
+    // preserves its independent encoder priming/end padding; the concat
+    // demuxer then stretches a packet (observed 49.8ms vs the normal 21.3ms)
+    // at clip boundaries, which sounds like a tiny dropout even though the
+    // video timestamps are continuous. AAC-only normalization is cheap and
+    // does not touch a single video frame.
+    let audioPresence = remuxMetas.map((meta) => meta?.hasAudio);
+    if (audioPresence.some((hasAudio) => hasAudio === undefined)) {
+      const fallbackProbes = await probeInputs(ffmpeg, inputs);
+      audioPresence = fallbackProbes.map((probe) => probe.hasAudio);
+    }
+    const hasAnyAudio = audioPresence.some(Boolean);
+    const individualInputs = hasAnyAudio ? inputs.flatMap((name) => ['-i', name]) : [];
+    const audioFilter = hasAnyAudio
+      ? [
+          ...clips.map((clip, i) => audioChain(i + 1, clipLen(clip), Boolean(audioPresence[i]), i)),
+          `${clips.map((_, i) => `[a${i}]`).join('')}concat=n=${clips.length}:v=0:a=1[aout]`,
+        ].join(';')
+      : null;
+    onProgress?.(hasAnyAudio ? 'Joining video and smoothing audio' : 'Joining video', 0.25);
     const remuxCode = await ffmpeg.exec([
+      '-fflags', '+genpts',
       '-f', 'concat', '-safe', '0', '-i', concatFile,
-      '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy',
-      '-movflags', '+faststart', '-map_metadata', '-1', 'out.mp4',
+      ...individualInputs,
+      ...(audioFilter ? ['-filter_complex', audioFilter] : []),
+      '-map', '0:v:0',
+      ...(audioFilter ? ['-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k'] : ['-c:v', 'copy', '-an']),
+      '-movflags', '+faststart', '-avoid_negative_ts', 'make_zero', '-map_metadata', '-1', 'out.mp4',
     ]);
     if (remuxCode === 0) {
-      exportLog('copy path: concat "-c copy" remux succeeded (mode=remuxed, no re-encode)');
+      exportLog(
+        hasAnyAudio
+          ? 'copy path: gapless join succeeded (mode=remuxed, video copied; audio normalized only)'
+          : 'copy path: gapless video join succeeded (mode=remuxed, no re-encode)',
+      );
       const data = await ffmpeg.readFile('out.mp4');
       const bytes = (data as Uint8Array).byteLength;
       const blob = new Blob([new Uint8Array(data as Uint8Array).buffer as ArrayBuffer], { type: 'video/mp4' });

@@ -56,6 +56,6 @@ async function run(files, expectText, label) {
 }
 
 await run([r90, r270], 'Rendered at 1080p output resolution.', 'MIXED-ROTATION (90+270 must transcode)');
-await run([r90, r90b], 'Clips joined without re-encoding.', 'UNIFORM-ROTATION (90+90 must remux)');
+await run([r90, r90b], 'Video copied without re-encoding; audio joined seamlessly.', 'UNIFORM-ROTATION (90+90 must remux)');
 fs.rmSync(dir, { recursive: true, force: true });
 console.log('PROBE-MIXED-ROTATION PASS');

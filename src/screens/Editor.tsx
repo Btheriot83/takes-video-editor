@@ -56,7 +56,6 @@ export default function Editor() {
   const activeIndexRef = useRef(0);
   const slotIndexRef = useRef<[number | null, number | null]>([null, null]);
   const handoffRef = useRef(false);
-  const lastUiUpdateRef = useRef(0);
   const [playing, setPlaying] = useState(false);
   const [activeSlot, setActiveSlot] = useState<VideoSlot>(0);
   const [handoffGapMs, setHandoffGapMs] = useState<number | null>(null);
@@ -72,6 +71,10 @@ export default function Editor() {
   const [clipUrls, setClipUrls] = useState<Record<string, string>>({});
   const clipUrlsRef = useRef<Record<string, string>>({});
   const fileRef = useRef<HTMLInputElement>(null);
+  const editorRootRef = useRef<HTMLDivElement>(null);
+  const playheadLabelRef = useRef<HTMLSpanElement>(null);
+  const timelinePlayheadRef = useRef<HTMLDivElement>(null);
+  const playheadRef = useRef(playhead);
 
   clipUrlsRef.current = clipUrls;
 
@@ -104,6 +107,25 @@ export default function Editor() {
   const selected = clips.find((c) => c.id === selectedId) ?? null;
   const selIdx = clips.findIndex((c) => c.id === selectedId);
   const output = exportDimensions(aspectRatio, exportQuality);
+
+  // Native video playback should not have to compete with a full React render
+  // of every thumbnail and trim handle on every frame. Keep the live clock and
+  // timeline indicator on their own cheap DOM path, then commit the current
+  // time to app state only when playback pauses, ends, or crosses a clip.
+  const renderLivePlayhead = useCallback((time: number) => {
+    const safeTime = Math.max(0, Math.min(totalDuration(clips), time));
+    editorRootRef.current?.setAttribute('data-editor-playhead', safeTime.toFixed(3));
+    if (playheadLabelRef.current) playheadLabelRef.current.textContent = fmtTime(safeTime);
+    if (timelinePlayheadRef.current) {
+      timelinePlayheadRef.current.style.left = `${TIMELINE_HORIZONTAL_PADDING + timelinePlayheadX(clips, safeTime)}px`;
+    }
+  }, [clips]);
+
+  useEffect(() => {
+    if (playing) return;
+    playheadRef.current = playhead;
+    renderLivePlayhead(playhead);
+  }, [playhead, playing, renderLivePlayhead]);
 
   // object URLs for all clips
   useEffect(() => {
@@ -193,13 +215,11 @@ export default function Editor() {
     if (!playing) void syncVideo(playhead);
   }, [playhead, selectedId, playing, syncVideo]);
 
-  const playheadRef = useRef(playhead);
-  playheadRef.current = playhead;
-
   // During an export the preview players are parked (sources unloaded): two
   // AVPlayer-backed elements with loaded data pin decoder/GPU resources that
   // the export's own 4K decoder+encoder need on iOS.
   const parkPreviews = useCallback(() => {
+    setPlayhead(playheadRef.current);
     setPlaying(false);
     videoRefs.current.forEach((video) => {
       if (!video) return;
@@ -208,7 +228,7 @@ export default function Editor() {
       video.load();
     });
     slotIndexRef.current = [null, null];
-  }, []);
+  }, [setPlayhead]);
 
   const resumePreviews = useCallback(() => {
     void syncVideo(playheadRef.current);
@@ -233,6 +253,7 @@ export default function Editor() {
       if (!loaded) {
         videoRefs.current[fromSlot]?.pause();
         handoffRef.current = false;
+        setPlayhead(playheadRef.current);
         setPlaying(false);
         setPlaybackError('The next clip could not be loaded. Select it in the timeline to retry.');
         return;
@@ -242,53 +263,74 @@ export default function Editor() {
     if (!incoming) {
       videoRefs.current[fromSlot]?.pause();
       handoffRef.current = false;
+      setPlayhead(playheadRef.current);
       setPlaying(false);
       setPlaybackError('The next clip could not be loaded. Select it in the timeline to retry.');
       return;
     }
     const outgoing = videoRefs.current[fromSlot];
-    // The spare slot is decoder-primed but parked exactly at trimIn. Swapping
-    // before play() preserves the opening frames instead of hiding the first
-    // 100ms behind a muted pre-roll.
-    setHandoffStartOffsetMs(Math.max(0, (incoming.currentTime - clips[nextIndex].trimIn) * 1000));
-    incoming.muted = false;
-    if (outgoing) { outgoing.muted = true; outgoing.pause(); }
-    activeSlotRef.current = toSlot;
-    activeIndexRef.current = nextIndex;
-    setActiveSlot(toSlot);
-    select(clips[nextIndex].id);
-    setPlayhead(clipStart(clips, nextIndex));
+    // Make-before-break: start the already-decoded incoming player while the
+    // outgoing player remains visible and audible. The old ordering paused A
+    // first, then waited for B.play(), which guaranteed a visible hold/black
+    // gap on iPhone at every 4K boundary.
+    incoming.muted = true;
     try {
       if (incoming.paused) await incoming.play();
+      const nextStart = clipStart(clips, nextIndex);
+      const incomingOffset = Math.max(0, incoming.currentTime - clips[nextIndex].trimIn);
+
+      // Change the actual media layers before scheduling React state so the
+      // visual handoff happens in this frame rather than after a large editor
+      // tree has rendered. React then adopts these same inline values.
+      incoming.style.opacity = '1';
+      incoming.setAttribute('aria-hidden', 'false');
+      if (outgoing) {
+        outgoing.style.opacity = '0';
+        outgoing.setAttribute('aria-hidden', 'true');
+        outgoing.muted = true;
+      }
+      incoming.muted = false;
+      outgoing?.pause();
+
+      activeSlotRef.current = toSlot;
+      activeIndexRef.current = nextIndex;
+      setActiveSlot(toSlot);
+      select(clips[nextIndex].id);
+      const nextPlayhead = nextStart + incomingOffset;
+      playheadRef.current = nextPlayhead;
+      renderLivePlayhead(nextPlayhead);
+      setPlayhead(nextPlayhead);
+      setHandoffStartOffsetMs(incomingOffset * 1000);
       setHandoffGapMs(performance.now() - boundaryStarted);
       setPlaybackError(null);
     } catch {
+      incoming.pause();
+      outgoing?.pause();
+      setPlayhead(playheadRef.current);
       setPlaying(false);
       setPlaybackError('Playback stopped because the next clip could not start. Tap play to retry.');
     }
     handoffRef.current = false;
     preloadAfter(nextIndex);
-  }, [clips, loadSlot, preloadAfter, select, setPlayhead]);
+  }, [clips, loadSlot, preloadAfter, renderLivePlayhead, select, setPlayhead]);
 
   // Frame-timed playback avoids the coarse 200–250ms cadence of timeupdate.
   useEffect(() => {
     if (!playing) return;
     let frame = 0;
-    const tick = (now: number) => {
+    const tick = () => {
       const index = activeIndexRef.current;
       const clip = clips[index];
       const v = videoRefs.current[activeSlotRef.current];
       if (!clip || !v) return;
       const global = clipStart(clips, index) + Math.max(0, v.currentTime - clip.trimIn);
       playheadRef.current = global;
-      if (now - lastUiUpdateRef.current >= 80) {
-        lastUiUpdateRef.current = now;
-        setPlayhead(global);
-      }
+      renderLivePlayhead(global);
       if (v.currentTime >= clip.trimOut - FRAME / 2) {
         if (index + 1 < clips.length) void handoff(index);
         else {
           v.pause();
+          playheadRef.current = totalDuration(clips);
           setPlayhead(totalDuration(clips));
           setPlaying(false);
           return;
@@ -298,7 +340,7 @@ export default function Editor() {
     };
     frame = window.requestAnimationFrame(tick);
     return () => window.cancelAnimationFrame(frame);
-  }, [clips, handoff, playing, setPlayhead]);
+  }, [clips, handoff, playing, renderLivePlayhead, setPlayhead]);
 
   // iOS WebKit grants audible playback per media element per user gesture.
   // The spare slot only ever plays muted before a handoff unmutes it, so
@@ -329,6 +371,7 @@ export default function Editor() {
   const togglePlay = async () => {
     if (playing) {
       videoRefs.current.forEach((video) => video?.pause());
+      setPlayhead(playheadRef.current);
       setPlaying(false);
     } else {
       activateSlotsInGesture();
@@ -341,7 +384,7 @@ export default function Editor() {
   };
 
   return (
-    <div data-editor-playhead={playhead.toFixed(3)} data-editor-active-slot={activeSlot}
+    <div ref={editorRootRef} data-editor-playhead={playhead.toFixed(3)} data-editor-active-slot={activeSlot}
       data-last-handoff-gap-ms={handoffGapMs?.toFixed(1) ?? ''}
       data-last-handoff-start-offset-ms={handoffStartOffsetMs?.toFixed(1) ?? ''}
       className="fixed inset-0 bg-neutral-950 text-white flex flex-col select-none">
@@ -353,7 +396,7 @@ export default function Editor() {
           <ArrowLeft size={20} />
         </button>
         <div className="whitespace-nowrap text-center text-xs min-[360px]:text-sm tabular-nums text-white/70">
-          {fmtTime(playhead)} <span className="text-white/55">/ {fmtTime(total)}</span>
+          <span ref={playheadLabelRef}>{fmtTime(playhead)}</span> <span className="text-white/55">/ {fmtTime(total)}</span>
         </div>
         <div className="flex shrink-0 items-center">
           <button onClick={undo} disabled={!canUndo} aria-label="Undo"
@@ -380,7 +423,9 @@ export default function Editor() {
           {[0, 1].map((slot) => (
             <video key={slot} ref={(video) => { videoRefs.current[slot as VideoSlot] = video; }}
               data-editor-video-slot={slot} playsInline preload="auto" muted={slot !== activeSlot}
-              className={`absolute inset-0 h-full w-full transition-none ${slot === activeSlot ? 'opacity-100' : 'opacity-0'}`} />
+              aria-hidden={slot !== activeSlot}
+              className="absolute inset-0 h-full w-full transition-none"
+              style={{ opacity: slot === activeSlot ? 1 : 0 }} />
           ))}
         </div>
         <button onClick={togglePlay}
@@ -453,6 +498,7 @@ export default function Editor() {
         clips={clips}
         selectedId={selectedId}
         playhead={playhead}
+        playheadElementRef={timelinePlayheadRef}
         onSelect={(id, offset) => {
           videoRefs.current.forEach((video) => video?.pause());
           setPlaying(false);
@@ -515,16 +561,19 @@ function TrimNudge({ label, disabled, onClick, children }: {
 // ── Timeline ────────────────────────────────────────────────────────────────
 
 function Timeline({
-  clips, selectedId, playhead, onSelect, trimSelected, onReorder, selIdx,
+  clips, selectedId, playhead, playheadElementRef, onSelect, trimSelected, onReorder, selIdx,
 }: {
   clips: Clip[];
   selectedId: string | null;
   playhead: number;
+  playheadElementRef: React.RefObject<HTMLDivElement | null>;
   onSelect: (id: string, offset: number) => void;
   trimSelected: (ti: number, to: number) => void;
   onReorder: (from: number, to: number) => void;
   selIdx: number;
 }) {
+  const renderCountRef = useRef(0);
+  const timelineRootRef = useRef<HTMLDivElement>(null);
   const stripRef = useRef<HTMLDivElement>(null);
   const dragState = useRef<{
     pointerId: number;
@@ -548,6 +597,13 @@ function Timeline({
   useEffect(() => () => {
     if (dragState.current) clearTimeout(dragState.current.timer);
   }, []);
+
+  useEffect(() => {
+    renderCountRef.current += 1;
+    if (timelineRootRef.current) {
+      timelineRootRef.current.dataset.timelineRenderCount = String(renderCountRef.current);
+    }
+  });
 
   const onClipPointerDown = (e: React.PointerEvent, idx: number) => {
     if (trimDrag.current || (e.pointerType === 'mouse' && e.button !== 0)) return;
@@ -652,7 +708,8 @@ function Timeline({
   const playheadX = timelinePlayheadX(clips, playhead);
 
   return (
-    <div className="border-t border-white/10 bg-neutral-900/60 pb-[max(env(safe-area-inset-bottom),0.5rem)]">
+    <div ref={timelineRootRef} data-timeline-render-count="0"
+      className="border-t border-white/10 bg-neutral-900/60 pb-[max(env(safe-area-inset-bottom),0.5rem)]">
       <div className="text-[10px] text-white/60 px-3 pt-1.5 flex justify-between">
         <span>Tap to select · swipe to scroll · hold to reorder · drag edges to trim</span>
       </div>
@@ -751,7 +808,7 @@ function Timeline({
           );
         })}
         {/* playhead */}
-        <div data-timeline-playhead className="absolute top-1 bottom-1 w-0.5 bg-white pointer-events-none"
+        <div ref={playheadElementRef} data-timeline-playhead className="absolute top-1 bottom-1 w-0.5 bg-white pointer-events-none"
           style={{ left: TIMELINE_HORIZONTAL_PADDING + playheadX }} />
       </div>
     </div>

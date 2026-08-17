@@ -1,5 +1,6 @@
 // Focused mobile smoke: one short capture → verified output mode + dimensions.
 import { chromium } from 'playwright-core';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 
 const BASE = process.argv[2] || 'http://localhost:4173/';
@@ -155,6 +156,44 @@ const download = await downloadPromise;
 const output = `${OUT}/exported-${exportQuality.toLowerCase()}-${aspectRatio.replace(':', 'x')}-${actualMode}.mp4`;
 await download.saveAs(output);
 
+// A fast multi-clip join is only successful when the copied video timestamps
+// and normalized AAC sample grid stay continuous at the seam. Duration alone
+// misses the field failure where one AAC packet stretched to ~50ms and made a
+// tiny audible dropout between otherwise gapless 4K clips.
+let continuity = null;
+if (clipCount > 1 && actualMode === 'remuxed') {
+  const videoRows = execFileSync('ffprobe', [
+    '-v', 'error', '-select_streams', 'v:0',
+    '-show_entries', 'frame=key_frame,best_effort_timestamp_time', '-of', 'csv=p=0', output,
+  ]).toString().trim().split('\n').map((row) => {
+    const [keyFrame, timestamp] = row.split(',');
+    return { keyFrame: keyFrame === '1', timestamp: Number(timestamp) };
+  }).filter((row) => Number.isFinite(row.timestamp));
+  const joinFrameIndex = videoRows.findIndex((row, index) => index > 0 && row.keyFrame);
+  if (joinFrameIndex < 1) throw new Error('joined MP4 has no second-clip keyframe');
+  const videoJoinGapMs = (videoRows[joinFrameIndex].timestamp - videoRows[joinFrameIndex - 1].timestamp) * 1000;
+  if (videoJoinGapMs > 75) throw new Error(`video timestamp gap at clip join is ${videoJoinGapMs.toFixed(1)}ms`);
+
+  const audioPts = execFileSync('ffprobe', [
+    '-v', 'error', '-select_streams', 'a:0',
+    '-show_entries', 'packet=pts_time', '-of', 'csv=p=0', output,
+  ]).toString().trim().split('\n').map(Number).filter(Number.isFinite);
+  const audioIntervals = audioPts.slice(1).map((pts, index) => pts - audioPts[index]);
+  const sortedAudioIntervals = [...audioIntervals].sort((a, b) => a - b);
+  const medianAudioInterval = sortedAudioIntervals[Math.floor(sortedAudioIntervals.length / 2)] ?? 0;
+  const maxAudioInterval = Math.max(0, ...audioIntervals);
+  if (!medianAudioInterval || maxAudioInterval > medianAudioInterval * 1.5) {
+    throw new Error(
+      `audio timestamp discontinuity: median=${(medianAudioInterval * 1000).toFixed(1)}ms max=${(maxAudioInterval * 1000).toFixed(1)}ms`,
+    );
+  }
+  continuity = {
+    videoJoinGapMs: Number(videoJoinGapMs.toFixed(1)),
+    audioPacketMs: Number((medianAudioInterval * 1000).toFixed(3)),
+    maxAudioPacketGapMs: Number((maxAudioInterval * 1000).toFixed(3)),
+  };
+}
+
 // Recording stays 4K-only after returning from the editor.
 await page.keyboard.press('Escape');
 await page.getByRole('button', { name: 'Back to camera' }).click();
@@ -162,6 +201,6 @@ await page.waitForSelector('button[aria-label="Tap to record"]', { timeout: 1500
 await page.getByLabel('4K recording only').waitFor();
 if (await page.getByRole('button', { name: 'HD', exact: true }).count()) throw new Error('HD recording control returned after editing');
 
-console.log(JSON.stringify({ realCamera, cameraFacing, captureQuality, exportQuality, aspectRatio, clipCount, capture, source, recordingWallMs, playbackRateRatio, expectedPreviewPath, previewPath, expectedMode, actualMode, readyMs, recorderEvidence, output, bytes: fs.statSync(output).size, browserErrors: errors }, null, 2));
+console.log(JSON.stringify({ realCamera, cameraFacing, captureQuality, exportQuality, aspectRatio, clipCount, capture, source, recordingWallMs, playbackRateRatio, expectedPreviewPath, previewPath, expectedMode, actualMode, readyMs, continuity, recorderEvidence, output, bytes: fs.statSync(output).size, browserErrors: errors }, null, 2));
 await browser.close();
 if (errors.length) throw new Error(`browser reported ${errors.length} error(s)`);

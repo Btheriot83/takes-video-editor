@@ -131,7 +131,7 @@ export function previewExportPath(
     return {
       path: 'join',
       headline: 'Fast join available',
-      detail: 'Checks the clips, then joins compatible recordings without re-encoding.',
+      detail: 'Copies compatible video frames and smooths audio at each clip boundary.',
       rejections,
     };
   }

@@ -278,7 +278,7 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
             </div>
             <p className="text-xs text-white/50">
               {exportMode === 'native' && 'Camera original preserved without re-encoding.'}
-              {exportMode === 'remuxed' && 'Clips joined without re-encoding.'}
+              {exportMode === 'remuxed' && 'Video copied without re-encoding; audio joined seamlessly.'}
               {exportMode === 'transcoded' && `Rendered at ${quality} output resolution.`}
             </p>
             {resultStats && (
