@@ -5,6 +5,8 @@ import { clipFraming, clipLen } from '../types/clip';
 import type { Clip, ClipFraming, ExportQuality } from '../types/clip';
 import { exportLog } from './export-log';
 import { framePlacement } from './framing';
+import { remuxVideoTiming } from './remux-timing';
+import type { RemuxVideoTiming } from './remux-timing';
 
 /**
  * WebCodecs render path: decode each clip in an offscreen <video>, step it
@@ -1086,6 +1088,8 @@ export async function probeMp4Blob(
   codedHeight: number | null;
   /** tkhd display/rotation matrix of the first video track (9 fixed-point values). */
   matrix: number[] | null;
+  /** Video-only duration and leading edit used for gapless copy joins. */
+  videoTiming: RemuxVideoTiming | null;
 } | null> {
   // Non-MP4 input (e.g. a WebM blob) makes mp4box's BoxParser call
   // Log.error("BoxParser", "Invalid box type...") WITHOUT an isofile, which
@@ -1134,8 +1138,9 @@ export async function probeMp4Blob(
     const codedWidth = video?.video?.width ?? video?.track_width ?? null;
     const codedHeight = video?.video?.height ?? video?.track_height ?? null;
     const matrix = video?.matrix ? Array.from(video.matrix as ArrayLike<number>) : null;
+    const videoTiming = remuxVideoTiming(video);
     file.stop();
-    return { hasAudio, fps, codec, codedWidth, codedHeight, matrix };
+    return { hasAudio, fps, codec, codedWidth, codedHeight, matrix, videoTiming };
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error;
     return null;

@@ -6,6 +6,8 @@ import type { FFmpeg } from '@ffmpeg/ffmpeg';
 import { planWebCodecsEncode, probeMp4Blob } from './webcodecs-export';
 import { renderVideoWorkerFirst } from './render-worker-client';
 import { clearExportLog, exportLog } from './export-log';
+import { concatVideoManifest } from './remux-timing';
+import type { RemuxVideoTiming } from './remux-timing';
 
 // We load @ffmpeg/ffmpeg's ESM build from same-origin static files
 // (public/ffesm) instead of the vite-bundled worker: the bundled module
@@ -457,7 +459,11 @@ async function runExport(
     throwIfAborted();
     await writeAllInputs();
     const concatFile = 'concat.txt';
-    const concatBody = inputs.map((name) => `file '${name}'`).join('\n');
+    const probedTimings = remuxMetas.map((meta) => meta?.videoTiming ?? null);
+    const seamTimings: RemuxVideoTiming[] | null = probedTimings.every(
+      (timing): timing is RemuxVideoTiming => timing !== null,
+    ) ? probedTimings : null;
+    const concatBody = concatVideoManifest(inputs, seamTimings);
     await ffmpeg.writeFile(concatFile, new TextEncoder().encode(concatBody));
     // Keep the expensive 4K video bit-for-bit copied, but put audio on one
     // continuous sample grid. Copying each MediaRecorder AAC track verbatim
@@ -475,10 +481,20 @@ async function runExport(
     const individualInputs = hasAnyAudio ? inputs.flatMap((name) => ['-i', name]) : [];
     const audioFilter = hasAnyAudio
       ? [
-          ...clips.map((clip, i) => audioChain(i + 1, clipLen(clip), Boolean(audioPresence[i]), i)),
+          ...clips.map((clip, i) => audioChain(
+            i + 1,
+            seamTimings?.[i].sampleDurationSeconds ?? clipLen(clip),
+            Boolean(audioPresence[i]),
+            i,
+          )),
           `${clips.map((_, i) => `[a${i}]`).join('')}concat=n=${clips.length}:v=0:a=1[aout]`,
         ].join(';')
       : null;
+    exportLog(
+      seamTimings
+        ? 'copy seam timing: normalized MP4 video edit lists and sample durations'
+        : 'copy seam timing: source timing metadata unavailable; using container durations',
+    );
     onProgress?.(hasAnyAudio ? 'Joining video and smoothing audio' : 'Joining video', 0.25);
     const remuxCode = await ffmpeg.exec([
       '-fflags', '+genpts',

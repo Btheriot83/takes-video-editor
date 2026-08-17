@@ -164,15 +164,22 @@ let continuity = null;
 if (clipCount > 1 && actualMode === 'remuxed') {
   const videoRows = execFileSync('ffprobe', [
     '-v', 'error', '-select_streams', 'v:0',
-    '-show_entries', 'frame=key_frame,best_effort_timestamp_time', '-of', 'csv=p=0', output,
+    '-show_entries', 'packet=pts_time,duration_time,flags', '-of', 'csv=p=0', output,
   ]).toString().trim().split('\n').map((row) => {
-    const [keyFrame, timestamp] = row.split(',');
-    return { keyFrame: keyFrame === '1', timestamp: Number(timestamp) };
+    const [timestamp, duration, flags] = row.split(',');
+    return { keyFrame: flags?.includes('K'), timestamp: Number(timestamp), duration: Number(duration) };
   }).filter((row) => Number.isFinite(row.timestamp));
   const joinFrameIndex = videoRows.findIndex((row, index) => index > 0 && row.keyFrame);
   if (joinFrameIndex < 1) throw new Error('joined MP4 has no second-clip keyframe');
   const videoJoinGapMs = (videoRows[joinFrameIndex].timestamp - videoRows[joinFrameIndex - 1].timestamp) * 1000;
-  if (videoJoinGapMs > 75) throw new Error(`video timestamp gap at clip join is ${videoJoinGapMs.toFixed(1)}ms`);
+  const priorVideoPacketMs = videoRows[joinFrameIndex - 1].duration * 1000;
+  const seamTimestampErrorMs = videoJoinGapMs - priorVideoPacketMs;
+  if (!Number.isFinite(priorVideoPacketMs) || Math.abs(seamTimestampErrorMs) > Math.max(2, priorVideoPacketMs * 0.15)) {
+    throw new Error(
+      `video timestamp gap at clip join is ${videoJoinGapMs.toFixed(1)}ms ` +
+      `(prior packet duration ${priorVideoPacketMs.toFixed(1)}ms)`,
+    );
+  }
 
   const audioPts = execFileSync('ffprobe', [
     '-v', 'error', '-select_streams', 'a:0',
@@ -189,6 +196,7 @@ if (clipCount > 1 && actualMode === 'remuxed') {
   }
   continuity = {
     videoJoinGapMs: Number(videoJoinGapMs.toFixed(1)),
+    videoFrameMs: Number(priorVideoPacketMs.toFixed(1)),
     audioPacketMs: Number((medianAudioInterval * 1000).toFixed(3)),
     maxAudioPacketGapMs: Number((maxAudioInterval * 1000).toFixed(3)),
   };
