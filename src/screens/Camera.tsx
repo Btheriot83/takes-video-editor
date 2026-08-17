@@ -100,7 +100,7 @@ export default function Camera() {
     noticeTimerRef.current = window.setTimeout(() => setCapabilityNotice(null), durationMs);
   }, []);
 
-  const openCamera = useCallback(async (nextFacing: 'user' | 'environment') => {
+  const openCamera = useCallback(async (nextFacing: 'user' | 'environment'): Promise<boolean> => {
     setStreamReady(false);
     setCaptureVerified4K(false);
     setTorchOn(false);
@@ -145,7 +145,10 @@ export default function Camera() {
       if (preview) {
         preview.srcObject = stream;
         await waitForPreviewMetadata(preview);
-        if (streamRef.current !== stream) return;
+        if (streamRef.current !== stream) {
+          stream.getTracks().forEach((track) => track.stop());
+          return false;
+        }
         await preview.play().catch(() => {});
       }
       // videoWidth/videoHeight describe the actual display-oriented frame.
@@ -170,6 +173,7 @@ export default function Camera() {
       ));
       setStreamReady(true);
       setError(null);
+      return true;
     } catch (cameraError: unknown) {
       setZoomRange(null);
       setTorchSupported(false);
@@ -180,6 +184,7 @@ export default function Camera() {
           ? 'Camera access was denied. Allow camera and microphone permission, then try again.'
           : 'Could not open a camera on this device.',
       );
+      return false;
     }
   }, []);
 
@@ -222,6 +227,7 @@ export default function Camera() {
     setStopping(true);
     if (recRef.current === active) recRef.current = null;
     setRecording(false);
+    let clipSaved = false;
     try {
       const blob = await active.stop();
       if (blob.size > 0) {
@@ -237,6 +243,7 @@ export default function Camera() {
           active.mimeType,
           'cover',
         );
+        clipSaved = true;
         // Unmissable saved confirmation: users reported not knowing whether
         // releasing the button actually kept the clip.
         const count = useStore.getState().clips.length;
@@ -262,18 +269,33 @@ export default function Camera() {
       }
     } catch (recordingError) {
       console.error('[cam] stop recording failed', recordingError);
+      if (clipSaved) {
+        // The durable clip already exists; never tell the user to retake it
+        // merely because best-effort recovery cleanup failed afterwards.
+        showCapabilityNotice('4K clip saved ✓', 4000);
+        return;
+      }
       // Keep the underlying reason visible: a field screenshot of this alert
       // must be enough to diagnose what actually failed.
       const detail = recordingError instanceof Error && recordingError.message
         ? ` (${recordingError.message})`
         : '';
-      setError(`The recording could not be saved. Please try again.${detail}`);
+      // A zero-byte MediaRecorder result means the current WebKit capture
+      // pipeline is stale. Reopen it immediately and leave the existing clips
+      // untouched, so the failed take does not trap the user behind an alert
+      // before they can add clip two.
+      const recovered = await openCamera(facing);
+      if (recovered) {
+        showCapabilityNotice('That take did not save. Camera reset — record it again.', 7000);
+      } else {
+        setError(`The recording could not be saved. Please try again.${detail}`);
+      }
     } finally {
       setElapsed(0);
       stoppingRef.current = false;
       setStopping(false);
     }
-  }, [addClipFromBlob, showCapabilityNotice]);
+  }, [addClipFromBlob, facing, openCamera, showCapabilityNotice]);
 
   const startHold = useCallback((source: ActiveHold) => {
     if (

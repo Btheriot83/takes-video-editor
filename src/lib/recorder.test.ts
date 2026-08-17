@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { canRecordCameraTrackDirectly, captureConstraints, captureVideoBitrate, ultraHDRetryConstraints } from './recorder';
+import { describe, it, expect, vi } from 'vitest';
+import { canRecordCameraTrackDirectly, captureConstraints, captureVideoBitrate, leaseRecordingTracks, ultraHDRetryConstraints } from './recorder';
 import { CAPTURE_DIMENSIONS, isFullUltraHDFrame, isUltraHDCapture } from '../types/clip';
 
 describe('captureConstraints', () => {
@@ -115,5 +115,40 @@ describe('canRecordCameraTrackDirectly', () => {
       { width: 0, height: 0 },
       { width: 2160, height: 3840 },
     )).toBe(false);
+  });
+});
+
+describe('leaseRecordingTracks', () => {
+  it('gives each recorder fresh tracks and never stops the live preview tracks', () => {
+    const sourceStops = [vi.fn(), vi.fn()];
+    const cloneStops = [vi.fn(), vi.fn()];
+    const sourceTracks = sourceStops.map((stop, index) => ({
+      id: `source-${index}`,
+      stop,
+      clone: vi.fn(() => ({ id: `clone-${index}`, stop: cloneStops[index] } as unknown as MediaStreamTrack)),
+    })) as unknown as MediaStreamTrack[];
+
+    const lease = leaseRecordingTracks({ getTracks: () => sourceTracks });
+    expect(lease.tracks.map((track) => track.id)).toEqual(['clone-0', 'clone-1']);
+    expect(lease.tracks[0]).not.toBe(sourceTracks[0]);
+    expect(lease.tracks[1]).not.toBe(sourceTracks[1]);
+
+    lease.dispose();
+    lease.dispose();
+    expect(cloneStops[0]).toHaveBeenCalledTimes(1);
+    expect(cloneStops[1]).toHaveBeenCalledTimes(1);
+    expect(sourceStops[0]).not.toHaveBeenCalled();
+    expect(sourceStops[1]).not.toHaveBeenCalled();
+  });
+
+  it('releases clones already made if a later track cannot be cloned', () => {
+    const cloneStop = vi.fn();
+    const sourceTracks = [
+      { clone: () => ({ stop: cloneStop } as unknown as MediaStreamTrack) },
+      { clone: () => { throw new Error('clone failed'); } },
+    ] as unknown as MediaStreamTrack[];
+
+    expect(() => leaseRecordingTracks({ getTracks: () => sourceTracks })).toThrow('clone failed');
+    expect(cloneStop).toHaveBeenCalledTimes(1);
   });
 });

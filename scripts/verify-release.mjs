@@ -37,6 +37,10 @@ const preview = spawn(vite, ['preview', '--host', '127.0.0.1', '--port', '4175']
 try {
   await waitForPreview();
   run('npm', ['run', 'smoke', '--', baseURL]);
+  // iPhone WebKit can return zero bytes on the second and later MediaRecorder
+  // attempts. Exercise six native 4K takes under a guard that rejects reused
+  // track identities and verify the stop path uses one orderly flush per take.
+  run('node', ['scripts/probe-multiclip-recorder.mjs', baseURL]);
   // A lower-resolution camera must never unlock recording or be mislabeled as
   // 4K merely because the output canvas has 4K dimensions.
   run('node', ['scripts/probe-4k-fallback.mjs', baseURL]);

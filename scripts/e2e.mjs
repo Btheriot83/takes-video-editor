@@ -10,6 +10,30 @@ const SLACK = Math.max(1, Number(process.env.E2E_TIME_SLACK || 1));
 const OUT = 'scripts/e2e-out';
 fs.mkdirSync(OUT, { recursive: true });
 
+// Chromium's default fake microphone can produce an audio track whose clock
+// stalls when the recorded MP4 is played back unmuted. Feed it a deterministic
+// PCM tone so the playback-speed check exercises a real advancing A/V clock.
+const fakeAudioPath = `${process.cwd()}/${OUT}/fake-microphone.wav`;
+const sampleRate = 48_000;
+const sampleCount = sampleRate * 4;
+const wav = Buffer.alloc(44 + sampleCount * 2);
+wav.write('RIFF', 0);
+wav.writeUInt32LE(wav.length - 8, 4);
+wav.write('WAVEfmt ', 8);
+wav.writeUInt32LE(16, 16);
+wav.writeUInt16LE(1, 20);
+wav.writeUInt16LE(1, 22);
+wav.writeUInt32LE(sampleRate, 24);
+wav.writeUInt32LE(sampleRate * 2, 28);
+wav.writeUInt16LE(2, 32);
+wav.writeUInt16LE(16, 34);
+wav.write('data', 36);
+wav.writeUInt32LE(sampleCount * 2, 40);
+for (let index = 0; index < sampleCount; index += 1) {
+  wav.writeInt16LE(Math.round(Math.sin(2 * Math.PI * 440 * index / sampleRate) * 6000), 44 + index * 2);
+}
+fs.writeFileSync(fakeAudioPath, wav);
+
 const errors = [];
 let mediaRecorderStarts = 0;
 let encoderPrefetchRequestAt = null;
@@ -17,11 +41,13 @@ const browser = await chromium.launch({
   executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   args: [
     '--use-fake-device-for-media-stream',
+    `--use-file-for-fake-audio-capture=${fakeAudioPath}`,
     '--use-fake-ui-for-media-stream',
     '--autoplay-policy=no-user-gesture-required',
     '--no-sandbox',
   ],
 });
+try {
 const ctx = await browser.newContext({
   viewport: { width: 390, height: 844 }, // iPhone 14-ish
   permissions: ['camera', 'microphone'],
@@ -33,6 +59,7 @@ const cdp = await ctx.newCDPSession(page);
 page.on('console', (m) => {
   const t = m.text();
   if (t.includes('[rec] started, state=')) mediaRecorderStarts += 1;
+  if (t.startsWith('[rec] capture mode=') || t.startsWith('[rec] completed=')) console.log(`[browser] ${t}`);
   if (t.includes('[ffmpeg]') || t.includes('[export]')) fs.appendFileSync(OUT + '/ffmpeg.log', t + '\n');
   if (m.type() === 'error') errors.push(`${t} (${m.location().url || 'unknown URL'})`);
 });
@@ -387,6 +414,13 @@ if (afterUndo !== 4) throw new Error('undo failed');
 await page.locator('[data-clip]').nth(0).click();
 await page.waitForTimeout(200);
 const timelineRendersBeforePlayback = Number(await page.locator('[data-timeline-render-count]').getAttribute('data-timeline-render-count'));
+// The automated Chrome session has no usable audio output clock; leaving its
+// synthetic microphone audible can freeze currentTime while paused=false.
+// Volume zero preserves decoding of both tracks without muting the media
+// element, so this remains a strict wall-clock playback and handoff test.
+await page.locator('[data-editor-video-slot]').evaluateAll((videos) => {
+  for (const video of videos) video.volume = 0;
+});
 await page.click('button[aria-label="Play"]');
 await page.waitForSelector('button[aria-label="Pause"]', { timeout: 5000 });
 const playbackSlot = await page.locator('[data-editor-playhead]').getAttribute('data-editor-active-slot');
@@ -399,9 +433,24 @@ await page.waitForTimeout(1200);
 const playbackEnd = await playbackVideo.evaluate((video) => ({
   mediaTime: video.currentTime,
   wallTime: performance.now(),
+  paused: video.paused,
+  ended: video.ended,
+  readyState: video.readyState,
+  networkState: video.networkState,
+  duration: video.duration,
+  muted: video.muted,
+  volume: video.volume,
+  playbackRate: video.playbackRate,
+  seeking: video.seeking,
+  buffered: Array.from({ length: video.buffered.length }, (_, index) => [video.buffered.start(index), video.buffered.end(index)]),
+  seekable: Array.from({ length: video.seekable.length }, (_, index) => [video.seekable.start(index), video.seekable.end(index)]),
+  quality: video.getVideoPlaybackQuality?.(),
+  error: video.error ? { code: video.error.code, message: video.error.message } : null,
 }));
 const playbackRate = (playbackEnd.mediaTime - playbackStart.mediaTime) / ((playbackEnd.wallTime - playbackStart.wallTime) / 1000);
-if (playbackRate < 0.85 || playbackRate > 1.15) throw new Error(`editor playback ran at ${playbackRate.toFixed(2)}x`);
+if (playbackRate < 0.85 || playbackRate > 1.15) {
+  throw new Error(`editor playback ran at ${playbackRate.toFixed(2)}x: ${JSON.stringify({ playbackStart, playbackEnd })}`);
+}
 const timelineRendersDuringPlayback = Number(await page.locator('[data-timeline-render-count]').getAttribute('data-timeline-render-count')) - timelineRendersBeforePlayback;
 // The media clock updates the visible counter and playhead directly. A React
 // render storm here competes with 4K hardware decode on iPhone and produces
@@ -542,6 +591,8 @@ await recoveryContext.close();
 log('camera permission recovery actions verified');
 
 console.log('\nBROWSER ERRORS:', errors.length ? errors : 'none');
-await browser.close();
 if (errors.length) throw new Error(`browser reported ${errors.length} error(s)`);
 console.log('E2E PASS');
+} finally {
+  await browser.close();
+}

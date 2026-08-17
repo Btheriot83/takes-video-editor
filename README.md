@@ -11,8 +11,11 @@ Camera recording is 4K-only. The record control unlocks only after both the
 camera track and the displayed preview report a complete UHD source; a lower-resolution
 camera stays visible for diagnosis but cannot be recorded and upscaled. Output
 frames are requested in step with incoming camera frames to preserve real-time
-playback cadence. The web camera API can verify delivered pixel dimensions, but
-it cannot certify the phone sensor's optical detail.
+playback cadence. Each take records from fresh cloned track identities while
+the live preview stream stays open, avoiding iPhone WebKit's intermittent empty
+second-take result without repeatedly reopening the physical camera. The web
+camera API can verify delivered pixel dimensions, but it cannot certify the
+phone sensor's optical detail.
 
 ## Development
 
@@ -54,6 +57,8 @@ The release verification uses Chrome mobile/touch emulation, browser camera and
 microphone permissions, and Chromium's synthetic camera. It includes two exact
 portrait selfie recordings and requires their no-reencode join to finish in
 under two seconds. A separate exact-match check requires a native handoff under
-two seconds without fetching the encoder. A physical mobile-device pass is
-still required for iOS-specific camera orientation, torch, and optical zoom
-behavior.
+two seconds without fetching the encoder. The multi-clip recorder regression
+runs six native-path takes with unique recording tracks, then injects one empty
+take and verifies automatic recovery preserves the surrounding clips. A
+physical mobile-device pass is still required for iOS-specific camera,
+MediaRecorder, torch, and optical zoom behavior.

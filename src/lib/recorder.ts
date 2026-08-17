@@ -65,6 +65,38 @@ type ComposedRecordingStream = {
   frameCount: () => number;
 };
 
+export type RecordingTrackLease = {
+  tracks: MediaStreamTrack[];
+  dispose: () => void;
+};
+
+/**
+ * Give every MediaRecorder instance fresh track identities while keeping the
+ * preview's getUserMedia stream alive. Mobile WebKit can return zero-byte
+ * blobs when later recorders are attached to tracks a previous recorder used.
+ * Reopening the physical camera between every take is also unreliable on iOS,
+ * so clone the live tracks and release only those clones after the take.
+ */
+export function leaseRecordingTracks(source: Pick<MediaStream, 'getTracks'>): RecordingTrackLease {
+  const tracks: MediaStreamTrack[] = [];
+  try {
+    for (const track of source.getTracks()) tracks.push(track.clone());
+  } catch (error) {
+    tracks.forEach((track) => track.stop());
+    throw error;
+  }
+
+  let disposed = false;
+  return {
+    tracks,
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      tracks.forEach((track) => track.stop());
+    },
+  };
+}
+
 /**
  * The camera track is the smoothest recording source because the phone can
  * keep it on its native hardware encode path. A 4K canvas redraw is only
@@ -328,13 +360,21 @@ export async function startRecording(
   let composition = !cameraNativeOutput && preview && output
     ? composeOutputReadyStream(stream, preview, output, cameraSettings?.frameRate ?? 30)
     : null;
-  let recordingStream = composition?.stream ?? stream;
+  let trackLease = composition ? null : leaseRecordingTracks(stream);
+  let recordingStream = composition?.stream ?? new MediaStream(trackLease?.tracks ?? []);
   let videoSettings = recordingStream.getVideoTracks()[0]?.getSettings?.();
   let videoBitsPerSecond = captureVideoBitrate(
     composition ? output?.width : videoSettings?.width,
     composition ? output?.height : videoSettings?.height,
   );
   const captureMode = () => cameraNativeOutput ? 'camera-native' : composition?.mode ?? 'raw';
+  let recordingStreamDisposed = false;
+  const disposeRecordingStream = () => {
+    if (recordingStreamDisposed) return;
+    recordingStreamDisposed = true;
+    composition?.dispose();
+    trackLease?.dispose();
+  };
 
   const createRecorder = () => new MediaRecorder(recordingStream, {
     mimeType: mimeType || undefined,
@@ -345,16 +385,25 @@ export async function startRecording(
   try {
     rec = createRecorder();
   } catch (error) {
-    if (!composition) throw error;
+    if (!composition) {
+      disposeRecordingStream();
+      throw error;
+    }
     // A browser may expose canvas.captureStream yet reject that stream in
     // MediaRecorder. Preserve recording in that case and make the fallback
     // explicit through outputReady=false and the export preflight warning.
     composition.dispose();
     composition = null;
-    recordingStream = stream;
+    trackLease = leaseRecordingTracks(stream);
+    recordingStream = new MediaStream(trackLease.tracks);
     videoSettings = cameraSettings;
     videoBitsPerSecond = captureVideoBitrate(videoSettings?.width, videoSettings?.height);
-    rec = createRecorder();
+    try {
+      rec = createRecorder();
+    } catch (fallbackError) {
+      disposeRecordingStream();
+      throw fallbackError;
+    }
   }
   console.log('[rec] capture=', {
     mimeType,
@@ -377,11 +426,11 @@ export async function startRecording(
   try {
     await recBegin({ mimeType: rec.mimeType || mimeType, startedAt: Date.now(), facing });
   } catch (error) {
-    composition?.dispose();
+    disposeRecordingStream();
     throw error;
   }
 
-  rec.ondataavailable = (e) => {
+  const handleData = (e: BlobEvent) => {
     if (e.data && e.data.size > 0) {
       const now = performance.now();
       chunkIntervals.push(now - lastChunkAt);
@@ -391,6 +440,16 @@ export async function startRecording(
       pendingChunkWrites.push(write);
     }
   };
+  rec.addEventListener('dataavailable', handleData);
+
+  let recorderFailure: Error | null = null;
+  const handleRecorderError = (event: Event) => {
+    const detail = (event as Event & { error?: DOMException }).error;
+    recorderFailure = detail instanceof Error
+      ? detail
+      : new Error('The browser reported a recording failure');
+  };
+  rec.addEventListener('error', handleRecorderError);
 
   let elapsed = 0;
   let last = performance.now();
@@ -408,11 +467,79 @@ export async function startRecording(
     rec.start(2000);
   } catch (error) {
     clearInterval(timer);
-    composition?.dispose();
+    rec.removeEventListener('dataavailable', handleData);
+    rec.removeEventListener('error', handleRecorderError);
+    disposeRecordingStream();
     throw error;
   }
   const frameCountAtStart = composition?.frameCount() ?? 0;
   console.log('[rec] started, state=', rec.state);
+
+  let stopPromise: Promise<Blob> | null = null;
+  const stop = () => {
+    if (stopPromise) return stopPromise;
+    stopPromise = new Promise<Blob>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        clearInterval(timer);
+        rec.removeEventListener('dataavailable', handleData);
+        rec.removeEventListener('error', handleRecorderError);
+        rec.onstop = null;
+        rec.onerror = null;
+        disposeRecordingStream();
+      };
+      const fail = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      };
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        const capturedFrames = Math.max(0, (composition?.frameCount() ?? 0) - frameCountAtStart);
+        const blob = new Blob(chunks, { type: rec.mimeType || mimeType });
+        console.log('[rec] completed=', {
+          elapsed,
+          bytes: blob.size,
+          chunks: chunks.length,
+          chunkIntervalsMs: chunkIntervals.map((interval) => Math.round(interval)),
+          mimeType: blob.type,
+          videoBitsPerSecond: rec.videoBitsPerSecond,
+          audioBitsPerSecond: rec.audioBitsPerSecond,
+          captureMode: captureMode(),
+          capturedFrames,
+          measuredFps: elapsed > 0 ? Number((capturedFrames / elapsed).toFixed(1)) : null,
+        });
+        resolve(blob);
+      };
+      const timeout = window.setTimeout(() => {
+        fail(recorderFailure ?? new Error('Timed out while stopping the recording'));
+      }, 10_000);
+
+      rec.onstop = finish;
+      rec.onerror = () => {
+        fail(recorderFailure ?? new Error('The browser failed to stop the recording'));
+      };
+
+      if (rec.state === 'inactive') {
+        fail(recorderFailure ?? new Error('The recorder stopped before the take ended'));
+        return;
+      }
+      // Preserve the proven MP4 finalization order used by Chrome and WebKit.
+      // Track isolation above removes the iPhone repeat-recorder failure while
+      // this explicit flush keeps the saved file's media clock playable.
+      try { rec.requestData(); } catch { /* stop() still performs a final flush */ }
+      try {
+        rec.stop();
+      } catch (error) {
+        fail(error);
+      }
+    });
+    return stopPromise;
+  };
 
   return {
     get mimeType() { return rec.mimeType || mimeType; },
@@ -425,57 +552,7 @@ export async function startRecording(
       await Promise.all(pendingChunkWrites);
       await recFinalize();
     },
-    stop: () =>
-      new Promise<Blob>((resolve, reject) => {
-        let settled = false;
-        const timeout = window.setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          clearInterval(timer);
-          composition?.dispose();
-          reject(new Error('Timed out while stopping the recording'));
-        }, 5000);
-        rec.onstop = () => {
-          if (settled) return;
-          settled = true;
-          window.clearTimeout(timeout);
-          clearInterval(timer);
-          const capturedFrames = Math.max(0, (composition?.frameCount() ?? 0) - frameCountAtStart);
-          composition?.dispose();
-          const blob = new Blob(chunks, { type: rec.mimeType || mimeType });
-          console.log('[rec] completed=', {
-            elapsed,
-            bytes: blob.size,
-            chunks: chunks.length,
-            chunkIntervalsMs: chunkIntervals.map((interval) => Math.round(interval)),
-            mimeType: blob.type,
-            videoBitsPerSecond: rec.videoBitsPerSecond,
-            audioBitsPerSecond: rec.audioBitsPerSecond,
-            captureMode: captureMode(),
-            capturedFrames,
-            measuredFps: elapsed > 0 ? Number((capturedFrames / elapsed).toFixed(1)) : null,
-          });
-          resolve(blob);
-        };
-        rec.onerror = () => {
-          if (settled) return;
-          settled = true;
-          window.clearTimeout(timeout);
-          clearInterval(timer);
-          composition?.dispose();
-          reject(new Error('The browser failed to stop the recording'));
-        };
-        try { rec.requestData(); } catch { /* noop */ }
-        try {
-          rec.stop();
-        } catch (error) {
-          settled = true;
-          window.clearTimeout(timeout);
-          clearInterval(timer);
-          composition?.dispose();
-          reject(error);
-        }
-      }),
+    stop,
   };
 }
 
