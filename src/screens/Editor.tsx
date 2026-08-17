@@ -136,13 +136,19 @@ export default function Editor() {
     (async () => {
       const urls: Record<string, string> = {};
       for (const c of clips) {
-        if (clipUrls[c.blobKey]) { urls[c.blobKey] = clipUrls[c.blobKey]; continue; }
+        const existing = clipUrlsRef.current[c.blobKey];
+        if (existing) { urls[c.blobKey] = existing; continue; }
         const b = await getBlob(c.blobKey);
         if (b) urls[c.blobKey] = URL.createObjectURL(b);
       }
       if (alive) setClipUrls((prev) => {
-        Object.values(prev).forEach((u) => { if (!Object.values(urls).includes(u)) URL.revokeObjectURL(u); });
-        return urls;
+        // Keep URLs for clips removed by an edit until the editor unmounts.
+        // Undo can restore those clips immediately, and revoking a URL while
+        // the spare player is still preloading it intermittently yields a
+        // missing-media frame or ERR_FILE_NOT_FOUND during the transition.
+        const next = { ...prev, ...urls };
+        clipUrlsRef.current = next;
+        return next;
       });
     })();
     return () => { alive = false; };
