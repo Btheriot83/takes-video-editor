@@ -1,12 +1,15 @@
 // Probe: the 4K capture fallback path. The Chromium fake camera happily
 // delivers >=2160 frames, so the main smoke exercises the happy path; this
 // probe caps getUserMedia at 1280x720 to prove the camera screen degrades
-// honestly — capability notice shown, badge reporting the real capture size,
-// recording still working at the delivered resolution.
+// honestly — badge reporting the real size and recording blocked instead of
+// silently upscaling HD into a 4K-shaped file.
 // Run: node scripts/probe-4k-fallback.mjs [baseURL]
 import { chromium } from 'playwright-core';
+import fs from 'node:fs';
 
 const BASE = process.argv[2] || 'http://localhost:4173/';
+const OUT = 'scripts/e2e-out';
+fs.mkdirSync(OUT, { recursive: true });
 
 const errors = [];
 const browser = await chromium.launch({
@@ -42,39 +45,32 @@ page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 const log = (m) => console.log(`[probe-4k-fallback] ${m}`);
 
 await page.goto(BASE, { waitUntil: 'load' });
-await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
+await page.locator('[data-4k-recording-blocked]').waitFor({ timeout: 15000 });
+log('persistent 4K recording block shown');
 
-await page.getByRole('button', { name: '4K', exact: true }).click();
-// The notice appears as soon as the reopened stream reports a sub-4K size.
-await page.getByText('4K not available on this camera').waitFor({ timeout: 15000 });
-log('capability notice shown for unavailable 4K');
-
-await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
 const frame = page.locator('[data-camera-frame]');
 if (await frame.getAttribute('data-capture-quality') !== '4K') throw new Error('4K setting was not applied to the frame');
+if (await frame.getAttribute('data-capture-verified-4k') !== 'false') throw new Error('sub-4K source was incorrectly verified');
 const capW = Number(await frame.getAttribute('data-capture-width'));
 const capH = Number(await frame.getAttribute('data-capture-height'));
 if (!(capW && capH) || Math.min(capW, capH) >= 2160) throw new Error(`expected a sub-4K capture, got ${capW}x${capH}`);
 const badge = await page.locator('[data-capture-badge]').textContent();
-if (!badge.includes(`${capW}×${capH}`)) throw new Error(`badge "${badge}" does not report the real capture size ${capW}x${capH}`);
+if (!badge.includes('Not 4K') || !badge.includes(`${capW}×${capH}`)) throw new Error(`badge "${badge}" does not report the sub-4K source ${capW}x${capH}`);
 log(`badge honestly reports ${capW}×${capH}`);
 
-// Recording must still work at whatever the camera delivered.
-const record = page.getByRole('button', { name: 'Tap to record' });
-const box = await record.boundingBox();
-const cdp = await ctx.newCDPSession(page);
-await cdp.send('Input.dispatchTouchEvent', {
-  type: 'touchStart',
-  touchPoints: [{ x: box.x + box.width / 2, y: box.y + box.height / 2, id: 1 }],
-});
-await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
-await page.waitForTimeout(1500);
-await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 5000 });
-await page.waitForTimeout(600);
-const clipBadge = await page.getByText(/1 clip ·/).isVisible().catch(() => false);
-if (!clipBadge) throw new Error('recording in the fallback resolution did not produce a clip');
-log('recording still works at the fallback resolution');
+const record = page.getByRole('button', { name: '4K camera unavailable' });
+if (!(await record.isDisabled())) throw new Error('record control unlocked on a sub-4K source');
+if (await page.locator('[data-review-clips]').count()) throw new Error('a clip appeared while 4K recording was blocked');
+const layout = await page.evaluate(() => ({
+  innerWidth: window.innerWidth,
+  documentWidth: document.documentElement.scrollWidth,
+  scrollX: window.scrollX,
+}));
+if (layout.documentWidth > layout.innerWidth + 1 || layout.scrollX !== 0) {
+  throw new Error(`4K unavailable state overflows horizontally: ${JSON.stringify(layout)}`);
+}
+log('recording remains locked rather than manufacturing an upscaled 4K file');
+await page.screenshot({ path: `${OUT}/4k-unavailable-390x844.png` });
 
 await browser.close();
 if (errors.length) throw new Error(`browser reported ${errors.length} error(s): ${errors.join('; ')}`);

@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { clipFraming, clipMatchesOutput, exportDimensions, isUltraHDCapture } from './clip';
+import {
+  DEFAULT_CAPTURE_QUALITY, clipFraming, clipMatchesOutput, exportDimensions,
+  isFullUltraHDFrame, isUltraHDCapture, isVerifiedUltraHDCapture,
+} from './clip';
 
 const out4kPortrait = exportDimensions('16:9', '4K'); // 2160x3840
 
@@ -46,6 +49,38 @@ describe('isUltraHDCapture', () => {
     expect(isUltraHDCapture(2160, 2160)).toBe(true);
     expect(isUltraHDCapture(1080, 1920)).toBe(false);
     expect(isUltraHDCapture(undefined, undefined)).toBe(false);
+  });
+});
+
+describe('4K-only capture contract', () => {
+  it('defaults every new camera session to 4K', () => {
+    expect(DEFAULT_CAPTURE_QUALITY).toBe('4K');
+  });
+
+  it('requires both the camera track and displayed preview to be 4K-class', () => {
+    expect(isVerifiedUltraHDCapture(
+      { width: 3840, height: 2160 },
+      { width: 2160, height: 3840 },
+    )).toBe(true);
+    expect(isVerifiedUltraHDCapture(
+      { width: 1920, height: 1080 },
+      { width: 2160, height: 3840 },
+    )).toBe(false);
+    expect(isVerifiedUltraHDCapture(
+      { width: 3840, height: 2160 },
+      { width: 1080, height: 1920 },
+    )).toBe(false);
+    expect(isVerifiedUltraHDCapture(
+      { width: 2160, height: 2160 },
+      { width: 2160, height: 2160 },
+    )).toBe(false);
+  });
+
+  it('distinguishes a full UHD camera raster from a square 2160px output', () => {
+    expect(isFullUltraHDFrame(3840, 2160)).toBe(true);
+    expect(isFullUltraHDFrame(2160, 3840)).toBe(true);
+    expect(isFullUltraHDFrame(2160, 2160)).toBe(false);
+    expect(isUltraHDCapture(2160, 2160)).toBe(true);
   });
 });
 

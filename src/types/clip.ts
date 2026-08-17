@@ -1,10 +1,11 @@
 export type AspectRatio = '16:9' | '4:3' | '1:1';
 export type ExportQuality = '1080p' | '4K';
+/** `HD` remains only so legacy saved projects can still be read safely. */
 export type CaptureQuality = 'HD' | '4K';
 export type ClipFraming = 'cover' | 'contain';
 
 export const DEFAULT_ASPECT_RATIO: AspectRatio = '16:9';
-export const DEFAULT_CAPTURE_QUALITY: CaptureQuality = 'HD';
+export const DEFAULT_CAPTURE_QUALITY: CaptureQuality = '4K';
 
 /** Requested capture size per quality, portrait convention (width < height). */
 export const CAPTURE_DIMENSIONS: Record<CaptureQuality, { width: number; height: number }> = {
@@ -12,12 +13,25 @@ export const CAPTURE_DIMENSIONS: Record<CaptureQuality, { width: number; height:
   '4K': { width: 2160, height: 3840 },
 };
 
-/**
- * True when a capture size is 4K-class regardless of sensor orientation
- * (2160x3840 portrait or 3840x2160 landscape both qualify).
- */
+/** True when a saved/output frame belongs to the 2160px 4K export class. */
 export function isUltraHDCapture(width?: number, height?: number): boolean {
   return Math.min(width ?? 0, height ?? 0) >= 2160;
+}
+
+/** True only for a complete UHD camera raster in either orientation. */
+export function isFullUltraHDFrame(width?: number, height?: number): boolean {
+  return Math.min(width ?? 0, height ?? 0) >= 2160 && Math.max(width ?? 0, height ?? 0) >= 3840;
+}
+
+/**
+ * A 4K-shaped output is not proof of a 4K camera source. Verify both the
+ * camera track contract and the display-oriented preview before recording.
+ */
+export function isVerifiedUltraHDCapture(
+  track: { width?: number; height?: number },
+  preview: { width?: number; height?: number },
+): boolean {
+  return isFullUltraHDFrame(track.width, track.height) && isFullUltraHDFrame(preview.width, preview.height);
 }
 
 /**

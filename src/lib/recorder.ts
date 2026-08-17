@@ -1,5 +1,5 @@
 import { recBegin, recChunk, recFinalize } from './db';
-import { CAPTURE_DIMENSIONS, isUltraHDCapture } from '../types/clip';
+import { CAPTURE_DIMENSIONS, isFullUltraHDFrame, isUltraHDCapture } from '../types/clip';
 import { framePlacement } from './framing';
 import type { CaptureQuality } from '../types/clip';
 
@@ -52,10 +52,18 @@ export interface ActiveRecording {
   mimeType: string;
   /** True when the saved track was normalized to the selected output frame. */
   outputReady: boolean;
+  /** How output frames are sampled from the live camera. */
+  captureMode: 'source-synced' | 'timer' | 'raw';
 }
 
 type RecordingFrame = { width: number; height: number };
-type ComposedRecordingStream = { stream: MediaStream; dispose: () => void };
+type ManualCanvasTrack = MediaStreamTrack & { requestFrame?: () => void };
+type ComposedRecordingStream = {
+  stream: MediaStream;
+  dispose: () => void;
+  mode: 'source-synced' | 'timer';
+  frameCount: () => number;
+};
 
 function cancelPreviewFrame(preview: HTMLVideoElement, id: number | null): void {
   if (id !== null && typeof preview.cancelVideoFrameCallback === 'function') {
@@ -98,9 +106,10 @@ function composeOutputReadyStream(
   let disposed = false;
   let videoFrameId: number | null = null;
   let animationFrameId: number | null = null;
+  let drawnFrames = 0;
 
   const draw = () => {
-    if (disposed) return;
+    if (disposed) return false;
     if (preview.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && preview.videoWidth > 0 && preview.videoHeight > 0) {
       const placement = framePlacement(
         preview.videoWidth,
@@ -120,23 +129,48 @@ function composeOutputReadyStream(
         placement.output.width,
         placement.output.height,
       );
+      drawnFrames += 1;
+      return true;
     }
-    if (typeof preview.requestVideoFrameCallback === 'function') {
-      videoFrameId = preview.requestVideoFrameCallback(() => draw());
-    } else {
-      animationFrameId = window.requestAnimationFrame(draw);
-    }
+    return false;
   };
-  draw();
 
-  const canvasStream = canvas.captureStream(Math.max(1, Math.min(30, frameRate || 30)));
-  const videoTrack = canvasStream.getVideoTracks()[0];
+  // A fixed 30 Hz canvas clock can sample between camera frames, duplicating
+  // some frames and skipping others. Prefer manual canvas capture and request
+  // exactly one output frame for every frame the camera actually delivers.
+  // Older browsers fall back to the proven timer-driven stream.
+  let canvasStream = canvas.captureStream(0);
+  let videoTrack = canvasStream.getVideoTracks()[0] as ManualCanvasTrack | undefined;
+  let mode: ComposedRecordingStream['mode'] = 'source-synced';
+  if (videoTrack && typeof videoTrack.requestFrame !== 'function') {
+    videoTrack.stop();
+    canvasStream = canvas.captureStream(Math.max(1, Math.min(30, frameRate || 30)));
+    videoTrack = canvasStream.getVideoTracks()[0] as ManualCanvasTrack | undefined;
+    mode = 'timer';
+  }
   if (!videoTrack) {
     disposed = true;
     cancelPreviewFrame(preview, videoFrameId);
     if (animationFrameId !== null) window.cancelAnimationFrame(animationFrameId);
     return null;
   }
+
+  const schedule = () => {
+    if (disposed) return;
+    if (typeof preview.requestVideoFrameCallback === 'function') {
+      videoFrameId = preview.requestVideoFrameCallback(() => {
+        if (draw() && mode === 'source-synced') videoTrack.requestFrame?.();
+        schedule();
+      });
+    } else {
+      animationFrameId = window.requestAnimationFrame(() => {
+        draw();
+        schedule();
+      });
+    }
+  };
+  if (draw() && mode === 'source-synced') videoTrack.requestFrame?.();
+  schedule();
 
   const dispose = () => {
     if (disposed) return;
@@ -151,6 +185,8 @@ function composeOutputReadyStream(
   return {
     stream: new MediaStream([videoTrack, ...source.getAudioTracks()]),
     dispose,
+    mode,
+    frameCount: () => drawnFrames,
   };
 }
 
@@ -210,7 +246,7 @@ export function ultraHDRetryConstraints(facing: CameraFacing): CameraTrackConstr
 
 function streamIsUltraHD(stream: MediaStream): boolean {
   const settings = stream.getVideoTracks()[0]?.getSettings?.();
-  return isUltraHDCapture(settings?.width, settings?.height);
+  return isFullUltraHDFrame(settings?.width, settings?.height);
 }
 
 /**
@@ -224,7 +260,7 @@ export function captureVideoBitrate(width?: number, height?: number): number {
 
 export async function getCameraStream(
   facing: CameraFacing,
-  quality: CaptureQuality = 'HD',
+  quality: CaptureQuality = '4K',
 ): Promise<MediaStream> {
   const audio: MediaTrackConstraints = { echoCancellation: true, noiseSuppression: true };
   const base: MediaStreamConstraints = {
@@ -307,9 +343,11 @@ export async function startRecording(
     recordingSettings: videoSettings,
     output,
     outputReady: Boolean(composition),
+    captureMode: composition?.mode ?? 'raw',
     audioSettings,
     videoBitsPerSecond,
   });
+  console.log(`[rec] capture mode=${composition?.mode ?? 'raw'}`);
 
   let seq = 0;
   const chunks: Blob[] = [];
@@ -354,11 +392,13 @@ export async function startRecording(
     composition?.dispose();
     throw error;
   }
+  const frameCountAtStart = composition?.frameCount() ?? 0;
   console.log('[rec] started, state=', rec.state);
 
   return {
     get mimeType() { return rec.mimeType || mimeType; },
     outputReady: Boolean(composition),
+    captureMode: composition?.mode ?? 'raw',
     get paused() { return rec.state === 'paused'; },
     pause: () => { if (rec.state === 'recording') rec.pause(); },
     resume: () => { if (rec.state === 'paused') rec.resume(); },
@@ -381,6 +421,7 @@ export async function startRecording(
           settled = true;
           window.clearTimeout(timeout);
           clearInterval(timer);
+          const capturedFrames = Math.max(0, (composition?.frameCount() ?? 0) - frameCountAtStart);
           composition?.dispose();
           const blob = new Blob(chunks, { type: rec.mimeType || mimeType });
           console.log('[rec] completed=', {
@@ -391,6 +432,9 @@ export async function startRecording(
             mimeType: blob.type,
             videoBitsPerSecond: rec.videoBitsPerSecond,
             audioBitsPerSecond: rec.audioBitsPerSecond,
+            captureMode: composition?.mode ?? 'raw',
+            capturedFrames,
+            measuredFps: elapsed > 0 ? Number((capturedFrames / elapsed).toFixed(1)) : null,
           });
           resolve(blob);
         };

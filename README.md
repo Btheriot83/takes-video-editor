@@ -7,6 +7,13 @@ portrait, and square produces 1:1. Switch between front and rear cameras, use su
 torch and pinch-zoom controls, then trim, split, reorder, and export an MP4
 without creating an account or uploading source media to a server.
 
+Camera recording is 4K-only. The record control unlocks only after both the
+camera track and the displayed preview report a complete UHD source; a lower-resolution
+camera stays visible for diagnosis but cannot be recorded and upscaled. Output
+frames are requested in step with incoming camera frames to preserve real-time
+playback cadence. The web camera API can verify delivered pixel dimensions, but
+it cannot certify the phone sensor's optical detail.
+
 ## Development
 
 Requires a current Node.js release and npm.

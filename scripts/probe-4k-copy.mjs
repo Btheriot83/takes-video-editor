@@ -1,14 +1,15 @@
 // Probe: 4K-capture untrimmed clips must hit the instant COPY paths.
 //
-// The fake camera delivers 2160x2160 for a 4K request in this environment, so
-// the matching output frame is 1:1 4K (2160x2160):
+// The fake camera's portrait request first resolves to 2160x2160, which is not
+// a complete UHD raster; the production retry upgrades it to 3840x2160. The
+// recorder then normalizes that verified source to the selected output frame.
 //  - pass 1 (CLIP_COUNT=1): expects "Camera original preserved" (mode=native)
 //  - pass 2 (CLIP_COUNT=2): expects "Clips joined without re-encoding"
 //    (mode=remuxed) — this also exercises the mp4box codec-uniformity probe,
 //    because Chrome reports the parameterless-unhelpful "video/mp4" family
 //    rather than an avc1-parameterized type.
-// Then, still at 16:9 (2160x3840 output) with the same 2160x2160 capture, the
-// export must NOT claim a copy path: mismatched aspect requires the render.
+// A portrait 16:9 capture is also normalized during recording and must keep
+// the same instant native path.
 // Run: node scripts/probe-4k-copy.mjs [base-url]
 import { chromium } from 'playwright-core';
 import { execFileSync } from 'node:child_process';
@@ -43,9 +44,8 @@ async function run({ clipCount, aspect, expectCopy }) {
 
   await page.goto(BASE, { waitUntil: 'load' });
   await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
-  await page.getByRole('button', { name: '4K', exact: true }).click();
   await page.getByRole('button', { name: aspect, exact: true }).click();
-  await page.waitForFunction(() => document.querySelector('[data-camera-frame]')?.getAttribute('data-capture-width') === '2160', null, { timeout: 15000 });
+  await page.waitForFunction(() => document.querySelector('[data-camera-frame]')?.getAttribute('data-capture-verified-4k') === 'true', null, { timeout: 15000 });
   const frame = page.locator('[data-camera-frame]');
   const capture = {
     width: await frame.getAttribute('data-capture-width'),
@@ -98,7 +98,6 @@ async function run({ clipCount, aspect, expectCopy }) {
 
 await run({ clipCount: 1, aspect: '1:1', expectCopy: true });
 await run({ clipCount: 2, aspect: '1:1', expectCopy: true });
-// Aspect guard: same 4K capture, but 16:9 output (2160x3840) must render.
-await run({ clipCount: 1, aspect: '16:9', expectCopy: false });
+await run({ clipCount: 1, aspect: '16:9', expectCopy: true });
 console.log(JSON.stringify(results, null, 2));
 console.log('PROBE-4K-COPY PASS');

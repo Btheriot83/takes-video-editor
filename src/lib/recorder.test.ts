@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { captureConstraints, captureVideoBitrate, ultraHDRetryConstraints } from './recorder';
-import { CAPTURE_DIMENSIONS, isUltraHDCapture } from '../types/clip';
+import { CAPTURE_DIMENSIONS, isFullUltraHDFrame, isUltraHDCapture } from '../types/clip';
 
 describe('captureConstraints', () => {
   it('keeps the proven portrait request for the rear HD camera', () => {
@@ -70,6 +70,15 @@ describe('isUltraHDCapture', () => {
     expect(isUltraHDCapture(1920, 3840)).toBe(false);
     expect(isUltraHDCapture(undefined, undefined)).toBe(false);
     expect(isUltraHDCapture(2160, undefined)).toBe(false);
+  });
+});
+
+describe('isFullUltraHDFrame', () => {
+  it('requires the complete 3840x2160 raster in either orientation', () => {
+    expect(isFullUltraHDFrame(3840, 2160)).toBe(true);
+    expect(isFullUltraHDFrame(2160, 3840)).toBe(true);
+    expect(isFullUltraHDFrame(2160, 2160)).toBe(false);
+    expect(isFullUltraHDFrame(1920, 1080)).toBe(false);
   });
 });
 

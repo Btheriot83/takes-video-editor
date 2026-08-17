@@ -22,12 +22,7 @@ interface State {
   total: number;
   aspectRatio: AspectRatio;
   captureQuality: CaptureQuality;
-  /**
-   * Last export quality the user explicitly chose, persisted across sessions.
-   * Read by the Camera screen to badge the 4K capture toggle when someone who
-   * exports at 4K is still capturing HD (an HD capture forces an upscale
-   * transcode instead of a copy-path 4K export).
-   */
+  /** Last export quality the user explicitly chose, persisted across sessions. */
   lastExportQuality: ExportQuality | null;
   setLastExportQuality: (quality: ExportQuality) => void;
 
@@ -45,7 +40,6 @@ interface State {
   setScreen: (s: Screen) => void;
   setPlayhead: (t: number) => void;
   setAspectRatio: (aspectRatio: AspectRatio) => void;
-  setCaptureQuality: (captureQuality: CaptureQuality) => void;
 
   commit: (next: Clip[], selectId?: string | null) => void;
   undo: () => void;
@@ -132,9 +126,9 @@ export const useStore = create<State>((set, get) => ({
         // Empty projects always open in the requested vertical default.
         // Existing projects retain their chosen frame for editing/export.
         aspectRatio: existing.length ? (p?.aspectRatio ?? DEFAULT_ASPECT_RATIO) : DEFAULT_ASPECT_RATIO,
-        // Capture quality is a camera preference, not a project frame, so it
-        // is restored even when the project itself is empty.
-        captureQuality: p?.captureQuality ?? DEFAULT_CAPTURE_QUALITY,
+        // Recording is intentionally 4K-only. Ignore legacy projects that
+        // persisted the retired HD camera option.
+        captureQuality: DEFAULT_CAPTURE_QUALITY,
       });
 
       const rec = await recRecover();
@@ -221,10 +215,6 @@ export const useStore = create<State>((set, get) => ({
   setAspectRatio: (aspectRatio) => {
     set({ aspectRatio });
     persist(get().clips, aspectRatio, get().captureQuality);
-  },
-  setCaptureQuality: (captureQuality) => {
-    set({ captureQuality });
-    persist(get().clips, get().aspectRatio, captureQuality);
   },
   setLastExportQuality: (quality) => {
     set({ lastExportQuality: quality });

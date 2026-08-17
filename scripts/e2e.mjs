@@ -72,61 +72,32 @@ log('default portrait 9:16 frame verified');
 await page.setViewportSize({ width: 320, height: 568 });
 await page.screenshot({ path: `${OUT}/1-camera-compact.png` });
 const viewport = page.viewportSize();
-for (const ratio of ['16:9', '4:3', '1:1', 'HD', '4K']) {
+for (const ratio of ['16:9', '4:3', '1:1']) {
   const box = await page.getByRole('button', { name: ratio, exact: true }).boundingBox();
   if (!box || box.x < 0 || box.y < 0 || box.x + box.width > viewport.width || box.y + box.height > viewport.height) {
     throw new Error(`${ratio} selector is clipped on the mobile viewport`);
   }
   if (box.width < 44 || box.height < 44) throw new Error(`${ratio} selector hitbox is ${box.width}x${box.height}, expected at least 44x44`);
 }
-log('mobile ratio + quality selector visibility and hitboxes verified at 320x568');
+const fourKOnly = page.getByLabel('4K recording only');
+const fourKOnlyBox = await fourKOnly.boundingBox();
+if (!fourKOnlyBox || fourKOnlyBox.x < 0 || fourKOnlyBox.y < 0 || fourKOnlyBox.x + fourKOnlyBox.width > viewport.width || fourKOnlyBox.y + fourKOnlyBox.height > viewport.height) {
+  throw new Error('4K-only status is clipped on the mobile viewport');
+}
+log('mobile ratio controls and 4K-only status verified at 320x568');
 await page.setViewportSize({ width: 390, height: 844 });
 
-// Capture quality: HD must be the default, and choosing 4K must reopen the
-// stream. The fake camera cannot promise 4K, so either the badge reports a
-// true >=2160 capture or the graceful "not available" notice must appear.
-if (await page.getByRole('button', { name: 'HD', exact: true }).getAttribute('aria-pressed') !== 'true') {
-  throw new Error('HD capture quality is not the default');
-}
-await page.getByRole('button', { name: '4K', exact: true }).click();
-await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
+// Capture is 4K-only: the app must verify the delivered camera stream before
+// enabling record, and the retired HD control must not exist.
 const qualityFrame = page.locator('[data-camera-frame]');
 if (await qualityFrame.getAttribute('data-capture-quality') !== '4K') throw new Error('frame did not reflect the 4K capture setting');
-// The 4K request may need up to three sequential getUserMedia attempts
-// (portrait ideal -> landscape retry -> portrait reopen), and the
-// "not available" notice auto-dismisses after ~2.2s — so poll until either
-// a true 4K-class capture is reported or the notice is seen, rather than
-// reading the state once and racing both.
-{
-  const deadline = Date.now() + 12000;
-  let capW = 0; let capH = 0; let outcome = null;
-  while (Date.now() < deadline && !outcome) {
-    capW = Number(await qualityFrame.getAttribute('data-capture-width')) || 0;
-    capH = Number(await qualityFrame.getAttribute('data-capture-height')) || 0;
-    if (Math.min(capW, capH) >= 2160) outcome = 'delivered';
-    else if (await page.getByText('4K not available on this camera').isVisible().catch(() => false)) outcome = 'notice';
-    else await page.waitForTimeout(150);
-  }
-  if (outcome === 'delivered') {
-    log(`4K capture delivered (${capW}x${capH})`);
-  } else if (outcome === 'notice') {
-    const badge = await page.locator('[data-capture-badge]').textContent();
-    if (capW && capH && !badge.includes(`${capW}×${capH}`)) throw new Error(`capture badge "${badge}" does not reflect actual ${capW}x${capH}`);
-    log(`4K unavailable fallback verified (actual ${capW || '?'}x${capH || '?'} shown honestly)`);
-  } else {
-    // Notice may have flashed and expired between polls; the honest badge is
-    // the durable affordance — accept it as the fallback evidence.
-    const badge = await page.locator('[data-capture-badge]').textContent();
-    if (!(capW && capH) || !badge.includes(`${capW}×${capH}`)) {
-      throw new Error(`4K selection settled neither on 4K capture nor an honest fallback (got ${capW}x${capH}, badge "${badge}")`);
-    }
-    log(`4K unavailable fallback verified via badge (actual ${capW}x${capH}; notice expired between polls)`);
-  }
-}
-await page.getByRole('button', { name: 'HD', exact: true }).click();
-await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
-if (await qualityFrame.getAttribute('data-capture-quality') !== 'HD') throw new Error('switching back to HD capture failed');
-log('capture quality toggle verified (back on HD)');
+if (await qualityFrame.getAttribute('data-capture-verified-4k') !== 'true') throw new Error('record unlocked without a verified 4K stream');
+if (await page.getByRole('button', { name: 'HD', exact: true }).count()) throw new Error('retired HD recording control is still visible');
+const capW = Number(await qualityFrame.getAttribute('data-capture-width')) || 0;
+const capH = Number(await qualityFrame.getAttribute('data-capture-height')) || 0;
+if (Math.min(capW, capH) < 2160) throw new Error(`record unlocked on a sub-4K stream (${capW}x${capH})`);
+await page.getByText(/4K verified ·/).waitFor();
+log(`4K-only verified source gate passed (${capW}x${capH})`);
 
 // verify every project frame option changes the actual capture viewport
 for (const ratio of ['16:9', '4:3', '1:1']) {
@@ -170,8 +141,9 @@ if (!JSON.stringify(selfieState.constraints.resizeMode ?? '').includes('crop-and
 const requestedWidth = Number(selfieState.constraints.width?.ideal ?? selfieState.constraints.width);
 const requestedHeight = Number(selfieState.constraints.height?.ideal ?? selfieState.constraints.height);
 const requestedAspect = Number(selfieState.constraints.aspectRatio?.ideal ?? selfieState.constraints.aspectRatio);
-if (!(requestedWidth < requestedHeight) || Math.abs(requestedAspect - 9 / 16) > 0.01) {
-  throw new Error(`selfie camera did not request an output-ready portrait mode: ${JSON.stringify(selfieState)}`);
+if (Math.min(requestedWidth, requestedHeight) < 2160 || Math.max(requestedWidth, requestedHeight) < 3840 ||
+    Math.min(Math.abs(requestedAspect - 9 / 16), Math.abs(requestedAspect - 16 / 9)) > 0.01) {
+  throw new Error(`selfie camera did not request a complete UHD mode: ${JSON.stringify(selfieState)}`);
 }
 await page.screenshot({ path: `${OUT}/1-selfie-vertical.png` });
 await page.getByRole('button', { name: 'Switch to rear camera' }).click();
@@ -282,13 +254,13 @@ for (let i = 0; i < 3; i++) {
       throw new Error('recording did not continue while the touch was held');
     }
     if (mediaRecorderStarts !== 2) throw new Error(`duplicate hold started ${mediaRecorderStarts} recorders`);
-    // Ratio and quality selectors must lock while a recording is running.
-    for (const control of ['16:9', 'HD', '4K']) {
+    // Aspect controls must lock while a recording is running.
+    for (const control of ['16:9', '4:3', '1:1']) {
       if (!(await page.getByRole('button', { name: control, exact: true }).isDisabled())) {
         throw new Error(`${control} selector stayed enabled while recording`);
       }
     }
-    log('ratio + quality selectors locked during recording');
+    log('aspect ratio selectors locked during recording');
   }
   await page.waitForTimeout(2000);
   const releaseStarted = Date.now();
@@ -346,12 +318,11 @@ log('selfie clip kept edge-to-edge vertical framing after reload in the editor')
 const editorFrame = page.locator('[data-editor-frame]');
 const editorBox = await editorFrame.boundingBox();
 if (Math.abs(editorBox.width / editorBox.height - 9 / 16) > 0.03) throw new Error('editor frame is not portrait 9:16');
-// These fake-camera clips are HD, so the export default must be the source
-// class (1080p), keeping the native/remux fast paths instead of a 4K upscale.
-if (await editorFrame.getAttribute('data-export-width') !== '1080' || await editorFrame.getAttribute('data-export-height') !== '1920') {
-  throw new Error('editor default export metadata is not the 1080p source class (1080x1920)');
+// Verified 4K camera clips default the editor and export sheet to 4K.
+if (await editorFrame.getAttribute('data-export-width') !== '2160' || await editorFrame.getAttribute('data-export-height') !== '3840') {
+  throw new Error('editor default export metadata is not the 4K source class (2160x3840)');
 }
-log('editor portrait frame and source-matched 1080p default export verified');
+log('editor portrait frame and source-matched 4K default export verified');
 
 const clipCount = await page.locator('[data-clip]').count();
 log(`timeline clips: ${clipCount}`);
@@ -465,18 +436,14 @@ for (let index = 0; index < 8; index += 1) {
 }
 log('export dialog focus trap verified');
 await exportDialog.getByText('9:16 portrait', { exact: true }).waitFor();
-// HD-only sources open the sheet on 1080p; switching to 4K and back must
-// update the live export metadata. Controls stay finger-sized.
-await exportDialog.getByText(/1080p · 1080 × 1920/).waitFor();
+// 4K camera sources open the sheet on 4K; switching to 1080p and back must
+// update the live export metadata. Finish on 1080p for the edited render.
+await exportDialog.getByText(/4K · 2160 × 3840/).waitFor();
 const quality1080 = exportDialog.getByRole('button', { name: '1080p', exact: true });
 const quality4k = exportDialog.getByRole('button', { name: '4K', exact: true });
-if (await quality1080.getAttribute('aria-pressed') !== 'true') throw new Error('export quality did not default to the 1080p source class');
-const qualityBox = await quality1080.boundingBox();
-if (!qualityBox || qualityBox.height < 44) throw new Error(`1080p quality control is ${qualityBox?.height}px tall, expected at least 44`);
-await quality4k.click();
-if (await quality4k.getAttribute('aria-pressed') !== 'true') throw new Error('4K quality selection was not pressed');
-if (await editorFrame.getAttribute('data-export-width') !== '2160') throw new Error('4K selection did not update export metadata');
-await exportDialog.getByText(/4K · 2160 × 3840/).waitFor();
+if (await quality4k.getAttribute('aria-pressed') !== 'true') throw new Error('export quality did not default to the 4K source class');
+const qualityBox = await quality4k.boundingBox();
+if (!qualityBox || qualityBox.height < 44) throw new Error(`4K quality control is ${qualityBox?.height}px tall, expected at least 44`);
 await quality1080.click();
 if (await quality1080.getAttribute('aria-pressed') !== 'true') throw new Error('1080p quality selection was not pressed');
 if (await editorFrame.getAttribute('data-export-width') !== '1080') throw new Error('1080p selection did not update export metadata');

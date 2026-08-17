@@ -7,7 +7,7 @@ const OUT = 'scripts/e2e-out';
 const realCamera = process.env.REAL_CAMERA === '1';
 const SLACK = Math.max(1, Number(process.env.E2E_TIME_SLACK || 1));
 const exportQuality = process.env.EXPORT_QUALITY === '1080p' ? '1080p' : '4K';
-const captureQuality = process.env.CAPTURE_QUALITY === '4K' ? '4K' : 'HD';
+const captureQuality = '4K';
 const aspectRatio = ['16:9', '4:3', '1:1'].includes(process.env.ASPECT_RATIO) ? process.env.ASPECT_RATIO : '16:9';
 const cameraFacing = process.env.CAMERA_FACING === 'front' ? 'front' : 'rear';
 const maxReadyMs = Number(process.env.EXPECT_MAX_READY_MS || 0);
@@ -45,14 +45,15 @@ page.on('pageerror', (error) => errors.push(String(error)));
 
 await page.goto(BASE, { waitUntil: 'load' });
 await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
+if (await page.getByRole('button', { name: 'HD', exact: true }).count()) {
+  throw new Error('retired HD recording control is still visible');
+}
+await page.getByLabel('4K recording only').waitFor();
 if (cameraFacing === 'front') {
   await page.getByRole('button', { name: 'Switch to front camera' }).click();
   await page.waitForSelector('button[aria-label="Switch to rear camera"]:not([disabled])', { timeout: 15000 });
 }
-if (captureQuality === '4K') {
-  await page.getByRole('button', { name: '4K', exact: true }).click();
-  await page.waitForFunction(() => Number(document.querySelector('[data-camera-frame]')?.getAttribute('data-capture-width')) >= 2160, null, { timeout: 15000 });
-}
+await page.waitForFunction(() => document.querySelector('[data-camera-frame]')?.getAttribute('data-capture-verified-4k') === 'true', null, { timeout: 15000 });
 if (aspectRatio !== '16:9') await page.getByRole('button', { name: aspectRatio, exact: true }).click();
 const record = page.getByRole('button', { name: 'Tap to record' });
 const cameraFrame = page.locator('[data-camera-frame]');
@@ -61,14 +62,17 @@ const capture = {
   height: await cameraFrame.getAttribute('data-capture-height'),
   frameRate: await cameraFrame.getAttribute('data-capture-frame-rate'),
 };
+const recordingWallMs = [];
 for (let index = 0; index < clipCount; index++) {
   const box = await record.boundingBox();
   const point = { x: box.x + box.width / 2, y: box.y + box.height / 2, id: index + 1 };
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
   await page.waitForSelector('button[aria-label="Stop recording"]', { timeout: 5000 });
+  const startedAt = performance.now();
   await page.waitForTimeout(1100);
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
   await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 2000 * SLACK });
+  recordingWallMs.push(Math.round(performance.now() - startedAt));
 }
 await page.getByRole('button', { name: new RegExp(`Done recording\\. Review ${clipCount} clip`) }).click();
 
@@ -83,12 +87,22 @@ await page.waitForFunction(() => {
 const source = await page.locator('[data-editor-active-slot]').evaluate((editor) => {
   const slot = editor.getAttribute('data-editor-active-slot');
   const video = document.querySelector(`[data-editor-video-slot="${slot}"]`);
-  return video instanceof HTMLVideoElement ? { width: video.videoWidth, height: video.videoHeight } : null;
+  return video instanceof HTMLVideoElement
+    ? { width: video.videoWidth, height: video.videoHeight, duration: video.duration }
+    : null;
 });
+const firstWallSeconds = recordingWallMs[0] / 1000;
+const playbackRateRatio = source?.duration / firstWallSeconds;
+if (!Number.isFinite(playbackRateRatio) || playbackRateRatio < 0.85 || playbackRateRatio > 1.15) {
+  throw new Error(`recorded duration drifted from wall time: media=${source?.duration}s wall=${firstWallSeconds}s ratio=${playbackRateRatio}`);
+}
+if (!recorderEvidence.some((line) => line.includes('capture mode=source-synced'))) {
+  throw new Error(`recorder did not use source-synced frames: ${recorderEvidence.join(' | ')}`);
+}
 await page.getByText('Export video', { exact: true }).click();
 const dialog = page.getByRole('dialog', { name: 'Export video' });
-// The sheet defaults to the source class (1080p for HD fake-camera clips),
-// so always click the quality under test explicitly.
+// Explicitly choose the export quality under test; 4K is the source-matched
+// default and 1080p remains an optional downscaled export.
 if (exportQuality === '1080p') {
   await dialog.getByRole('button', { name: '1080p', exact: true }).click();
 } else {
@@ -107,8 +121,7 @@ await dialog.getByText(new RegExp(`${exportQuality} · ${expectedWidth} × ${exp
 if (clipCount === 1 && encoderCoreRequests !== 0) {
   throw new Error('one-clip review downloaded the encoder before export started');
 }
-// Steering UX: choosing 4K over an HD-class source must surface the upscale
-// hint; a genuine 4K-class capture and every 1080p export must not.
+// A verified UHD camera capture must never show the legacy upscale warning.
 const hintCount = await dialog.locator('[data-upscale-hint]').count();
 const expectUpscaleHint = exportQuality === '4K' && Math.min(source?.width ?? 0, source?.height ?? 0) < 2160;
 if (expectUpscaleHint && hintCount !== 1) throw new Error('4K-over-HD upscale hint missing');
@@ -142,16 +155,13 @@ const download = await downloadPromise;
 const output = `${OUT}/exported-${exportQuality.toLowerCase()}-${aspectRatio.replace(':', 'x')}-${actualMode}.mp4`;
 await download.saveAs(output);
 
-// Steering UX: after an explicit 4K export choice, the Camera screen badges
-// the 4K capture toggle while capture quality is still HD.
+// Recording stays 4K-only after returning from the editor.
 await page.keyboard.press('Escape');
 await page.getByRole('button', { name: 'Back to camera' }).click();
 await page.waitForSelector('button[aria-label="Tap to record"]', { timeout: 15000 });
-const nudgeCount = await page.locator('[data-capture-4k-nudge]').count();
-const expectNudge = exportQuality === '4K' && captureQuality === 'HD';
-if (expectNudge && nudgeCount !== 1) throw new Error('4K capture nudge missing after an HD-capture 4K export');
-if (!expectNudge && nudgeCount !== 0) throw new Error('4K capture nudge shown when capture already matches the export choice');
+await page.getByLabel('4K recording only').waitFor();
+if (await page.getByRole('button', { name: 'HD', exact: true }).count()) throw new Error('HD recording control returned after editing');
 
-console.log(JSON.stringify({ realCamera, cameraFacing, captureQuality, exportQuality, aspectRatio, clipCount, capture, source, expectedPreviewPath, previewPath, expectedMode, actualMode, readyMs, recorderEvidence, nudgeCount, output, bytes: fs.statSync(output).size, browserErrors: errors }, null, 2));
+console.log(JSON.stringify({ realCamera, cameraFacing, captureQuality, exportQuality, aspectRatio, clipCount, capture, source, recordingWallMs, playbackRateRatio, expectedPreviewPath, previewPath, expectedMode, actualMode, readyMs, recorderEvidence, output, bytes: fs.statSync(output).size, browserErrors: errors }, null, 2));
 await browser.close();
 if (errors.length) throw new Error(`browser reported ${errors.length} error(s)`);

@@ -51,10 +51,10 @@ const exportDialog = page.getByRole('dialog', { name: 'Export video' });
 await exportDialog.locator('[data-export-plan][data-export-path="join"]').waitFor();
 await page.screenshot({ path: `${out}/export-fast-430x799-at-3x.png` });
 
-// Switching an HD capture to 4K deterministically exercises the warning state
-// without starting a costly render. Verify both the smallest supported phone
+// Downscaling the 4K-only capture to 1080p deterministically exercises the
+// render state without starting the encoder. Verify both the smallest phone
 // viewport and the centered desktop presentation from the real rendered UI.
-await exportDialog.getByRole('button', { name: '4K', exact: true }).click();
+await exportDialog.getByRole('button', { name: '1080p', exact: true }).click();
 await exportDialog.locator('[data-export-plan][data-export-path="render"]').waitFor();
 await page.setViewportSize({ width: 320, height: 568 });
 await page.waitForTimeout(150);

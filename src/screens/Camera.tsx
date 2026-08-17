@@ -5,8 +5,8 @@ import type { ActiveRecording } from '../lib/recorder';
 import { storageMode } from '../lib/db';
 import { prepareExportAssets } from '../lib/ffmpeg';
 import { useStore } from '../state/store';
-import { ASPECT_RATIOS, fmtTime, clipFraming, clipLen, exportDimensions, isUltraHDCapture } from '../types/clip';
-import type { AspectRatio, CaptureQuality } from '../types/clip';
+import { ASPECT_RATIOS, fmtTime, clipFraming, clipLen, exportDimensions, isVerifiedUltraHDCapture } from '../types/clip';
+import type { AspectRatio } from '../types/clip';
 
 type ZoomRange = { min: number; max: number; step: number };
 type ExtendedCapabilities = MediaTrackCapabilities & { zoom?: ZoomRange; torch?: boolean };
@@ -15,7 +15,6 @@ type ExtendedConstraintSet = MediaTrackConstraintSet & { zoom?: number; torch?: 
 type ActiveHold = { kind: 'pointer' | 'touch'; id: number } | { kind: 'keyboard'; id: 'keyboard' };
 
 const RATIOS: AspectRatio[] = ['16:9', '4:3', '1:1'];
-const QUALITIES: CaptureQuality[] = ['HD', '4K'];
 
 /**
  * Press-duration boundary between the two record gestures (Instagram/TikTok
@@ -79,6 +78,7 @@ export default function Camera() {
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [streamReady, setStreamReady] = useState(false);
+  const [captureVerified4K, setCaptureVerified4K] = useState(false);
   const [zoomRange, setZoomRange] = useState<ZoomRange | null>(null);
   const [zoom, setZoom] = useState(1);
   const [torchSupported, setTorchSupported] = useState(false);
@@ -91,9 +91,8 @@ export default function Camera() {
 
   const {
     clips, addClipFromBlob, importFiles, setScreen, total,
-    aspectRatio, setAspectRatio, captureQuality, setCaptureQuality,
+    aspectRatio, setAspectRatio,
   } = useStore();
-  const lastExportQuality = useStore((s) => s.lastExportQuality);
 
   const showCapabilityNotice = useCallback((message: string, durationMs = 2200) => {
     setCapabilityNotice(message);
@@ -101,13 +100,14 @@ export default function Camera() {
     noticeTimerRef.current = window.setTimeout(() => setCapabilityNotice(null), durationMs);
   }, []);
 
-  const openCamera = useCallback(async (nextFacing: 'user' | 'environment', quality: CaptureQuality) => {
+  const openCamera = useCallback(async (nextFacing: 'user' | 'environment') => {
     setStreamReady(false);
+    setCaptureVerified4K(false);
     setTorchOn(false);
     setError(null);
     try {
       streamRef.current?.getTracks().forEach((track) => track.stop());
-      const stream = await getCameraStream(nextFacing, quality);
+      const stream = await getCameraStream(nextFacing, '4K');
       const videoTrack = stream.getVideoTracks()[0];
       const capabilities = videoTrack?.getCapabilities?.() as ExtendedCapabilities | undefined;
       let settings = videoTrack?.getSettings?.() as ExtendedSettings | undefined;
@@ -152,37 +152,44 @@ export default function Camera() {
       // Track settings can claim 1080x1920 while an iOS MediaRecorder blob is
       // still landscape; showing the intrinsic size keeps the badge truthful
       // and waiting for it prevents recording during orientation setup.
+      const previewWidth = preview?.videoWidth || undefined;
+      const previewHeight = preview?.videoHeight || undefined;
+      const deliveredWidth = previewWidth || settings?.width;
+      const deliveredHeight = previewHeight || settings?.height;
       setCaptureSize({
-        width: preview?.videoWidth || settings?.width,
-        height: preview?.videoHeight || settings?.height,
+        width: deliveredWidth,
+        height: deliveredHeight,
         frameRate: settings?.frameRate,
       });
-      // The capture badge always reflects the size the camera actually
-      // delivered; be explicit when a 4K request could not be honored.
-      if (quality === '4K' && !isUltraHDCapture(settings?.width, settings?.height)) {
-        showCapabilityNotice('4K not available on this camera');
-      }
+      // Both the track contract and display-oriented preview must be 4K-class.
+      // A 2160x3840 output canvas alone is only an upscale, not verified 4K
+      // camera capture, so the record control remains locked below this gate.
+      setCaptureVerified4K(isVerifiedUltraHDCapture(
+        { width: settings?.width, height: settings?.height },
+        { width: previewWidth, height: previewHeight },
+      ));
       setStreamReady(true);
       setError(null);
     } catch (cameraError: unknown) {
       setZoomRange(null);
       setTorchSupported(false);
       setCaptureSize(null);
+      setCaptureVerified4K(false);
       setError(
         cameraError instanceof DOMException && cameraError.name === 'NotAllowedError'
           ? 'Camera access was denied. Allow camera and microphone permission, then try again.'
           : 'Could not open a camera on this device.',
       );
     }
-  }, [showCapabilityNotice]);
+  }, []);
 
   useEffect(() => {
-    openCamera(facing, captureQuality);
+    openCamera(facing);
     return () => {
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     };
-  }, [facing, captureQuality, openCamera]);
+  }, [facing, openCamera]);
 
   useEffect(() => () => {
     if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
@@ -233,7 +240,7 @@ export default function Camera() {
         // Unmissable saved confirmation: users reported not knowing whether
         // releasing the button actually kept the clip.
         const count = useStore.getState().clips.length;
-        setSavedNotice(`Clip saved ✓ · ${count} clip${count === 1 ? '' : 's'}`);
+        setSavedNotice(`4K clip saved ✓ · ${count} clip${count === 1 ? '' : 's'}`);
         setPoppedClipId(clip.id);
         if (savedTimerRef.current) window.clearTimeout(savedTimerRef.current);
         savedTimerRef.current = window.setTimeout(() => {
@@ -270,7 +277,7 @@ export default function Camera() {
 
   const startHold = useCallback((source: ActiveHold) => {
     if (
-      !streamRef.current || !streamReady || error || stoppingRef.current ||
+      !streamRef.current || !streamReady || !captureVerified4K || error || stoppingRef.current ||
       startingRef.current || recRef.current || activeHoldRef.current !== null
     ) return;
 
@@ -284,7 +291,7 @@ export default function Camera() {
     const stream = streamRef.current;
     void (async () => {
       try {
-        const output = exportDimensions(aspectRatio, captureQuality === '4K' ? '4K' : '1080p');
+        const output = exportDimensions(aspectRatio, '4K');
         const active = await startRecording(stream, setElapsed, facing, videoRef.current, output);
         recRef.current = active;
         if (!active.outputReady) {
@@ -308,7 +315,7 @@ export default function Camera() {
         setStarting(false);
       }
     })();
-  }, [aspectRatio, captureQuality, error, facing, finishRecording, showCapabilityNotice, streamReady]);
+  }, [aspectRatio, captureVerified4K, error, facing, finishRecording, showCapabilityNotice, streamReady]);
 
   /**
    * A press while a tap-latched recording runs is the STOP gesture. Everything
@@ -476,6 +483,7 @@ export default function Camera() {
 
   const hasClips = clips.length > 0;
   const controlsDisabled = recording || starting || stopping || !streamReady;
+  const recordUnavailable = !streamReady || !captureVerified4K || !!error || stopping;
 
   return (
     <div className="fixed inset-0 bg-black text-white select-none overflow-hidden flex flex-col">
@@ -498,33 +506,15 @@ export default function Camera() {
               </button>
             ))}
           </div>
-          <div className="flex items-center rounded-full bg-white/10 p-0.5" role="group" aria-label="Capture quality">
-            {QUALITIES.map((quality) => (
-              <button
-                key={quality}
-                type="button"
-                disabled={controlsDisabled}
-                aria-pressed={captureQuality === quality}
-                onClick={() => setCaptureQuality(quality)}
-                className={`min-h-11 min-w-11 flex-1 rounded-full px-2 text-[11px] font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:opacity-40 sm:min-h-8 sm:flex-none ${
-                  captureQuality === quality ? 'bg-white text-black' : 'text-white/70'
-                }`}
-              >
-                <span className="relative">
-                  {quality}
-                  {/* Subtle steer: someone who last exported at 4K but is
-                      capturing HD will require a full 4K upscale next time.
-                      A dot, not a modal. */}
-                  {quality === '4K' && captureQuality === 'HD' && lastExportQuality === '4K' && (
-                    <span
-                      data-capture-4k-nudge
-                      title="You last exported in 4K — capture in 4K to avoid a slower upscale"
-                      className="absolute -right-1.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-400"
-                    />
-                  )}
-                </span>
-              </button>
-            ))}
+          <div
+            data-capture-mode="4k-only"
+            className={`flex min-h-11 shrink-0 items-center gap-1.5 rounded-full px-3 text-[10px] font-bold tracking-[0.08em] sm:min-h-8 ${
+              captureVerified4K ? 'bg-white text-black' : 'bg-white/10 text-white/70'
+            }`}
+            aria-label="4K recording only"
+          >
+            <span className={`h-1.5 w-1.5 rounded-full ${captureVerified4K ? 'bg-emerald-500' : 'bg-amber-400'}`} />
+            4K ONLY
           </div>
         </div>
         <div className="order-2 text-right text-sm tabular-nums text-white/80 sm:order-3">
@@ -542,7 +532,8 @@ export default function Camera() {
         <div
           data-camera-frame
           data-frame-ratio={ASPECT_RATIOS[aspectRatio].outputLabel}
-          data-capture-quality={captureQuality}
+          data-capture-quality="4K"
+          data-capture-verified-4k={captureVerified4K ? 'true' : 'false'}
           data-capture-width={captureSize?.width}
           data-capture-height={captureSize?.height}
           data-capture-frame-rate={captureSize?.frameRate}
@@ -577,8 +568,9 @@ export default function Camera() {
             {/* No "Camera" prefix: at 320px-wide viewports the prefix truncated
                 the actual resolution away, hiding the honesty affordance. */}
             <div data-capture-badge className="min-w-0 truncate rounded-full bg-black/65 px-2.5 py-1.5 text-[10px] text-white/70">
-              {captureSize?.width && captureSize?.height ? `${captureSize.width}×${captureSize.height}` : 'device managed'}
-              {captureSize?.frameRate ? ` · ${captureSize.frameRate.toFixed(0)} fps` : ''}
+              {captureVerified4K ? '4K verified · ' : captureSize ? 'Not 4K · ' : ''}
+              {captureSize?.width && captureSize?.height ? `${captureSize.width}×${captureSize.height}` : 'checking camera'}
+              {captureSize?.frameRate ? ` · ${captureSize.frameRate.toFixed(0)} fps setting` : ''}
             </div>
             <div className="ml-auto shrink-0 rounded-full bg-black/65 px-3 py-1.5 text-xs font-semibold tabular-nums shadow-sm" aria-live="polite">
               {zoom.toFixed(zoom % 1 === 0 ? 0 : 1)}×
@@ -600,7 +592,7 @@ export default function Camera() {
             <div className="mt-3 flex items-center justify-center gap-2">
               <button
                 type="button"
-                onClick={() => void openCamera(facing, captureQuality)}
+                onClick={() => void openCamera(facing)}
                 className="min-h-11 rounded-full bg-white px-4 text-xs font-semibold text-black active:bg-white/85 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
               >
                 Try camera again
@@ -634,6 +626,11 @@ export default function Camera() {
       </main>
 
       <footer className="relative z-20 shrink-0 bg-black px-4 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-3">
+        {streamReady && !captureVerified4K && !error && (
+          <div data-4k-recording-blocked role="alert" className="mx-auto mb-3 max-w-md rounded-xl border border-amber-400/35 bg-amber-400/10 px-3 py-2 text-center text-xs text-amber-100">
+            This camera is not delivering 4K. Recording stays locked instead of upscaling HD.
+          </div>
+        )}
         {hasClips && (
           <button
             type="button"
@@ -687,8 +684,8 @@ export default function Camera() {
           <div className="flex flex-col items-center">
             <button
               type="button"
-              disabled={!streamReady || !!error || stopping}
-              aria-label={recording ? 'Stop recording' : 'Tap to record'}
+              disabled={recordUnavailable}
+              aria-label={recording ? 'Stop recording' : captureVerified4K ? 'Tap to record' : '4K camera unavailable'}
               aria-describedby="record-hint"
               data-record-state={recording ? 'recording' : starting ? 'starting' : stopping ? 'stopping' : 'idle'}
               onContextMenu={(event) => event.preventDefault()}
@@ -735,7 +732,7 @@ export default function Camera() {
                 recording ? 'bg-red-600 font-bold text-white' : 'font-medium text-white/60'
               }`}
             >
-              {recording ? 'Tap to stop' : 'Tap to record'}
+              {recording ? 'Tap to stop' : !streamReady ? 'Checking 4K camera…' : captureVerified4K ? 'Tap to record' : '4K unavailable'}
             </span>
           </div>
 

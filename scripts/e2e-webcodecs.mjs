@@ -102,10 +102,10 @@ sources.forEach((source, index) => {
 
 await page.getByText('Export video', { exact: true }).click();
 const dialog = page.getByRole('dialog', { name: 'Export video' });
-// HD fake-camera clips default the sheet to 1080p, which would remux and
-// bypass the encoder under test; force the 4K transcode path explicitly.
-await dialog.getByRole('button', { name: '4K', exact: true }).click();
-await dialog.getByText(/4K · 2160 × 3840/).waitFor();
+// 4K-only clips default to a matching no-encode export. Select 1080p so this
+// focused test deterministically exercises the WebCodecs transcode pipeline.
+await dialog.getByRole('button', { name: '1080p', exact: true }).click();
+await dialog.getByText(/1080p · 1080 × 1920/).waitFor();
 // Benchmark: wall time from clicking Start export to "Video ready".
 const exportStartedAt = Date.now();
 await dialog.getByRole('button', { name: 'Start export' }).click();
@@ -132,8 +132,8 @@ const streams = JSON.parse(execFileSync('ffprobe', [
 const video = streams.find((s) => s.codec_type === 'video');
 const audio = streams.find((s) => s.codec_type === 'audio');
 if (!video || !audio) throw new Error(`expected video+audio streams, got ${JSON.stringify(streams)}`);
-if (video.width !== 2160 || video.height !== 3840) {
-  throw new Error(`expected 2160x3840, got ${video.width}x${video.height}`);
+if (video.width !== 1080 || video.height !== 1920) {
+  throw new Error(`expected 1080x1920, got ${video.width}x${video.height}`);
 }
 const videoDur = Number(video.duration);
 const audioDur = Number(audio.duration);
