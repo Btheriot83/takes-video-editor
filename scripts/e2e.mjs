@@ -164,14 +164,14 @@ if (reportedSelfieSize.width !== selfieState.intrinsicWidth || reportedSelfieSiz
 if (selfieState.objectFit !== 'cover' || selfieState.framing !== 'cover') {
   throw new Error(`selfie preview is not an edge-to-edge portrait fill: ${JSON.stringify(selfieState)}`);
 }
-if (!JSON.stringify(selfieState.constraints.resizeMode ?? '').includes('none')) {
-  throw new Error(`selfie camera did not request an uncropped native mode: ${JSON.stringify(selfieState.constraints)}`);
+if (!JSON.stringify(selfieState.constraints.resizeMode ?? '').includes('crop-and-scale')) {
+  throw new Error(`selfie camera did not request an output-ready crop: ${JSON.stringify(selfieState.constraints)}`);
 }
 const requestedWidth = Number(selfieState.constraints.width?.ideal ?? selfieState.constraints.width);
 const requestedHeight = Number(selfieState.constraints.height?.ideal ?? selfieState.constraints.height);
 const requestedAspect = Number(selfieState.constraints.aspectRatio?.ideal ?? selfieState.constraints.aspectRatio);
-if (!(requestedWidth > requestedHeight) || Math.abs(requestedAspect - 16 / 9) > 0.01) {
-  throw new Error(`selfie camera did not request a native primary-orientation mode: ${JSON.stringify(selfieState)}`);
+if (!(requestedWidth < requestedHeight) || Math.abs(requestedAspect - 9 / 16) > 0.01) {
+  throw new Error(`selfie camera did not request an output-ready portrait mode: ${JSON.stringify(selfieState)}`);
 }
 await page.screenshot({ path: `${OUT}/1-selfie-vertical.png` });
 await page.getByRole('button', { name: 'Switch to rear camera' }).click();
@@ -180,7 +180,7 @@ if (await selfiePreview.getAttribute('data-preview-framing') !== 'cover' ||
     await selfiePreview.evaluate((video) => getComputedStyle(video).objectFit) !== 'cover') {
   throw new Error('rear camera did not restore cover framing');
 }
-log('edge-to-edge vertical selfie and rear-camera framing verified');
+log('output-ready vertical selfie and rear-camera framing verified');
 
 // fake Chromium camera exposes no torch; the UI must state that honestly
 const flash = page.getByRole('button', { name: /Flash/ });

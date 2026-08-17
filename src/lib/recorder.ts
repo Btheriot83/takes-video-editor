@@ -1,11 +1,12 @@
 import { recBegin, recChunk, recFinalize } from './db';
 import { CAPTURE_DIMENSIONS, isUltraHDCapture } from '../types/clip';
+import { framePlacement } from './framing';
 import type { CaptureQuality } from '../types/clip';
 
 export type CameraFacing = 'user' | 'environment';
 export type CameraTrackConstraints = MediaTrackConstraints & {
   /** Present in the Media Capture spec but missing from older lib.dom types. */
-  resizeMode?: { exact: 'none' };
+  resizeMode?: { ideal: 'crop-and-scale' };
 };
 
 // Prefer H.264 in MP4: it is hardware-encoded on virtually all phones, so the
@@ -49,28 +50,135 @@ export interface ActiveRecording {
    * be silently concat-copied together.
    */
   mimeType: string;
+  /** True when the saved track was normalized to the selected output frame. */
+  outputReady: boolean;
+}
+
+type RecordingFrame = { width: number; height: number };
+type ComposedRecordingStream = { stream: MediaStream; dispose: () => void };
+
+function cancelPreviewFrame(preview: HTMLVideoElement, id: number | null): void {
+  if (id !== null && typeof preview.cancelVideoFrameCallback === 'function') {
+    preview.cancelVideoFrameCallback(id);
+  }
 }
 
 /**
- * Camera constraints in the source's primary orientation. WebKit evaluates
- * camera modes in landscape even while an iPhone is held vertically, then
- * flips width/height in getSettings() for the delivered portrait track. A
- * portrait-shaped front-camera request instead selected an unmodified
- * landscape mode, which our preview could only letterbox or heavily crop.
+ * Record the frame the user actually sees instead of trusting MediaRecorder
+ * to preserve a phone camera track's display orientation. WebKit and Chromium
+ * can both expose a portrait preview while MediaRecorder writes the camera's
+ * underlying landscape sensor dimensions; that mismatch is what forced every
+ * selfie through a very slow export-time render.
+ *
+ * A canvas capture has three useful properties here:
+ *  - the stored MP4 pixels are physically portrait (no fragile rotation flag),
+ *  - the dimensions exactly match the selected project frame, and
+ *  - the single necessary cover crop happens once during hardware recording,
+ *    so untouched clips can later use native/copy export.
+ *
+ * The original microphone tracks are reused without processing. If canvas
+ * capture is unavailable, return null and let startRecording retain the raw
+ * camera fallback; the export sheet will then label the required render before
+ * the user starts it.
+ */
+function composeOutputReadyStream(
+  source: MediaStream,
+  preview: HTMLVideoElement,
+  output: RecordingFrame,
+  frameRate: number,
+): ComposedRecordingStream | null {
+  if (typeof document === 'undefined') return null;
+  const canvas = document.createElement('canvas');
+  if (typeof canvas.captureStream !== 'function') return null;
+  const context = canvas.getContext('2d', { alpha: false });
+  if (!context) return null;
+  canvas.width = output.width;
+  canvas.height = output.height;
+
+  let disposed = false;
+  let videoFrameId: number | null = null;
+  let animationFrameId: number | null = null;
+
+  const draw = () => {
+    if (disposed) return;
+    if (preview.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && preview.videoWidth > 0 && preview.videoHeight > 0) {
+      const placement = framePlacement(
+        preview.videoWidth,
+        preview.videoHeight,
+        output.width,
+        output.height,
+        'cover',
+      );
+      context.drawImage(
+        preview,
+        placement.source.x,
+        placement.source.y,
+        placement.source.width,
+        placement.source.height,
+        placement.output.x,
+        placement.output.y,
+        placement.output.width,
+        placement.output.height,
+      );
+    }
+    if (typeof preview.requestVideoFrameCallback === 'function') {
+      videoFrameId = preview.requestVideoFrameCallback(() => draw());
+    } else {
+      animationFrameId = window.requestAnimationFrame(draw);
+    }
+  };
+  draw();
+
+  const canvasStream = canvas.captureStream(Math.max(1, Math.min(30, frameRate || 30)));
+  const videoTrack = canvasStream.getVideoTracks()[0];
+  if (!videoTrack) {
+    disposed = true;
+    cancelPreviewFrame(preview, videoFrameId);
+    if (animationFrameId !== null) window.cancelAnimationFrame(animationFrameId);
+    return null;
+  }
+
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    cancelPreviewFrame(preview, videoFrameId);
+    if (animationFrameId !== null) window.cancelAnimationFrame(animationFrameId);
+    videoTrack.stop();
+    canvas.width = 1;
+    canvas.height = 1;
+  };
+
+  return {
+    stream: new MediaStream([videoTrack, ...source.getAudioTracks()]),
+    dispose,
+  };
+}
+
+/**
+ * Output-ready 9:16 selfie constraints. `crop-and-scale` is intentional for
+ * the front camera: a phone's native selfie sensor is commonly landscape 4:3,
+ * so forbidding the UA's capture-time crop yields a landscape/3:4 file that
+ * must be slowly re-encoded to become portrait 9:16. Asking for the displayed
+ * portrait size lets the camera pipeline derive a 1080x1920/2160x3840 track
+ * that can be exported without re-encoding.
+ *
+ * The crop is not a digital zoom. It is the single center crop required to
+ * turn the sensor frame into 9:16 — the same crop the preview/output would
+ * otherwise apply later, only without the expensive second encode.
  */
 export function captureConstraints(facing: CameraFacing, quality: CaptureQuality): CameraTrackConstraints {
   const size = CAPTURE_DIMENSIONS[quality];
   const front = facing === 'user';
   return {
     facingMode: { ideal: facing },
-    width: { ideal: front ? size.height : size.width },
-    height: { ideal: front ? size.width : size.height },
+    width: { ideal: size.width },
+    height: { ideal: size.height },
     frameRate: { ideal: 30, max: 30 },
     ...(front ? {
-      aspectRatio: { ideal: size.height / size.width },
-      // Preserve the native field of view. Device orientation supplies the
-      // portrait rotation; CSS/export perform the single final frame crop.
-      resizeMode: { exact: 'none' },
+      aspectRatio: { ideal: size.width / size.height },
+      // Keep this ideal rather than exact so older browsers can fall back to
+      // a native mode instead of rejecting camera access altogether.
+      resizeMode: { ideal: 'crop-and-scale' } as const,
     } : {}),
   };
 }
@@ -89,7 +197,10 @@ export function ultraHDRetryConstraints(facing: CameraFacing): CameraTrackConstr
     width: { ideal: size.height },
     height: { ideal: size.width },
     frameRate: { ideal: 30, max: 30 },
-    ...(facing === 'user' ? { resizeMode: { exact: 'none' } } : {}),
+    ...(facing === 'user' ? {
+      aspectRatio: { ideal: size.height / size.width },
+      resizeMode: { ideal: 'crop-and-scale' } as const,
+    } : {}),
     advanced: [
       { width: size.height, height: size.width },
       { width: size.width, height: size.height },
@@ -154,18 +265,50 @@ export async function startRecording(
   stream: MediaStream,
   onTick?: (elapsed: number) => void,
   facing: CameraFacing = 'environment',
+  preview?: HTMLVideoElement | null,
+  output?: RecordingFrame,
 ): Promise<ActiveRecording> {
   const mimeType = pickMimeType();
-  const videoSettings = stream.getVideoTracks()[0]?.getSettings?.();
+  const cameraSettings = stream.getVideoTracks()[0]?.getSettings?.();
   const audioSettings = stream.getAudioTracks()[0]?.getSettings?.();
-  // Bitrate follows what the camera actually delivers, not what was requested,
-  // so a 4K request that fell back to 1080x1920 is not encoded at 4K rates.
-  const videoBitsPerSecond = captureVideoBitrate(videoSettings?.width, videoSettings?.height);
-  console.log('[rec] capture=', { mimeType, videoSettings, audioSettings, videoBitsPerSecond });
-  const rec = new MediaRecorder(stream, {
+  let composition = preview && output
+    ? composeOutputReadyStream(stream, preview, output, cameraSettings?.frameRate ?? 30)
+    : null;
+  let recordingStream = composition?.stream ?? stream;
+  let videoSettings = recordingStream.getVideoTracks()[0]?.getSettings?.();
+  let videoBitsPerSecond = captureVideoBitrate(
+    composition ? output?.width : videoSettings?.width,
+    composition ? output?.height : videoSettings?.height,
+  );
+
+  const createRecorder = () => new MediaRecorder(recordingStream, {
     mimeType: mimeType || undefined,
     videoBitsPerSecond,
     audioBitsPerSecond: 128_000,
+  });
+  let rec: MediaRecorder;
+  try {
+    rec = createRecorder();
+  } catch (error) {
+    if (!composition) throw error;
+    // A browser may expose canvas.captureStream yet reject that stream in
+    // MediaRecorder. Preserve recording in that case and make the fallback
+    // explicit through outputReady=false and the export preflight warning.
+    composition.dispose();
+    composition = null;
+    recordingStream = stream;
+    videoSettings = cameraSettings;
+    videoBitsPerSecond = captureVideoBitrate(videoSettings?.width, videoSettings?.height);
+    rec = createRecorder();
+  }
+  console.log('[rec] capture=', {
+    mimeType,
+    cameraSettings,
+    recordingSettings: videoSettings,
+    output,
+    outputReady: Boolean(composition),
+    audioSettings,
+    videoBitsPerSecond,
   });
 
   let seq = 0;
@@ -174,7 +317,12 @@ export async function startRecording(
   const chunkIntervals: number[] = [];
   let lastChunkAt = performance.now();
   console.log('[rec] recBegin…');
-  await recBegin({ mimeType: rec.mimeType || mimeType, startedAt: Date.now(), facing });
+  try {
+    await recBegin({ mimeType: rec.mimeType || mimeType, startedAt: Date.now(), facing });
+  } catch (error) {
+    composition?.dispose();
+    throw error;
+  }
 
   rec.ondataavailable = (e) => {
     if (e.data && e.data.size > 0) {
@@ -199,11 +347,18 @@ export async function startRecording(
   console.log('[rec] starting mediarecorder');
   // Fewer, larger chunks reduce IndexedDB/main-thread churn during capture
   // while retaining interruption recovery at a two-second cadence.
-  rec.start(2000);
+  try {
+    rec.start(2000);
+  } catch (error) {
+    clearInterval(timer);
+    composition?.dispose();
+    throw error;
+  }
   console.log('[rec] started, state=', rec.state);
 
   return {
     get mimeType() { return rec.mimeType || mimeType; },
+    outputReady: Boolean(composition),
     get paused() { return rec.state === 'paused'; },
     pause: () => { if (rec.state === 'recording') rec.pause(); },
     resume: () => { if (rec.state === 'paused') rec.resume(); },
@@ -218,6 +373,7 @@ export async function startRecording(
           if (settled) return;
           settled = true;
           clearInterval(timer);
+          composition?.dispose();
           reject(new Error('Timed out while stopping the recording'));
         }, 5000);
         rec.onstop = () => {
@@ -225,6 +381,7 @@ export async function startRecording(
           settled = true;
           window.clearTimeout(timeout);
           clearInterval(timer);
+          composition?.dispose();
           const blob = new Blob(chunks, { type: rec.mimeType || mimeType });
           console.log('[rec] completed=', {
             elapsed,
@@ -242,6 +399,7 @@ export async function startRecording(
           settled = true;
           window.clearTimeout(timeout);
           clearInterval(timer);
+          composition?.dispose();
           reject(new Error('The browser failed to stop the recording'));
         };
         try { rec.requestData(); } catch { /* noop */ }
@@ -251,6 +409,7 @@ export async function startRecording(
           settled = true;
           window.clearTimeout(timeout);
           clearInterval(timer);
+          composition?.dispose();
           reject(error);
         }
       }),

@@ -99,6 +99,56 @@ export function copyPathRejections(
   return reasons;
 }
 
+export type ExportPathPreview = {
+  path: 'native' | 'join' | 'render';
+  headline: string;
+  detail: string;
+  rejections: string[];
+};
+
+/**
+ * Honest preflight copy for the export sheet. This is deliberately based on
+ * the same gate as exportMp4: the UI must never label an export "fast" while
+ * the worker already knows it will rebuild every frame. A multi-clip join is
+ * still described as a candidate because its codec/rotation probe happens
+ * after the blobs are opened.
+ */
+export function previewExportPath(
+  clips: GateClip[],
+  blobTypes: string[],
+  output: { width: number; height: number },
+): ExportPathPreview {
+  const rejections = copyPathRejections(clips, blobTypes, output);
+  if (!rejections.length && clips.length === 1) {
+    return {
+      path: 'native',
+      headline: 'Fast export ready',
+      detail: 'Uses the camera file without re-encoding the video.',
+      rejections,
+    };
+  }
+  if (!rejections.length && clips.length > 1) {
+    return {
+      path: 'join',
+      headline: 'Fast join available',
+      detail: 'Checks the clips, then joins compatible recordings without re-encoding.',
+      rejections,
+    };
+  }
+
+  let detail = 'This edit must rebuild the video on this device and may take longer than the recorded clip.';
+  if (rejections.some((reason) => reason.includes('trimmed'))) {
+    detail = 'A clip was trimmed or split, so this device must rebuild the edited frames.';
+  } else if (rejections.some((reason) => reason.includes(' dims '))) {
+    detail = 'The recorded frame does not match this output size, so this device must resize and rebuild it.';
+  } else if (rejections.some((reason) => reason.includes('not MP4'))) {
+    detail = 'A source clip is not MP4, so this device must convert it.';
+  } else if (rejections.some((reason) => reason.includes('mimeType'))) {
+    detail = 'The clips use different recording formats, so this device must convert them.';
+  }
+  return { path: 'render', headline: 'Full render required', detail, rejections };
+}
+
 /**
  * Multi-clip remux verdict from the mp4box probe classification plus recorder
  * provenance. Clips recorded in-app with the SAME stamped recorder codec are

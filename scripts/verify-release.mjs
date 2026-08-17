@@ -50,6 +50,20 @@ try {
       EXPECT_MAX_READY_MS: '2000',
     },
   });
+  // The field regression was specific to the selfie camera: the preview was
+  // portrait while MediaRecorder persisted landscape pixels. Require two
+  // saved 1080x1920 selfie clips and a zero-render fast join under two seconds.
+  run('node', ['scripts/e2e-4k.mjs', baseURL], {
+    env: {
+      ...process.env,
+      CAMERA_FACING: 'front',
+      CAPTURE_QUALITY: 'HD',
+      EXPORT_QUALITY: '1080p',
+      ASPECT_RATIO: '16:9',
+      CLIP_COUNT: '2',
+      EXPECT_MAX_READY_MS: '2000',
+    },
+  });
 } finally {
   preview.kill('SIGTERM');
 }

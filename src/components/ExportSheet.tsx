@@ -4,6 +4,7 @@ import { useStore } from '../state/store';
 import { getBlob } from '../lib/db';
 import { exportMp4, shareFile, downloadBlob } from '../lib/ffmpeg';
 import { exportLogTail } from '../lib/export-log';
+import { previewExportPath } from '../lib/export-gate';
 import { totalDuration, fmtTime, exportDimensions, isUltraHDCapture } from '../types/clip';
 import { ASPECT_RATIOS } from '../types/clip';
 import type { ExportQuality } from '../types/clip';
@@ -130,6 +131,7 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
   };
 
   const output = exportDimensions(aspectRatio, quality);
+  const exportPlan = previewExportPath(clips, clips.map((clip) => clip.mimeType), output);
 
   const share = async () => {
     if (!resultRef.current) return;
@@ -221,13 +223,28 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
                 Recorded in 1080p — 4K will upscale and render slower. Record with the 4K camera toggle to avoid this upscale.
               </p>
             )}
+            <div
+              data-export-plan
+              data-export-path={exportPlan.path}
+              className={`mt-3 rounded-xl border px-3 py-2.5 ${
+                exportPlan.path === 'render'
+                  ? 'border-amber-300/25 bg-amber-300/10'
+                  : 'border-emerald-300/20 bg-emerald-300/10'
+              }`}
+            >
+              <p className={`text-xs font-semibold ${exportPlan.path === 'render' ? 'text-amber-200' : 'text-emerald-300'}`}>
+                {exportPlan.headline}
+              </p>
+              <p className="mt-0.5 text-[11px] leading-snug text-white/60">{exportPlan.detail}</p>
+            </div>
           </div>
         )}
 
         {phase === 'idle' && (
-          <button onClick={() => void start()}
+          <button onClick={() => void start()} aria-label="Start export"
             className="w-full bg-white text-black font-semibold py-3 rounded-xl active:scale-[0.98] flex items-center justify-center gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
-            <Download size={17} /> Start export
+            <Download size={17} />
+            {exportPlan.path === 'native' ? 'Prepare video' : exportPlan.path === 'join' ? 'Join clips & export' : 'Render video & export'}
           </button>
         )}
 
@@ -240,6 +257,13 @@ export default function ExportSheet({ onClose, quality, onQualityChange, onExpor
               <span>{label}…</span><span>{Math.round(progress * 100)}%</span>
             </div>
             <p className="mt-3 text-[11px] text-white/60">Keep this tab open until the export finishes.</p>
+            {exportPlan.path === 'render' && (
+              <details className="mt-2 text-[10px] text-white/45">
+                <summary className="cursor-pointer select-none py-1">Why this export is rendering</summary>
+                <p className="mb-1 leading-relaxed text-white/55">{exportPlan.detail}</p>
+                <pre className="max-h-28 overflow-y-auto whitespace-pre-wrap break-all rounded bg-black/40 p-2 leading-relaxed">{exportLogTail().join('\n') || exportPlan.rejections.join('\n')}</pre>
+              </details>
+            )}
             <button onClick={cancel}
               className="mt-3 w-full bg-white/10 font-medium py-3 rounded-xl active:scale-[0.98] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white">
               Cancel export

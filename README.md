@@ -19,6 +19,13 @@ npm run dev
 Open `http://localhost:3000`. Camera and microphone access require browser
 permission and a secure context (`localhost` or HTTPS).
 
+Recordings are normalized on-device to the selected project frame while the
+camera is running. That makes an untouched clip physically portrait (or square)
+instead of relying on phone rotation metadata, and lets matching exports reuse
+the recorded video without a second encode. Before export starts, the sheet
+labels the actual path as **Fast export ready**, **Fast join available**, or
+**Full render required** and changes the action label to match.
+
 ## Checks
 
 ```sh
@@ -36,6 +43,10 @@ npm run preview -- --host 127.0.0.1
 npm run smoke
 ```
 
-The smoke test uses Chrome mobile/touch emulation, browser camera and microphone
-permissions, and Chromium's synthetic camera. A physical mobile-device pass is
-still the best final check for device-specific torch and optical zoom support.
+The release verification uses Chrome mobile/touch emulation, browser camera and
+microphone permissions, and Chromium's synthetic camera. It includes two exact
+portrait selfie recordings and requires their no-reencode join to finish in
+under two seconds. A separate exact-match check requires a native handoff under
+two seconds without fetching the encoder. A physical mobile-device pass is
+still required for iOS-specific camera orientation, torch, and optical zoom
+behavior.

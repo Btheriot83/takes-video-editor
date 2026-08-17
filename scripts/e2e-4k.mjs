@@ -9,6 +9,7 @@ const SLACK = Math.max(1, Number(process.env.E2E_TIME_SLACK || 1));
 const exportQuality = process.env.EXPORT_QUALITY === '1080p' ? '1080p' : '4K';
 const captureQuality = process.env.CAPTURE_QUALITY === '4K' ? '4K' : 'HD';
 const aspectRatio = ['16:9', '4:3', '1:1'].includes(process.env.ASPECT_RATIO) ? process.env.ASPECT_RATIO : '16:9';
+const cameraFacing = process.env.CAMERA_FACING === 'front' ? 'front' : 'rear';
 const maxReadyMs = Number(process.env.EXPECT_MAX_READY_MS || 0);
 const clipCount = Number(process.env.CLIP_COUNT || 1);
 fs.mkdirSync(OUT, { recursive: true });
@@ -44,6 +45,10 @@ page.on('pageerror', (error) => errors.push(String(error)));
 
 await page.goto(BASE, { waitUntil: 'load' });
 await page.waitForSelector('button[aria-label="Tap to record"]:not([disabled])', { timeout: 15000 });
+if (cameraFacing === 'front') {
+  await page.getByRole('button', { name: 'Switch to front camera' }).click();
+  await page.waitForSelector('button[aria-label="Switch to rear camera"]:not([disabled])', { timeout: 15000 });
+}
 if (captureQuality === '4K') {
   await page.getByRole('button', { name: '4K', exact: true }).click();
   await page.waitForFunction(() => Number(document.querySelector('[data-camera-frame]')?.getAttribute('data-capture-width')) >= 2160, null, { timeout: 15000 });
@@ -111,6 +116,11 @@ if (!expectUpscaleHint && hintCount !== 0) throw new Error('upscale hint shown f
 const expectedMode = source?.width === Number(expectedWidth) && source?.height === Number(expectedHeight)
   ? clipCount === 1 ? 'native' : 'remuxed'
   : 'transcoded';
+const expectedPreviewPath = expectedMode === 'native' ? 'native' : expectedMode === 'remuxed' ? 'join' : 'render';
+const previewPath = await dialog.locator('[data-export-plan]').getAttribute('data-export-path');
+if (previewPath !== expectedPreviewPath) {
+  throw new Error(`expected ${expectedPreviewPath} preflight, got ${previewPath}`);
+}
 const exportStartedAt = performance.now();
 await dialog.getByRole('button', { name: 'Start export' }).click();
 await dialog.getByText('Video ready to share or download').waitFor({ timeout: 300000 });
@@ -142,6 +152,6 @@ const expectNudge = exportQuality === '4K' && captureQuality === 'HD';
 if (expectNudge && nudgeCount !== 1) throw new Error('4K capture nudge missing after an HD-capture 4K export');
 if (!expectNudge && nudgeCount !== 0) throw new Error('4K capture nudge shown when capture already matches the export choice');
 
-console.log(JSON.stringify({ realCamera, captureQuality, exportQuality, aspectRatio, clipCount, capture, source, expectedMode, actualMode, readyMs, recorderEvidence, nudgeCount, output, bytes: fs.statSync(output).size, browserErrors: errors }, null, 2));
+console.log(JSON.stringify({ realCamera, cameraFacing, captureQuality, exportQuality, aspectRatio, clipCount, capture, source, expectedPreviewPath, previewPath, expectedMode, actualMode, readyMs, recorderEvidence, nudgeCount, output, bytes: fs.statSync(output).size, browserErrors: errors }, null, 2));
 await browser.close();
 if (errors.length) throw new Error(`browser reported ${errors.length} error(s)`);

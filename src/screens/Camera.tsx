@@ -5,7 +5,7 @@ import type { ActiveRecording } from '../lib/recorder';
 import { storageMode } from '../lib/db';
 import { prepareExportAssets } from '../lib/ffmpeg';
 import { useStore } from '../state/store';
-import { ASPECT_RATIOS, fmtTime, clipFraming, clipLen, isUltraHDCapture } from '../types/clip';
+import { ASPECT_RATIOS, fmtTime, clipFraming, clipLen, exportDimensions, isUltraHDCapture } from '../types/clip';
 import type { AspectRatio, CaptureQuality } from '../types/clip';
 
 type ZoomRange = { min: number; max: number; step: number };
@@ -284,8 +284,12 @@ export default function Camera() {
     const stream = streamRef.current;
     void (async () => {
       try {
-        const active = await startRecording(stream, setElapsed, facing);
+        const output = exportDimensions(aspectRatio, captureQuality === '4K' ? '4K' : '1080p');
+        const active = await startRecording(stream, setElapsed, facing, videoRef.current, output);
         recRef.current = active;
+        if (!active.outputReady) {
+          showCapabilityNotice('This browser will need to render the recording during export', 5000);
+        }
         // Released before the recorder finished starting: a hold-release (or a
         // cancel) stops immediately, but a tap-latch keeps recording — the tap
         // gesture's whole point is that the finger has already lifted.
@@ -304,7 +308,7 @@ export default function Camera() {
         setStarting(false);
       }
     })();
-  }, [error, facing, finishRecording, streamReady]);
+  }, [aspectRatio, captureQuality, error, facing, finishRecording, showCapabilityNotice, streamReady]);
 
   /**
    * A press while a tap-latched recording runs is the STOP gesture. Everything

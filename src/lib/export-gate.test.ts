@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { COPY_TRIM_TOLERANCE, copyPathRejections, isUntrimmed, recorderProvenanceTrust, remuxProbeDecision } from './export-gate';
+import { COPY_TRIM_TOLERANCE, copyPathRejections, isUntrimmed, previewExportPath, recorderProvenanceTrust, remuxProbeDecision } from './export-gate';
 import type { GateClip } from './export-gate';
 
 const clip = (overrides: Partial<GateClip> = {}): GateClip => ({
@@ -87,6 +87,37 @@ describe('copyPathRejections (named gate decisions)', () => {
     );
     expect(reasons.some((r) => r.startsWith('clip 1 trimmed'))).toBe(true);
     expect(reasons.some((r) => r === 'clip 2 dims 2160x3840 vs output 1080x1920')).toBe(true);
+  });
+});
+
+describe('previewExportPath (honest pre-export UI)', () => {
+  it('labels one untouched matching recording as a native fast export', () => {
+    expect(previewExportPath([clip()], ['video/mp4'], out1080)).toMatchObject({
+      path: 'native',
+      headline: 'Fast export ready',
+      rejections: [],
+    });
+  });
+
+  it('labels a matching recording set as a candidate fast join', () => {
+    expect(previewExportPath([clip(), clip()], ['video/mp4', 'video/mp4'], out1080)).toMatchObject({
+      path: 'join',
+      headline: 'Fast join available',
+      rejections: [],
+    });
+  });
+
+  it('warns before a dimension-mismatch render starts', () => {
+    const plan = previewExportPath([clip({ width: 1440, height: 1920 })], ['video/mp4'], out1080);
+    expect(plan.path).toBe('render');
+    expect(plan.detail).toMatch(/does not match this output size/);
+    expect(plan.rejections).toEqual(['clip 1 dims 1440x1920 vs output 1080x1920']);
+  });
+
+  it('explains that a trim or split requires rebuilt frames', () => {
+    const plan = previewExportPath([clip({ trimIn: 0.5 })], ['video/mp4'], out1080);
+    expect(plan.path).toBe('render');
+    expect(plan.detail).toMatch(/trimmed or split/);
   });
 });
 

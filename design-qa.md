@@ -1,6 +1,22 @@
 # Design QA
 
-Final result: passed
+Final result: browser implementation passed; physical iPhone retest pending
+
+## 2026-08-16 portrait and export-speed correction
+
+- A physical iPhone recording of numbered site 3 showed a 10.1-second 1080p
+  export advancing only from about 10% to 11% over 13 seconds. That invalidated
+  the earlier synthetic timing claim and proved the app was rebuilding frames.
+- The recorder now writes the selected project dimensions directly (including
+  1080 × 1920 portrait) instead of trusting display-orientation metadata from
+  the camera track. The raw camera stream remains a graceful fallback.
+- The export sheet now states the path before work starts and uses matching
+  actions: Prepare video, Join clips & export, or Render video & export.
+- Two synthetic front-camera clips reached the Fast join state after save and
+  reload. The 4K-over-1080p warning state remained fully visible at 320 × 568,
+  including its 44 px export action, and the desktop dialog stayed centered.
+- Current rendered evidence is in `scripts/e2e-out/design-qa/`: camera, editor,
+  fast-join export, compact render warning, and desktop render warning.
 
 ## 2026-08-16 interaction and mobile pass
 

@@ -3,28 +3,30 @@ import { captureConstraints, captureVideoBitrate, ultraHDRetryConstraints } from
 import { CAPTURE_DIMENSIONS, isUltraHDCapture } from '../types/clip';
 
 describe('captureConstraints', () => {
-  it('requests portrait 1080x1920 at 30fps for HD', () => {
+  it('keeps the proven portrait request for the rear HD camera', () => {
     const c = captureConstraints('environment', 'HD');
     expect(c.width).toEqual({ ideal: 1080 });
     expect(c.height).toEqual({ ideal: 1920 });
+    expect(c.aspectRatio).toBeUndefined();
+    expect(c.resizeMode).toBeUndefined();
     expect(c.frameRate).toEqual({ ideal: 30, max: 30 });
     expect(c.facingMode).toEqual({ ideal: 'environment' });
   });
-  it('requests the front 4K sensor in its primary landscape orientation', () => {
+  it('requests an output-ready portrait 4K selfie track', () => {
     const c = captureConstraints('user', '4K');
-    expect(c.width).toEqual({ ideal: 3840 });
-    expect(c.height).toEqual({ ideal: 2160 });
-    expect(c.aspectRatio).toEqual({ ideal: 16 / 9 });
+    expect(c.width).toEqual({ ideal: 2160 });
+    expect(c.height).toEqual({ ideal: 3840 });
+    expect(c.aspectRatio).toEqual({ ideal: 9 / 16 });
     expect(c.frameRate).toEqual({ ideal: 30, max: 30 });
     expect(c.facingMode).toEqual({ ideal: 'user' });
-    expect(c.resizeMode).toEqual({ exact: 'none' });
+    expect(c.resizeMode).toEqual({ ideal: 'crop-and-scale' });
   });
-  it('lets WebKit rotate a native front-camera mode instead of boxing a landscape stream', () => {
+  it('allows WebKit to crop the front sensor once into an output-ready frame', () => {
     const front = captureConstraints('user', 'HD');
-    expect(front.width).toEqual({ ideal: 1920 });
-    expect(front.height).toEqual({ ideal: 1080 });
-    expect(front.aspectRatio).toEqual({ ideal: 16 / 9 });
-    expect(front.resizeMode).toEqual({ exact: 'none' });
+    expect(front.width).toEqual({ ideal: 1080 });
+    expect(front.height).toEqual({ ideal: 1920 });
+    expect(front.aspectRatio).toEqual({ ideal: 9 / 16 });
+    expect(front.resizeMode).toEqual({ ideal: 'crop-and-scale' });
     expect(captureConstraints('environment', 'HD').resizeMode).toBeUndefined();
   });
   it('capture dimensions stay portrait (width < height)', () => {
@@ -43,7 +45,8 @@ describe('ultraHDRetryConstraints', () => {
   });
   it('keeps the 30fps ceiling on the retry', () => {
     expect(ultraHDRetryConstraints('user').frameRate).toEqual({ ideal: 30, max: 30 });
-    expect(ultraHDRetryConstraints('user').resizeMode).toEqual({ exact: 'none' });
+    expect(ultraHDRetryConstraints('user').resizeMode).toEqual({ ideal: 'crop-and-scale' });
+    expect(ultraHDRetryConstraints('environment').resizeMode).toBeUndefined();
   });
   it('offers advanced sets for both orientations, landscape first', () => {
     const c = ultraHDRetryConstraints('user');
