@@ -1,20 +1,20 @@
 /** Generate N evenly-spaced thumbnails for a video blob. */
 export async function makeThumbs(blob: Blob, count = 4, w = 72): Promise<string[]> {
   const url = URL.createObjectURL(blob);
+  const v = document.createElement('video');
   try {
-    const v = document.createElement('video');
     v.preload = 'auto';
     v.muted = true;
     v.playsInline = true;
     v.src = url;
     await new Promise<void>((res, rej) => {
-      v.onloadeddata = () => res();
-      v.onerror = () => rej(new Error('thumb load failed'));
+      const timeout = window.setTimeout(() => rej(new Error('thumb load timed out')), 4000);
+      v.onloadeddata = () => { window.clearTimeout(timeout); res(); };
+      v.onerror = () => { window.clearTimeout(timeout); rej(new Error('thumb load failed')); };
     });
     let dur = v.duration;
     if (dur === Infinity || isNaN(dur)) {
-      v.currentTime = 1e7;
-      await new Promise<void>((res) => { v.onseeked = () => res(); });
+      await seek(v, 1e7);
       dur = v.currentTime;
     }
     const scale = v.videoWidth ? w / v.videoWidth : 1;
@@ -32,6 +32,10 @@ export async function makeThumbs(blob: Blob, count = 4, w = 72): Promise<string[
     }
     return out;
   } finally {
+    // Release the mobile decoder promptly; revoking the URL alone can leave
+    // the media resource retained until garbage collection.
+    v.removeAttribute('src');
+    v.load();
     URL.revokeObjectURL(url);
   }
 }

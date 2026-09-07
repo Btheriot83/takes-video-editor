@@ -29,21 +29,34 @@ export default defineConfig({
         ],
       },
       workbox: {
-        // ffmpeg.wasm core (32MB) is too big for precache — cache it at runtime
-        globIgnores: ['**/ffmpeg/**'],
+        // ffmpeg.wasm cores (32MB) are too big for precache — cache at runtime
+        globIgnores: ['**/ffmpeg/**', '**/ffmpeg-mt/**'],
         maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
         runtimeCaching: [
           {
-            urlPattern: /\/(ffmpeg|ffesm)\/.*\.(js|wasm)$/,
+            urlPattern: /\/(ffmpeg|ffmpeg-mt|ffesm)\/.*\.(js|wasm)$/,
             handler: 'CacheFirst',
-            options: { cacheName: 'ffmpeg-core', expiration: { maxEntries: 4 } },
+            options: { cacheName: 'ffmpeg-core', expiration: { maxEntries: 8 } },
           },
         ],
       },
     }),
   ],
+  // COOP/COEP allow explicit local testing of the experimental multithreaded
+  // ffmpeg core with VITE_ENABLE_FFMPEG_MT=true. Production uses the verified
+  // single-threaded core unless that flag is deliberately enabled at build.
   server: {
     port: 3000,
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
+  },
+  preview: {
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
   },
   resolve: {
     alias: {

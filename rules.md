@@ -6,3 +6,7 @@
 - Verify camera/import, editing, and export behavior in a real browser when those paths change.
 - Never commit generated output, dependency folders, local logs, or Vercel metadata.
 
+5. Every commit must use Conventional Commits format with one logical change, an imperative subject of at most 72 characters, and no trailing period.
+6. Run `git commit` directly with a specific message before every push; never use vague subjects such as `update` or `wip`.
+7. After pushing a branch, create or update its draft PR with what changed, key files, checks, UI evidence, related task, and review status.
+8. Complete owner-requested software delivery through required checks, PR review controls, merge and the established deployment pipeline. Preserve explicit release holds, access controls, destructive-data, money, credentials and media-publication gates.

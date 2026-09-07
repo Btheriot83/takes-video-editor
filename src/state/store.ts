@@ -1,9 +1,9 @@
 import { create } from 'zustand';
-import { totalDuration, clipLen } from '../types/clip';
-import type { Clip } from '../types/clip';
-import { History, trimClip, splitClip, moveClip, duplicateClip, uid } from '../lib/editor';
+import { totalDuration, clipLen, clipFraming, DEFAULT_ASPECT_RATIO, DEFAULT_CAPTURE_QUALITY } from '../types/clip';
+import type { AspectRatio, CaptureQuality, Clip, ClipFraming, ClipSource, ExportQuality } from '../types/clip';
+import { clampTimelineTime, History, trimClip, splitClip, moveClip, duplicateClip, uid } from '../lib/editor';
 import {
-  saveProject, loadProject, saveBlob, getBlob, deleteBlob, recRecover, gcBlobs, clearProject,
+  saveProject, loadProject, saveBlob, getBlob, deleteBlob, recRecover, recFinalize, gcBlobs, clearProject,
 } from '../lib/db';
 import { probeVideo } from '../lib/recorder';
 import { makeThumbs } from '../lib/thumbs';
@@ -20,13 +20,26 @@ interface State {
   canRedo: boolean;
   recoveredNotice: string | null;
   total: number;
+  aspectRatio: AspectRatio;
+  captureQuality: CaptureQuality;
+  /** Last export quality the user explicitly chose, persisted across sessions. */
+  lastExportQuality: ExportQuality | null;
+  setLastExportQuality: (quality: ExportQuality) => void;
 
   init: () => Promise<void>;
-  addClipFromBlob: (blob: Blob, mimeType: string) => Promise<Clip>;
+  addClipFromBlob: (
+    blob: Blob,
+    mimeType: string,
+    generateThumbs?: boolean,
+    source?: ClipSource,
+    recorderMimeType?: string,
+    framing?: ClipFraming,
+  ) => Promise<Clip>;
   importFiles: (files: FileList | File[]) => Promise<void>;
   select: (id: string | null) => void;
   setScreen: (s: Screen) => void;
   setPlayhead: (t: number) => void;
+  setAspectRatio: (aspectRatio: AspectRatio) => void;
 
   commit: (next: Clip[], selectId?: string | null) => void;
   undo: () => void;
@@ -40,16 +53,35 @@ interface State {
   dismissNotice: () => void;
 }
 
+const LAST_EXPORT_QUALITY_KEY = 'takes.lastExportQuality';
+
+/** localStorage can throw (Safari private mode); the preference is optional. */
+function readLastExportQuality(): ExportQuality | null {
+  try {
+    const value = localStorage.getItem(LAST_EXPORT_QUALITY_KEY);
+    return value === '4K' || value === '1080p' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 const history = new History();
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-function persist(clips: Clip[]) {
+function persist(clips: Clip[], aspectRatio: AspectRatio, captureQuality: CaptureQuality) {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    saveProject(clips).catch(() => {});
+    saveTimer = null;
+    saveProject(clips, aspectRatio, captureQuality).catch(() => {});
     // NOTE: no blob GC here — undo/redo can restore clips referencing older
     // blobs. Orphaned blobs are reclaimed on newProject / clearAllData.
   }, 400);
+}
+
+async function persistNow(clips: Clip[], aspectRatio: AspectRatio, captureQuality: CaptureQuality) {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = null;
+  await saveProject(clips, aspectRatio, captureQuality);
 }
 
 export const useStore = create<State>((set, get) => ({
@@ -62,101 +94,186 @@ export const useStore = create<State>((set, get) => ({
   canRedo: false,
   recoveredNotice: null,
   total: 0,
+  aspectRatio: DEFAULT_ASPECT_RATIO,
+  captureQuality: DEFAULT_CAPTURE_QUALITY,
+  lastExportQuality: readLastExportQuality(),
 
   init: async () => {
-    // crash/interruption recovery: an unfinished recording session?
     let notice: string | null = null;
     try {
-      const rec = await recRecover();
-      if (rec && rec.blob.size > 10_000) {
-        try {
-          const clip = await get().addClipFromBlob(rec.blob, rec.mimeType);
-          notice = `Recovered an interrupted recording (${clipLen(clip).toFixed(1)}s).`;
-        } catch {
-          notice = null;
-        }
-      }
-    } catch { /* ignore */ }
-
-    const p = await loadProject().catch(() => undefined);
-    if (p && p.clips.length) {
+      // Restore completed clips first so an interrupted recording is appended
+      // instead of being replaced by the older saved project.
+      const p = await loadProject().catch(() => undefined);
       const existing: Clip[] = [];
-      for (const c of p.clips) {
-        if (await getBlob(c.blobKey)) existing.push(c);
+      if (p?.clips.length) {
+        for (const clip of p.clips) {
+          try {
+            // Legacy clips (saved before provenance existed) load as 'import'
+            // so they never receive recorder-provenance remux trust.
+            if (await getBlob(clip.blobKey)) {
+              existing.push({ ...clip, source: clip.source ?? 'import', framing: clipFraming(clip) });
+            }
+          } catch {
+            // A single damaged entry must not leave the whole app on Loading.
+          }
+        }
       }
       set({
         clips: existing,
         total: totalDuration(existing),
         selectedId: existing[0]?.id ?? null,
         screen: existing.length ? 'editor' : 'camera',
-        recoveredNotice: notice,
-        ready: true,
+        // Empty projects always open in the requested vertical default.
+        // Existing projects retain their chosen frame for editing/export.
+        aspectRatio: existing.length ? (p?.aspectRatio ?? DEFAULT_ASPECT_RATIO) : DEFAULT_ASPECT_RATIO,
+        // Recording is intentionally 4K-only. Ignore legacy projects that
+        // persisted the retired HD camera option.
+        captureQuality: DEFAULT_CAPTURE_QUALITY,
       });
-    } else {
+
+      const rec = await recRecover();
+      if (rec && rec.blob.size > 10_000) {
+        // Crash-recovered chunks came from this app's own recorder; the meta
+        // mimeType stored by recBegin IS the recorder's negotiated stamp.
+        const clip = await get().addClipFromBlob(
+          rec.blob,
+          rec.mimeType,
+          true,
+          'recording',
+          rec.mimeType,
+          'cover',
+        );
+        await recFinalize();
+        notice = `Recovered an interrupted recording (${clipLen(clip).toFixed(1)}s).`;
+      }
+    } catch (error) {
+      console.error('[store] restore failed', error);
+      notice = 'Some saved media could not be restored. New recordings are still available.';
+    } finally {
       set({ ready: true, recoveredNotice: notice });
     }
   },
 
-  addClipFromBlob: async (blob, mimeType) => {
-    const meta = await probeVideo(blob);
+  addClipFromBlob: async (
+    blob,
+    mimeType,
+    generateThumbs = true,
+    source = 'import',
+    recorderMimeType,
+    framing = 'cover',
+  ) => {
     const blobKey = uid();
+    // Persist the irreplaceable media before doing any decoder work. Camera
+    // recovery data is kept until this clip and its project entry are durable.
     await saveBlob(blobKey, blob);
-    let thumbs: string[] = [];
-    try { thumbs = await makeThumbs(blob, 4); } catch { /* non-fatal */ }
+    const meta = await probeVideo(blob);
     const clip: Clip = {
       id: uid(),
       blobKey,
       mimeType,
+      source,
+      framing,
+      // Only recordings carry the stamp; an empty string is stored as absent
+      // so it can never satisfy the non-empty equality the remux trust needs.
+      ...(source === 'recording' && recorderMimeType ? { recorderMimeType } : {}),
       duration: meta.duration,
       trimIn: 0,
       trimOut: meta.duration,
       width: meta.width,
       height: meta.height,
       createdAt: Date.now(),
-      thumbs,
+      thumbs: [],
     };
     const clips = [...get().clips, clip];
+    await persistNow(clips, get().aspectRatio, get().captureQuality);
     history.push(get().clips);
     set({ clips, selectedId: clip.id, total: totalDuration(clips), canUndo: history.canUndo, canRedo: false });
-    persist(clips);
+
+    // Thumbnail decoding is expensive and can monopolize iPhone media
+    // decoders. It must never keep the record button in a stopping state.
+    if (generateThumbs) void makeThumbs(blob, 4).then(async (thumbs) => {
+      const latest = get().clips;
+      if (!latest.some((item) => item.id === clip.id)) return;
+      const withThumbs = latest.map((item) => (item.id === clip.id ? { ...item, thumbs } : item));
+      set({ clips: withThumbs });
+      persist(withThumbs, get().aspectRatio, get().captureQuality);
+    }).catch(() => { /* thumbnails are non-essential */ });
     return clip;
   },
 
   importFiles: async (files) => {
     for (const f of Array.from(files)) {
       if (!f.type.startsWith('video/')) continue;
-      await get().addClipFromBlob(f, f.type);
+      await get().addClipFromBlob(f, f.type, true, 'import');
     }
     if (get().clips.length) set({ screen: 'editor' });
   },
 
   select: (id) => set({ selectedId: id }),
   setScreen: (s) => set({ screen: s }),
-  setPlayhead: (t) => set({ playhead: t }),
+  setPlayhead: (t) => set({ playhead: clampTimelineTime(get().clips, t) }),
+  setAspectRatio: (aspectRatio) => {
+    set({ aspectRatio });
+    persist(get().clips, aspectRatio, get().captureQuality);
+  },
+  setLastExportQuality: (quality) => {
+    set({ lastExportQuality: quality });
+    try {
+      localStorage.setItem(LAST_EXPORT_QUALITY_KEY, quality);
+    } catch { /* private mode: keep it session-only */ }
+  },
 
   commit: (next, selectId) => {
-    history.push(get().clips);
+    const current = get();
+    const requestedSelection = selectId !== undefined ? selectId : current.selectedId;
+    const selectedId = next.some((clip) => clip.id === requestedSelection)
+      ? requestedSelection
+      : next[0]?.id ?? null;
+    history.push(current.clips);
     set({
       clips: next,
       total: totalDuration(next),
-      selectedId: selectId !== undefined ? selectId : get().selectedId,
+      selectedId,
+      playhead: clampTimelineTime(next, current.playhead),
       canUndo: history.canUndo,
       canRedo: history.canRedo,
     });
-    persist(next);
+    persist(next, get().aspectRatio, get().captureQuality);
   },
 
   undo: () => {
     const prev = history.undo(get().clips);
     if (!prev) return;
-    set({ clips: prev, total: totalDuration(prev), canUndo: history.canUndo, canRedo: history.canRedo });
-    persist(prev);
+    const current = get();
+    const selectedId = prev.some((clip) => clip.id === current.selectedId)
+      ? current.selectedId
+      : prev[0]?.id ?? null;
+    set({
+      clips: prev,
+      total: totalDuration(prev),
+      selectedId,
+      playhead: clampTimelineTime(prev, current.playhead),
+      canUndo: history.canUndo,
+      canRedo: history.canRedo,
+    });
+    persist(prev, get().aspectRatio, get().captureQuality);
   },
   redo: () => {
     const next = history.redo(get().clips);
     if (!next) return;
-    set({ clips: next, total: totalDuration(next), canUndo: history.canUndo, canRedo: history.canRedo });
-    persist(next);
+    const current = get();
+    const selectedId = next.some((clip) => clip.id === current.selectedId)
+      ? current.selectedId
+      : next[0]?.id ?? null;
+    set({
+      clips: next,
+      total: totalDuration(next),
+      selectedId,
+      playhead: clampTimelineTime(next, current.playhead),
+      canUndo: history.canUndo,
+      canRedo: history.canRedo,
+    });
+    persist(next, get().aspectRatio, get().captureQuality);
   },
 
   trimSelected: (trimIn, trimOut) => {
@@ -208,8 +325,12 @@ export const useStore = create<State>((set, get) => ({
     for (const c of get().clips) deleteBlob(c.blobKey).catch(() => {});
     await clearProject().catch(() => {});
     history.clear();
-    set({ clips: [], selectedId: null, screen: 'camera', playhead: 0, total: 0, canUndo: false, canRedo: false });
-    await saveProject([]);
+    set({
+      clips: [], selectedId: null, screen: 'camera', playhead: 0, total: 0,
+      canUndo: false, canRedo: false, aspectRatio: DEFAULT_ASPECT_RATIO,
+    });
+    // Capture quality is a device preference, so it survives New project.
+    await saveProject([], DEFAULT_ASPECT_RATIO, get().captureQuality);
   },
 
   dismissNotice: () => set({ recoveredNotice: null }),

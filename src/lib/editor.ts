@@ -1,6 +1,47 @@
 import { clipLen, FRAME } from '../types/clip';
 import type { Clip } from '../types/clip';
 
+export const TIMELINE_PX_PER_SEC = 44;
+export const TIMELINE_MIN_CLIP_PX = 88;
+export const TIMELINE_GAP_PX = 4;
+
+/** Width used by the visual timeline, including a usable minimum trim target. */
+export function timelineClipWidth(c: Clip): number {
+  return Math.max(TIMELINE_MIN_CLIP_PX, clipLen(c) * TIMELINE_PX_PER_SEC);
+}
+
+export function clampTimelineTime(clips: Clip[], time: number): number {
+  const duration = clips.reduce((sum, clip) => sum + clipLen(clip), 0);
+  return Math.max(0, Math.min(duration, Number.isFinite(time) ? time : 0));
+}
+
+/**
+ * Map timeline seconds to the rendered strip. A simple `time * pxPerSec`
+ * drifts as soon as a short clip is widened to its minimum touch-friendly
+ * width, and it also ignores the gaps between clips.
+ */
+export function timelinePlayheadX(clips: Clip[], time: number): number {
+  if (!clips.length) return 0;
+  const target = clampTimelineTime(clips, time);
+  let elapsed = 0;
+  let x = 0;
+
+  for (let index = 0; index < clips.length; index += 1) {
+    const clip = clips[index];
+    const length = clipLen(clip);
+    const width = timelineClipWidth(clip);
+    const isLast = index === clips.length - 1;
+    if (target < elapsed + length || isLast) {
+      const progress = length > 0 ? Math.max(0, Math.min(1, (target - elapsed) / length)) : 0;
+      return x + width * progress;
+    }
+    elapsed += length;
+    x += width + TIMELINE_GAP_PX;
+  }
+
+  return x;
+}
+
 export function uid(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }

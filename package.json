@@ -9,6 +9,9 @@
     "lint": "eslint .",
     "test": "vitest run",
     "smoke": "node scripts/e2e.mjs",
+    "smoke:4k": "node scripts/e2e-4k.mjs",
+    "release:verify": "node scripts/verify-release.mjs",
+    "release:production": "node scripts/release-production.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -50,6 +53,8 @@
     "idb": "^8.0.3",
     "input-otp": "^1.4.2",
     "lucide-react": "^0.562.0",
+    "mp4-muxer": "^5.2.2",
+    "mp4box": "^2.4.1",
     "next-themes": "^0.4.6",
     "react": "^19.2.0",
     "react-day-picker": "^9.13.0",
